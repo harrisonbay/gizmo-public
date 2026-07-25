@@ -56,7 +56,9 @@ gradients against the fitted analytic wave are respectively `3.99e-6`,
 `9.99e-7`, and `1.09e-6`; adjacent face areas differ from the analytic unit
 area by at most `4.07e-9`. All 2,048 adjacent pairs use HLLC and the entropic
 branch, and both raw and corrected fluxes are exactly antisymmetric under pair
-reversal in this fixture-backed invariant test.
+reversal in this fixture-backed invariant test. The full unordered-pair spatial
+operator evaluates 4,096 interacting pairs and conserves global momentum and
+energy rates to `8.9e-18` and `1.5e-24`.
 
 The Riemann port preserves the corrected two-rarefaction vacuum criterion and
 the legacy distinction between HLLC failure modes: negative or non-finite
@@ -68,4 +70,13 @@ integration, lab-frame deboost, and the closure-leak rule that disables
 reconstruction before solving. The entropic/PdV API then preserves the legacy
 strict speed thresholds, condition-number override, independent kernel
 derivatives, and KT-specific energy-delta semantics. Particle state updates and
-time integration remain the next hydro substep.
+CLI evolution remain behind the timestep-selection boundary described below.
+
+The hydro crate also contains the first synchronized evolution slice: exact
+unordered-pair accumulation into extensive momentum/total-energy rates,
+conversion to acceleration and specific-internal-energy rate, the raw legacy
+Courant estimate, and the noncosmological kick-drift-kick predictor ordering
+with the half-loss energy limiter. This is not yet wired to normal CLI
+execution. Before evolved snapshots can be called C-parity results, the
+integer power-of-two timeline and the remaining timestep bounds must be ported
+and checked against a freshly generated, named-commit C oracle.

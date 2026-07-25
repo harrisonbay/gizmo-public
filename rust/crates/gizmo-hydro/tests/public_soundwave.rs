@@ -1,8 +1,8 @@
 use gizmo_hydro::{
-    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, PrimitiveState1d, ReconstructedPoint1d,
-    RiemannMethod, apply_entropic_pdv_1d, cubic_kernel_1d, density_at_hsml_1d,
-    face_closure_errors_1d, gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
-    mfm_pair_flux_1d, solve_smoothing_lengths_1d,
+    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, MfmState1d, PrimitiveState1d,
+    ReconstructedPoint1d, RiemannMethod, apply_entropic_pdv_1d, cubic_kernel_1d,
+    density_at_hsml_1d, face_closure_errors_1d, gradients_at_hsml_1d, inverse_moments_1d,
+    meshless_face_geometry_1d, mfm_pair_flux_1d, mfm_spatial_rates_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 
@@ -357,4 +357,26 @@ fn assert_public_pair_fluxes(
     assert!(max_momentum_swap_error < 1.0e-12);
     assert!(max_raw_energy_swap_error < 1.0e-12);
     assert!(max_corrected_energy_swap_error < 1.0e-12);
+
+    let rates = mfm_spatial_rates_1d(MfmState1d {
+        positions,
+        masses,
+        velocities: &velocity,
+        specific_internal_energy: internal_energy,
+        smoothing_lengths,
+        box_size,
+        gamma: 5.0 / 3.0,
+    })
+    .expect("public full spatial RHS must be valid");
+    let net_momentum_rate: f64 = rates.momentum.iter().sum();
+    let net_energy_rate: f64 = rates.total_energy.iter().sum();
+    eprintln!(
+        "public fixture spatial RHS: pairs={}, entropic={}, \
+         net momentum/energy rate={net_momentum_rate:.12e}/{net_energy_rate:.12e}",
+        rates.pair_count, rates.entropic_pair_count
+    );
+    assert_eq!(rates.pair_count, 2 * positions.len());
+    assert_eq!(rates.entropic_pair_count, rates.pair_count);
+    assert!(net_momentum_rate.abs() < 1.0e-12);
+    assert!(net_energy_rate.abs() < 1.0e-12);
 }

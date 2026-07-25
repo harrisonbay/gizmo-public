@@ -900,9 +900,11 @@ pub fn apply_entropic_pdv_1d(
     }
     let midpoint_velocity = 0.5 * (i.velocity + j.velocity);
     let expected_momentum = flux.star_pressure * face.area * face.signed_area.signum();
+    let momentum_matches_source = flux.method == RiemannMethod::KurganovTadmor
+        || legacy_float_equal(flux.momentum, expected_momentum);
     if !legacy_float_equal(flux.mass, 0.0)
         || !legacy_float_equal(flux.interface_velocity, midpoint_velocity)
-        || !legacy_float_equal(flux.momentum, expected_momentum)
+        || !momentum_matches_source
     {
         return Err(HydroError::InvalidRiemannParameter {
             field: "entropic_source_flux",
@@ -997,6 +999,540 @@ pub fn apply_entropic_pdv_1d(
         }
     }
     Ok((flux, use_entropic_energy))
+}
+
+/// Evaluate the semidiscrete default 1-D MFM hydro operator.
+///
+/// Every interacting unordered pair is solved once. The returned momentum and
+/// total-energy rates are extensive and exactly antisymmetric by construction;
+/// acceleration and specific-internal-energy rates are the corresponding
+/// primitive-variable derivatives used by the legacy predictor and kicks.
+///
+/// # Errors
+///
+/// Returns an error for mismatched or invalid state columns, invalid meshless
+/// geometry, reconstruction failure, or a non-finite rate.
+#[allow(clippy::too_many_lines)]
+pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroError> {
+    let particle_count = state.positions.len();
+    for (field, actual) in [
+        ("masses", state.masses.len()),
+        ("velocities", state.velocities.len()),
+        (
+            "specific_internal_energy",
+            state.specific_internal_energy.len(),
+        ),
+        ("smoothing_lengths", state.smoothing_lengths.len()),
+    ] {
+        if actual != particle_count {
+            return Err(HydroError::MismatchedLength {
+                field,
+                expected: particle_count,
+                actual,
+            });
+        }
+    }
+    validate_particle_columns(
+        state.positions,
+        state.masses,
+        state.smoothing_lengths,
+        state.box_size,
+    )?;
+    if !state.gamma.is_finite() || state.gamma <= 1.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "gamma",
+            value: state.gamma,
+        });
+    }
+    for (index, (&velocity, &internal_energy)) in state
+        .velocities
+        .iter()
+        .zip(state.specific_internal_energy)
+        .enumerate()
+    {
+        if !velocity.is_finite() {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "velocity",
+                value: velocity,
+            });
+        }
+        if !internal_energy.is_finite() || internal_energy <= 0.0 {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "specific_internal_energy",
+                value: internal_energy,
+            });
+        }
+    }
+
+    let density = density_at_hsml_1d(
+        state.positions,
+        state.masses,
+        state.smoothing_lengths,
+        state.box_size,
+    )?;
+    let density_values: Vec<f64> = density.iter().map(|value| value.density).collect();
+    let pressure: Vec<f64> = density_values
+        .iter()
+        .zip(state.specific_internal_energy)
+        .map(|(&rho, &internal_energy)| (state.gamma - 1.0) * rho * internal_energy)
+        .collect();
+    let density_gradients = gradients_at_hsml_1d(
+        state.positions,
+        &density_values,
+        state.smoothing_lengths,
+        state.box_size,
+        0.0,
+        true,
+    )?;
+    let velocity_gradients = gradients_at_hsml_1d(
+        state.positions,
+        state.velocities,
+        state.smoothing_lengths,
+        state.box_size,
+        0.1,
+        false,
+    )?;
+    let pressure_gradients = gradients_at_hsml_1d(
+        state.positions,
+        &pressure,
+        state.smoothing_lengths,
+        state.box_size,
+        0.1,
+        true,
+    )?;
+    let inverse_moments =
+        inverse_moments_1d(state.positions, state.smoothing_lengths, state.box_size)?;
+    let closure_errors =
+        face_closure_errors_1d(state.positions, state.smoothing_lengths, state.box_size)?;
+
+    let mut momentum = vec![0.0; particle_count];
+    let mut total_energy = vec![0.0; particle_count];
+    let mut pair_count = 0_usize;
+    let mut entropic_pair_count = 0_usize;
+    let mut maximum_signal_speed: Vec<f64> = pressure
+        .iter()
+        .zip(&density_values)
+        .map(|(&particle_pressure, &rho)| (state.gamma * particle_pressure / rho).sqrt())
+        .collect();
+    for i in 0..particle_count {
+        for j in (i + 1)..particle_count {
+            let displacement =
+                periodic_displacement_1d(state.positions[i], state.positions[j], state.box_size)?;
+            let distance = displacement.abs();
+            if distance <= 0.0
+                || (distance >= state.smoothing_lengths[i]
+                    && distance >= state.smoothing_lengths[j])
+            {
+                continue;
+            }
+            let point_geometry = |index: usize| MeshlessPoint1d {
+                position: state.positions[index],
+                mass: state.masses[index],
+                density: density_values[index],
+                smoothing_length: state.smoothing_lengths[index],
+                inverse_moment: inverse_moments[index],
+            };
+            let face =
+                meshless_face_geometry_1d(point_geometry(i), point_geometry(j), state.box_size)?;
+            let reconstructed = |index: usize| ReconstructedPoint1d {
+                primitive: PrimitiveState1d {
+                    density: density_values[index],
+                    velocity: state.velocities[index],
+                    pressure: pressure[index],
+                },
+                density_gradient: density_gradients[index].limited,
+                velocity_gradient: velocity_gradients[index].limited,
+                pressure_gradient: pressure_gradients[index].limited,
+                face_closure_error: closure_errors[index],
+            };
+            let raw_flux = mfm_pair_flux_1d(reconstructed(i), reconstructed(j), face, state.gamma)?;
+            let entropic = |index: usize| {
+                Ok::<EntropicPoint1d, HydroError>(EntropicPoint1d {
+                    velocity: state.velocities[index],
+                    density: density_values[index],
+                    pressure: pressure[index],
+                    sound_speed: (state.gamma * pressure[index] / density_values[index]).sqrt(),
+                    volume: state.masses[index] / density_values[index],
+                    dhsml_factor: density[index].dhsml_factor,
+                    kernel_radial_derivative: cubic_kernel_1d(
+                        distance,
+                        state.smoothing_lengths[index],
+                    )?
+                    .radial_derivative,
+                    condition_number: 1.0,
+                    face_closure_error: closure_errors[index],
+                })
+            };
+            let (flux, selected_entropic) =
+                apply_entropic_pdv_1d(raw_flux, face, entropic(i)?, entropic(j)?)?;
+            momentum[i] += flux.momentum;
+            momentum[j] -= flux.momentum;
+            total_energy[i] += flux.energy;
+            total_energy[j] -= flux.energy;
+            pair_count += 1;
+            entropic_pair_count += usize::from(selected_entropic);
+            let signal_speed = pair_signal_speed(
+                reconstructed(i),
+                reconstructed(j),
+                displacement.signum(),
+                state.gamma,
+            )?;
+            maximum_signal_speed[i] = maximum_signal_speed[i].max(signal_speed);
+            maximum_signal_speed[j] = maximum_signal_speed[j].max(signal_speed);
+        }
+    }
+
+    let mut acceleration = Vec::with_capacity(particle_count);
+    let mut specific_internal_energy = Vec::with_capacity(particle_count);
+    for index in 0..particle_count {
+        let particle_acceleration = momentum[index] / state.masses[index];
+        let internal_energy_rate =
+            (total_energy[index] - state.velocities[index] * momentum[index]) / state.masses[index];
+        if !momentum[index].is_finite()
+            || !total_energy[index].is_finite()
+            || !particle_acceleration.is_finite()
+            || !internal_energy_rate.is_finite()
+        {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "spatial_rate",
+                value: f64::NAN,
+            });
+        }
+        acceleration.push(particle_acceleration);
+        specific_internal_energy.push(internal_energy_rate);
+    }
+    Ok(MfmRates1d {
+        momentum,
+        total_energy,
+        acceleration,
+        specific_internal_energy,
+        pair_count,
+        entropic_pair_count,
+        maximum_signal_speed,
+    })
+}
+
+/// Select the synchronized non-cosmological Courant step used by the 1-D MFM
+/// sound-wave profile.
+///
+/// The effective particle size is `2 Hsml / N_eff`; the legacy denominator is
+/// one half of the particle's maximum signal speed.
+///
+/// # Errors
+///
+/// Returns an error for invalid state/rate columns, Courant factor, neighbor
+/// estimate, or signal speed.
+pub fn global_courant_timestep_1d(
+    state: MfmState1d<'_>,
+    rates: &MfmRates1d,
+    courant_factor: f64,
+) -> Result<f64, HydroError> {
+    if !courant_factor.is_finite() || courant_factor <= 0.0 || courant_factor > 0.5 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "courant_factor",
+            value: courant_factor,
+        });
+    }
+    if rates.maximum_signal_speed.len() != state.positions.len() {
+        return Err(HydroError::MismatchedLength {
+            field: "maximum_signal_speed",
+            expected: state.positions.len(),
+            actual: rates.maximum_signal_speed.len(),
+        });
+    }
+    let density = density_at_hsml_1d(
+        state.positions,
+        state.masses,
+        state.smoothing_lengths,
+        state.box_size,
+    )?;
+    let mut timestep = f64::INFINITY;
+    for (index, estimate) in density.iter().enumerate() {
+        let signal_speed = rates.maximum_signal_speed[index];
+        let particle_size = 2.0 * state.smoothing_lengths[index] / estimate.effective_neighbors;
+        let candidate = courant_factor * particle_size / (0.5 * signal_speed);
+        if !particle_size.is_finite()
+            || particle_size <= 0.0
+            || !signal_speed.is_finite()
+            || signal_speed <= 0.0
+            || !candidate.is_finite()
+            || candidate <= 0.0
+        {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "courant_timestep",
+                value: candidate,
+            });
+        }
+        timestep = timestep.min(candidate);
+    }
+    if !timestep.is_finite() {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "global_timestep",
+            value: timestep,
+        });
+    }
+    Ok(timestep)
+}
+
+/// Advance one synchronized kick-drift-kick step of the default 1-D MFM path.
+///
+/// Endpoint forces use full-step old-RHS predictions for velocity and internal
+/// energy, while positions drift with the first-half-kicked actual velocity,
+/// matching the legacy predictor ordering. Smoothing lengths are re-solved at
+/// the endpoint before the new RHS evaluation.
+///
+/// # Errors
+///
+/// Returns an error for invalid state/rate columns, timestep or energy floor,
+/// smoothing-length failure, or endpoint hydro failure. The state is only
+/// replaced after the complete step succeeds.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn advance_mfm_kdk_1d(
+    state: &mut MfmEvolvingState1d,
+    old_rates: &MfmRates1d,
+    timestep: f64,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    minimum_specific_internal_energy: f64,
+) -> Result<MfmRates1d, HydroError> {
+    let particle_count = state.positions.len();
+    validate_rate_columns(old_rates, particle_count)?;
+    if !timestep.is_finite() || timestep <= 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "timestep",
+            value: timestep,
+        });
+    }
+    if !minimum_specific_internal_energy.is_finite() || minimum_specific_internal_energy < 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "minimum_specific_internal_energy",
+            value: minimum_specific_internal_energy,
+        });
+    }
+
+    validate_evolving_state(state)?;
+    let half_timestep = 0.5 * timestep;
+    let mut endpoint_positions = Vec::with_capacity(particle_count);
+    let mut half_velocity = Vec::with_capacity(particle_count);
+    let mut half_internal_energy = Vec::with_capacity(particle_count);
+    let mut predicted_velocity = Vec::with_capacity(particle_count);
+    let mut predicted_internal_energy = Vec::with_capacity(particle_count);
+    for index in 0..particle_count {
+        let velocity_half = state.velocities[index] + half_timestep * old_rates.acceleration[index];
+        let internal_energy_half = limited_internal_energy_update(
+            state.specific_internal_energy[index],
+            old_rates.specific_internal_energy[index],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?;
+        let position =
+            (state.positions[index] + timestep * velocity_half).rem_euclid(state.box_size);
+        let velocity_predicted = state.velocities[index] + timestep * old_rates.acceleration[index];
+        let internal_energy_predicted = limited_internal_energy_update(
+            state.specific_internal_energy[index],
+            old_rates.specific_internal_energy[index],
+            timestep,
+            minimum_specific_internal_energy,
+        )?;
+        if !velocity_half.is_finite() || !position.is_finite() || !velocity_predicted.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "kdk_predictor",
+                value: f64::NAN,
+            });
+        }
+        endpoint_positions.push(position);
+        half_velocity.push(velocity_half);
+        half_internal_energy.push(internal_energy_half);
+        predicted_velocity.push(velocity_predicted);
+        predicted_internal_energy.push(internal_energy_predicted);
+    }
+    let solved = solve_smoothing_lengths_1d(
+        &endpoint_positions,
+        &state.masses,
+        &state.smoothing_lengths,
+        state.box_size,
+        desired_neighbors,
+        neighbor_tolerance,
+    )?;
+    let endpoint_smoothing_lengths: Vec<f64> = solved
+        .iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    let new_rates = mfm_spatial_rates_1d(MfmState1d {
+        positions: &endpoint_positions,
+        masses: &state.masses,
+        velocities: &predicted_velocity,
+        specific_internal_energy: &predicted_internal_energy,
+        smoothing_lengths: &endpoint_smoothing_lengths,
+        box_size: state.box_size,
+        gamma: state.gamma,
+    })?;
+
+    let mut endpoint_velocity = Vec::with_capacity(particle_count);
+    let mut endpoint_internal_energy = Vec::with_capacity(particle_count);
+    for index in 0..particle_count {
+        let velocity = half_velocity[index] + half_timestep * new_rates.acceleration[index];
+        let internal_energy = limited_internal_energy_update(
+            half_internal_energy[index],
+            new_rates.specific_internal_energy[index],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?;
+        if !velocity.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "kdk_velocity",
+                value: velocity,
+            });
+        }
+        endpoint_velocity.push(velocity);
+        endpoint_internal_energy.push(internal_energy);
+    }
+    state.positions = endpoint_positions;
+    state.velocities = endpoint_velocity;
+    state.specific_internal_energy = endpoint_internal_energy;
+    state.smoothing_lengths = endpoint_smoothing_lengths;
+    Ok(new_rates)
+}
+
+fn validate_rate_columns(rates: &MfmRates1d, expected: usize) -> Result<(), HydroError> {
+    for (field, actual) in [
+        ("momentum_rate", rates.momentum.len()),
+        ("total_energy_rate", rates.total_energy.len()),
+        ("acceleration", rates.acceleration.len()),
+        (
+            "specific_internal_energy_rate",
+            rates.specific_internal_energy.len(),
+        ),
+        ("maximum_signal_speed", rates.maximum_signal_speed.len()),
+    ] {
+        if actual != expected {
+            return Err(HydroError::MismatchedLength {
+                field,
+                expected,
+                actual,
+            });
+        }
+    }
+    for value in rates
+        .momentum
+        .iter()
+        .chain(&rates.total_energy)
+        .chain(&rates.acceleration)
+        .chain(&rates.specific_internal_energy)
+        .chain(&rates.maximum_signal_speed)
+    {
+        if !value.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "input_rate",
+                value: *value,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_evolving_state(state: &MfmEvolvingState1d) -> Result<(), HydroError> {
+    let view = state.as_view();
+    let expected = view.positions.len();
+    for (field, actual) in [
+        ("masses", view.masses.len()),
+        ("velocities", view.velocities.len()),
+        (
+            "specific_internal_energy",
+            view.specific_internal_energy.len(),
+        ),
+        ("smoothing_lengths", view.smoothing_lengths.len()),
+    ] {
+        if actual != expected {
+            return Err(HydroError::MismatchedLength {
+                field,
+                expected,
+                actual,
+            });
+        }
+    }
+    validate_particle_columns(
+        view.positions,
+        view.masses,
+        view.smoothing_lengths,
+        view.box_size,
+    )?;
+    for (index, (&velocity, &internal_energy)) in view
+        .velocities
+        .iter()
+        .zip(view.specific_internal_energy)
+        .enumerate()
+    {
+        if !velocity.is_finite() || !internal_energy.is_finite() || internal_energy <= 0.0 {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "evolving_primitive",
+                value: internal_energy,
+            });
+        }
+    }
+    if !view.gamma.is_finite() || view.gamma <= 1.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "gamma",
+            value: view.gamma,
+        });
+    }
+    Ok(())
+}
+
+fn limited_internal_energy_update(
+    previous: f64,
+    rate: f64,
+    timestep: f64,
+    floor: f64,
+) -> Result<f64, HydroError> {
+    if !previous.is_finite()
+        || previous <= 0.0
+        || !rate.is_finite()
+        || !timestep.is_finite()
+        || timestep < 0.0
+        || !floor.is_finite()
+        || floor < 0.0
+    {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "internal_energy_update",
+            value: f64::NAN,
+        });
+    }
+    let candidate = previous + timestep * rate;
+    if !candidate.is_finite() {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "internal_energy_candidate",
+            value: candidate,
+        });
+    }
+    Ok(if candidate < 0.5 * previous {
+        0.5 * previous
+    } else {
+        candidate
+    }
+    .max(floor))
+}
+
+fn pair_signal_speed(
+    i: ReconstructedPoint1d,
+    j: ReconstructedPoint1d,
+    radial_normal: f64,
+    gamma: f64,
+) -> Result<f64, HydroError> {
+    let sound_i = (gamma * i.primitive.pressure / i.primitive.density).sqrt();
+    let sound_j = (gamma * j.primitive.pressure / j.primitive.density).sqrt();
+    let radial_relative_velocity = (i.primitive.velocity - j.primitive.velocity) * radial_normal;
+    let signal_speed = sound_i + sound_j - radial_relative_velocity.min(0.0);
+    if !signal_speed.is_finite() || signal_speed <= 0.0 {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "signal_speed",
+            value: signal_speed,
+        });
+    }
+    Ok(signal_speed)
 }
 
 fn validate_entropic_point(side: &'static str, point: EntropicPoint1d) -> Result<(), HydroError> {
@@ -1694,6 +2230,54 @@ pub struct PairFlux1d {
     pub closure_leak: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MfmState1d<'a> {
+    pub positions: &'a [f64],
+    pub masses: &'a [f64],
+    pub velocities: &'a [f64],
+    pub specific_internal_energy: &'a [f64],
+    pub smoothing_lengths: &'a [f64],
+    pub box_size: f64,
+    pub gamma: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MfmEvolvingState1d {
+    pub positions: Vec<f64>,
+    pub masses: Vec<f64>,
+    pub velocities: Vec<f64>,
+    pub specific_internal_energy: Vec<f64>,
+    pub smoothing_lengths: Vec<f64>,
+    pub box_size: f64,
+    pub gamma: f64,
+}
+
+impl MfmEvolvingState1d {
+    #[must_use]
+    pub fn as_view(&self) -> MfmState1d<'_> {
+        MfmState1d {
+            positions: &self.positions,
+            masses: &self.masses,
+            velocities: &self.velocities,
+            specific_internal_energy: &self.specific_internal_energy,
+            smoothing_lengths: &self.smoothing_lengths,
+            box_size: self.box_size,
+            gamma: self.gamma,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MfmRates1d {
+    pub momentum: Vec<f64>,
+    pub total_energy: Vec<f64>,
+    pub acceleration: Vec<f64>,
+    pub specific_internal_energy: Vec<f64>,
+    pub pair_count: usize,
+    pub entropic_pair_count: usize,
+    pub maximum_signal_speed: Vec<f64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PairSolvePath {
     Reconstructed,
@@ -2299,6 +2883,38 @@ mod tests {
     }
 
     #[test]
+    fn legitimate_kt_pair_flows_through_entropic_correction() {
+        let i = reconstructed_point(PrimitiveState1d {
+            density: 2.0,
+            velocity: 1.0,
+            pressure: 0.8,
+        });
+        let j = reconstructed_point(PrimitiveState1d {
+            density: 1.0,
+            velocity: -1.0,
+            pressure: 0.6,
+        });
+        let raw = mfm_pair_flux_1d(i, j, unit_pair_face(1.0), 5.0 / 3.0).unwrap();
+        assert_eq!(raw.method, RiemannMethod::KurganovTadmor);
+        assert!((raw.momentum - raw.star_pressure).abs() > 1.0);
+        let entropic = |point: ReconstructedPoint1d| EntropicPoint1d {
+            velocity: point.primitive.velocity,
+            density: point.primitive.density,
+            pressure: point.primitive.pressure,
+            sound_speed: ((5.0 / 3.0) * point.primitive.pressure / point.primitive.density).sqrt(),
+            volume: point.primitive.density.recip(),
+            dhsml_factor: 1.0,
+            kernel_radial_derivative: -1.0,
+            condition_number: 1.0,
+            face_closure_error: 0.0,
+        };
+        let (corrected, _) =
+            apply_entropic_pdv_1d(raw, unit_pair_face(1.0), entropic(i), entropic(j)).unwrap();
+        assert_eq!(corrected.method, RiemannMethod::KurganovTadmor);
+        assert!(corrected.energy.is_finite());
+    }
+
+    #[test]
     fn exact_mfm_solver_matches_reference_star_states() {
         let sod = ideal_gas_mfm_flux_1d(
             PrimitiveState1d {
@@ -2717,6 +3333,137 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn spatial_operator_is_conservative_uniform_and_galilean_covariant() {
+        let count = 8_u32;
+        let positions: Vec<f64> = (0..count)
+            .map(|index| (f64::from(index) + 0.5) / f64::from(count))
+            .collect();
+        let masses = vec![1.0 / f64::from(count); positions.len()];
+        let smoothing_lengths = vec![0.25; positions.len()];
+        let uniform_velocity = vec![2.0; positions.len()];
+        let uniform_energy = vec![0.9; positions.len()];
+        let uniform = mfm_spatial_rates_1d(MfmState1d {
+            positions: &positions,
+            masses: &masses,
+            velocities: &uniform_velocity,
+            specific_internal_energy: &uniform_energy,
+            smoothing_lengths: &smoothing_lengths,
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        })
+        .unwrap();
+        assert_eq!(uniform.pair_count, positions.len());
+        for value in uniform
+            .momentum
+            .iter()
+            .chain(&uniform.total_energy)
+            .chain(&uniform.acceleration)
+            .chain(&uniform.specific_internal_energy)
+        {
+            assert!(value.abs() < 1.0e-14);
+        }
+
+        let velocity: Vec<f64> = positions
+            .iter()
+            .map(|position| 0.01 * (std::f64::consts::TAU * position).sin())
+            .collect();
+        let internal_energy: Vec<f64> = positions
+            .iter()
+            .map(|position| 0.9 + 0.01 * (std::f64::consts::TAU * position).sin())
+            .collect();
+        let state = MfmState1d {
+            positions: &positions,
+            masses: &masses,
+            velocities: &velocity,
+            specific_internal_energy: &internal_energy,
+            smoothing_lengths: &smoothing_lengths,
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        };
+        let rates = mfm_spatial_rates_1d(state).unwrap();
+        assert_close(rates.momentum.iter().sum(), 0.0);
+        assert_close(rates.total_energy.iter().sum(), 0.0);
+        for index in 0..positions.len() {
+            assert_close(
+                rates.acceleration[index],
+                rates.momentum[index] / masses[index],
+            );
+            assert_close(
+                rates.specific_internal_energy[index],
+                (rates.total_energy[index] - velocity[index] * rates.momentum[index])
+                    / masses[index],
+            );
+        }
+
+        let boost = 3.0;
+        let boosted_velocity: Vec<f64> = velocity.iter().map(|value| value + boost).collect();
+        let boosted = mfm_spatial_rates_1d(MfmState1d {
+            velocities: &boosted_velocity,
+            ..state
+        })
+        .unwrap();
+        for index in 0..positions.len() {
+            assert!((boosted.acceleration[index] - rates.acceleration[index]).abs() < 1.0e-13);
+            assert!(
+                (boosted.specific_internal_energy[index] - rates.specific_internal_energy[index])
+                    .abs()
+                    < 1.0e-13
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_courant_and_kdk_preserve_uniform_translation() {
+        let count = 8_u32;
+        let positions: Vec<f64> = (0..count)
+            .map(|index| (f64::from(index) + 0.5) / f64::from(count))
+            .collect();
+        let mut state = MfmEvolvingState1d {
+            positions,
+            masses: vec![1.0 / f64::from(count); usize::try_from(count).unwrap()],
+            velocities: vec![2.0; usize::try_from(count).unwrap()],
+            specific_internal_energy: vec![0.9; usize::try_from(count).unwrap()],
+            smoothing_lengths: vec![0.25; usize::try_from(count).unwrap()],
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        };
+        let rates = mfm_spatial_rates_1d(state.as_view()).unwrap();
+        let timestep = global_courant_timestep_1d(state.as_view(), &rates, 0.05).unwrap();
+        assert_close(timestep, 0.00625);
+        let initial_positions = state.positions.clone();
+        let new_rates =
+            advance_mfm_kdk_1d(&mut state, &rates, timestep, 4.0, 1.0e-12, 0.0).unwrap();
+        for (index, &position) in state.positions.iter().enumerate() {
+            assert_close(
+                position,
+                (initial_positions[index] + 2.0 * timestep).rem_euclid(1.0),
+            );
+            assert_close(state.velocities[index], 2.0);
+            assert_close(state.specific_internal_energy[index], 0.9);
+            assert_close(state.smoothing_lengths[index], 0.25);
+            assert!(new_rates.acceleration[index].abs() < 1.0e-14);
+            assert!(new_rates.specific_internal_energy[index].abs() < 1.0e-14);
+        }
+    }
+
+    #[test]
+    fn internal_energy_update_matches_legacy_half_loss_limiter_and_floor() {
+        assert_close(
+            limited_internal_energy_update(1.0, -6.0, 0.1, 0.0).unwrap(),
+            0.5,
+        );
+        assert_close(
+            limited_internal_energy_update(1.0, -4.0, 0.1, 0.0).unwrap(),
+            0.6,
+        );
+        assert_close(
+            limited_internal_energy_update(1.0, -6.0, 0.1, 0.75).unwrap(),
+            0.75,
+        );
+        assert!(limited_internal_energy_update(1.0, f64::NAN, 0.1, 0.0).is_err());
     }
 
     #[test]
