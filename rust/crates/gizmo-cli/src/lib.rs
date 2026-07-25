@@ -10,6 +10,7 @@ pub struct Invocation {
     pub config_file: PathBuf,
     pub parameter_file: PathBuf,
     pub restart: RestartFlag,
+    pub initialize_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,6 +57,7 @@ impl Invocation {
     {
         let mut arguments = arguments.into_iter().map(Into::into);
         let mut config_file = PathBuf::from("Config.sh");
+        let mut initialize_only = false;
         let mut positional = Vec::new();
 
         while let Some(argument) = arguments.next() {
@@ -64,6 +66,8 @@ impl Invocation {
                     .next()
                     .map(PathBuf::from)
                     .ok_or(CliError::MissingConfigPath)?;
+            } else if argument == "--initialize-only" {
+                initialize_only = true;
             } else if argument == "--help" || argument == "-h" {
                 return Err(CliError::HelpRequested);
             } else if argument
@@ -88,11 +92,15 @@ impl Invocation {
             .map(|value| parse_restart_flag(&value))
             .transpose()?
             .unwrap_or_default();
+        if initialize_only && restart != RestartFlag::InitialConditions {
+            return Err(CliError::InitializeOnlyRestart);
+        }
 
         Ok(Self {
             config_file,
             parameter_file,
             restart,
+            initialize_only,
         })
     }
 }
@@ -115,6 +123,7 @@ pub enum CliError {
     TooManyArguments,
     UnknownOption(OsString),
     InvalidRestartFlag(String),
+    InitializeOnlyRestart,
 }
 
 impl fmt::Display for CliError {
@@ -131,6 +140,9 @@ impl fmt::Display for CliError {
                 formatter,
                 "invalid restart flag `{value}`; expected an integer from 0 through 6"
             ),
+            Self::InitializeOnlyRestart => {
+                formatter.write_str("`--initialize-only` requires restart flag 0")
+            }
         }
     }
 }
@@ -139,6 +151,7 @@ impl Error for CliError {}
 
 pub const USAGE: &str = "\
 Usage: gizmo [--config <Config.sh>] <ParameterFile> [<RestartFlag>]
+       gizmo --initialize-only [--config <Config.sh>] <ParameterFile>
 
 RestartFlag:
   0  Read initial conditions and start simulation (default)
@@ -162,6 +175,20 @@ mod tests {
         assert_eq!(invocation.config_file, PathBuf::from("Config.sh"));
         assert_eq!(invocation.parameter_file, PathBuf::from("params.txt"));
         assert_eq!(invocation.restart, RestartFlag::InitialConditions);
+        assert!(!invocation.initialize_only);
+    }
+
+    #[test]
+    fn parses_initialization_only_mode() {
+        let invocation = Invocation::parse([
+            "--initialize-only",
+            "--config",
+            "soundwave.sh",
+            "params.txt",
+        ])
+        .unwrap();
+        assert!(invocation.initialize_only);
+        assert_eq!(invocation.config_file, PathBuf::from("soundwave.sh"));
     }
 
     #[test]

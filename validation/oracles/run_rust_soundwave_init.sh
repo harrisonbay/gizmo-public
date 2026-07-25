@@ -13,3 +13,15 @@ GIZMO_SOUNDWAVE_IC="$fixture" \
   -- \
   --ignored \
   --nocapture
+
+(
+  cd "$repo_root/validation/oracles/soundwave"
+  cargo run \
+    --quiet \
+    --manifest-path "$repo_root/rust/Cargo.toml" \
+    -p gizmo-cli \
+    -- \
+    --initialize-only \
+    --config legacy-config.sh \
+    legacy.params
+)

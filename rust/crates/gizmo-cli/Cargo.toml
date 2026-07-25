@@ -7,6 +7,9 @@ version.workspace = true
 
 [dependencies]
 gizmo-config = { path = "../gizmo-config" }
+gizmo-hydro = { path = "../gizmo-hydro" }
+gizmo-io = { path = "../gizmo-io" }
+gizmo-params = { path = "../gizmo-params" }
 
 [lints]
 workspace = true
@@ -14,4 +17,3 @@ workspace = true
 [[bin]]
 name = "gizmo"
 path = "src/main.rs"
-

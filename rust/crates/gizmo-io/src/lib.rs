@@ -138,6 +138,9 @@ impl SoundWaveSnapshot {
     /// Returns an error if header values or gas columns are invalid, the gas
     /// count disagrees with `NumPart_Total`, or another particle type is present.
     pub fn validate_and_sort(&mut self) -> Result<(), ValidationError> {
+        if self.gas.is_empty() {
+            return Err(ValidationError::EmptyGasState);
+        }
         self.header.validate()?;
         let header_gas_count = usize::try_from(self.header.num_part_total[0])
             .map_err(|_| ValidationError::ParticleCountOverflow(self.header.num_part_total[0]))?;
@@ -346,6 +349,7 @@ fn reorder<T: Copy>(values: &[T], order: &[usize]) -> Vec<T> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidationError {
+    EmptyGasState,
     InvalidHeaderScalar {
         field: &'static str,
         value: f64,
@@ -386,6 +390,7 @@ pub enum ValidationError {
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyGasState => formatter.write_str("sound-wave gas state is empty"),
             Self::InvalidHeaderScalar { field, value } => {
                 write!(formatter, "header `{field}` has invalid value {value}")
             }
@@ -577,6 +582,23 @@ mod tests {
                 count: 1
             })
         ));
+    }
+
+    #[test]
+    fn validation_rejects_empty_gas_state() {
+        let mut empty = valid_snapshot();
+        empty.header.num_part_total[0] = 0;
+        empty.gas.coordinates.clear();
+        empty.gas.velocities.clear();
+        empty.gas.ids.clear();
+        empty.gas.masses.clear();
+        empty.gas.internal_energy.clear();
+        empty.gas.density = Some(Vec::new());
+        empty.gas.smoothing_length = Some(Vec::new());
+        assert_eq!(
+            empty.validate_and_sort(),
+            Err(ValidationError::EmptyGasState)
+        );
     }
 
     #[test]

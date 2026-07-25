@@ -35,10 +35,14 @@ pub fn cubic_kernel_1d(radius: f64, hsml: f64) -> Result<KernelValue, HydroError
         let squared = one_minus_u * one_minus_u;
         (2.0 * squared * one_minus_u, -6.0 * squared)
     };
-    Ok(KernelValue {
+    let result = KernelValue {
         weight: shape * CUBIC_1D_NORMALIZATION / hsml,
         radial_derivative: derivative_shape * CUBIC_1D_NORMALIZATION / (hsml * hsml),
-    })
+    };
+    if !result.weight.is_finite() || !result.radial_derivative.is_finite() {
+        return Err(HydroError::NonFiniteKernelResult { radius, hsml });
+    }
+    Ok(result)
 }
 
 /// Signed legacy periodic displacement `a - b` in a one-dimensional box.
@@ -244,6 +248,19 @@ fn estimate_particle(
             derivative_sum += -(kernel.weight / hsml + (radius / hsml) * kernel.radial_derivative);
         }
     }
+    for (field, value) in [
+        ("kernel_sum", kernel_sum),
+        ("mass_weighted_sum", mass_weighted_sum),
+        ("derivative_sum", derivative_sum),
+    ] {
+        if !value.is_finite() {
+            return Err(HydroError::NonFiniteDensityEstimate {
+                index,
+                field,
+                value,
+            });
+        }
+    }
     Ok(DensityEstimate {
         density: mass_weighted_sum,
         effective_neighbors: kernel_sum * 2.0 * hsml,
@@ -281,6 +298,10 @@ pub enum HydroError {
         radius: f64,
         hsml: f64,
     },
+    NonFiniteKernelResult {
+        radius: f64,
+        hsml: f64,
+    },
     InvalidPeriodicInput {
         a: f64,
         b: f64,
@@ -307,6 +328,11 @@ pub enum HydroError {
         upper: Option<f64>,
         effective_neighbors: f64,
     },
+    NonFiniteDensityEstimate {
+        index: usize,
+        field: &'static str,
+        value: f64,
+    },
 }
 
 impl fmt::Display for HydroError {
@@ -318,6 +344,10 @@ impl fmt::Display for HydroError {
                     "invalid kernel inputs radius={radius}, hsml={hsml}"
                 )
             }
+            Self::NonFiniteKernelResult { radius, hsml } => write!(
+                formatter,
+                "kernel result is non-finite for radius={radius}, hsml={hsml}"
+            ),
             Self::InvalidPeriodicInput { a, b, box_size } => {
                 write!(
                     formatter,
@@ -351,6 +381,14 @@ impl fmt::Display for HydroError {
                 formatter,
                 "particle {index} did not converge on smoothing length: \
                  bounds={lower:?}..{upper:?}, effective neighbors={effective_neighbors}"
+            ),
+            Self::NonFiniteDensityEstimate {
+                index,
+                field,
+                value,
+            } => write!(
+                formatter,
+                "particle {index} produced non-finite density accumulator `{field}`={value}"
             ),
         }
     }
@@ -411,6 +449,8 @@ mod tests {
         assert!(density_at_hsml_1d(&[0.0], &[], &[0.5], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.0], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.5], -1.0).is_err());
+        assert!(density_at_hsml_1d(&[0.0, 0.25], &[1.0e308; 2], &[0.5; 2], 1.0).is_err());
+        assert!(cubic_kernel_1d(0.0, f64::MIN_POSITIVE).is_err());
     }
 
     #[test]

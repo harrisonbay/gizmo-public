@@ -7,11 +7,13 @@ cubic kernel, density summation, and adaptive smoothing-length constraints. It
 does not evolve a simulation yet.
 
 ```console
-cargo run -p gizmo-cli -- --config ../Config.sh ../params.txt 0
+validation/oracles/run_rust_soundwave_init.sh
 ```
 
-The command validates the build configuration and invocation, prints their
-provenance, and then exits with an explicit `not yet ported` error.
+Initialization-only mode validates the sound-wave profile, parses the runtime
+parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive
+`Hsml`, and prints a deterministic JSON summary. Normal invocations still exit
+with an explicit `not yet ported` error before evolution.
 
 Crates are layered so that scientific code does not depend on command-line or
 configuration parsing:
