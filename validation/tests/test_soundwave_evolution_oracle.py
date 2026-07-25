@@ -21,6 +21,18 @@ class SoundwaveEvolutionOracleTests(unittest.TestCase):
         self.assertEqual(manifest["timeline"]["steps"], 65_536)
         self.assertEqual(manifest["timeline"]["shared_step_ticks"], 8192)
 
+        for input_name in (
+            "config",
+            "parameters",
+            "one_step_parameters",
+            "post_kick_instrumentation",
+        ):
+            input_record = manifest["inputs"][input_name]
+            digest = hashlib.sha256(
+                (ORACLE_DIR / input_record["path"]).read_bytes()
+            ).hexdigest()
+            self.assertEqual(digest, input_record["sha256"])
+
         for snapshot in manifest["snapshots"]:
             table = ORACLE_DIR / snapshot["table"]
             digest = hashlib.sha256(table.read_bytes()).hexdigest()

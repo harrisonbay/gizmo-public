@@ -18,6 +18,16 @@
       "path": "legacy.params",
       "sha256": "47814e91badf91863568a7939693b48d2b39fc63fb81d1bdd5213b497dcc42fa"
     },
+    "one_step_parameters": {
+      "path": "one-step.params",
+      "sha256": "d5742881249597e98c9010f8b3c607c95d378d88788a73a2a3eb1b8b19dda83d",
+      "note": "Uses the initial-step snapshot cadence and explicitly preserves the production MaxSizeTimestep=0.001 cap"
+    },
+    "post_kick_instrumentation": {
+      "path": "post-kick-snapshot.patch",
+      "sha256": "d2838661fb403e1e9f552c239bdca19b80ed0fd7b13f51c4fc2ea6b7c8598f89",
+      "note": "Adds one semantic snapshot immediately after the first do_second_halfstep_kick; no numerical state is modified"
+    },
     "initial_conditions": {
       "path": "soundwave_ics.hdf5",
       "sha256": "d13c5f1bb916490037c96f2d3e4fa37b1121e09b352bd6bc15de80bee9f35b35"
@@ -52,6 +62,14 @@
       "raw_sha256": "9d78a048b41ec2261f22e87befe512e94371538e18efd594635572c4e55611c3",
       "table": "evolution_t0.csv.gz",
       "table_sha256": "e55d626ace04511a62f64b05639bf666c3e4ef83438a24b236714e82acbbbeac"
+    },
+    {
+      "time": 2.288818359375e-05,
+      "run_profile": "one_step_parameters + post_kick_instrumentation",
+      "state_phase": "immediately after do_second_halfstep_kick",
+      "raw_sha256": "f40f2cd99ba433ac2f44ca4b248955c6b735060260cce62ed63396e709a6111f",
+      "table": "evolution_step1.csv.gz",
+      "table_sha256": "f0330968cf6c72d85921cd10092ed59a19b271c8df9f0f2b2426b3dfd849649c"
     },
     {
       "time": 0.1,

@@ -308,6 +308,49 @@
         }
       ],
       "dossier": "audit/findings/GZ-0008.md"
+    },
+    {
+      "id": "GZ-0009",
+      "title": "First evolved MFM gradient pass produces localized force spikes",
+      "status": "under_investigation",
+      "confidence": "medium",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "BOX_SPATIAL_DIMENSION=1",
+        "BOX_PERIODIC",
+        "SELFGRAVITY_OFF",
+        "FORCE_EQUAL_TIMESTEPS"
+      ],
+      "summary": "An observation-only post-kick differential agrees on the first half-kick and endpoint scalar state but finds localized density/pressure-gradient and acceleration spikes in the first evolved corrected-C force pass. The divergence clusters near tree/order boundaries; its attribution remains under investigation.",
+      "impact": "A C-side neighbor or gradient-accumulation defect would inject tree-layout-dependent momentum errors into smooth MFM flows. Alternatively, an unported intended semantic would leave the Rust endpoint momentum update incomplete.",
+      "reproduction": "Run the pinned one-rank sound wave with validation/oracles/soundwave/post-kick-snapshot.patch, record endpoint HydroAccel and scalar gradients before the second kick, and compare by particle ID with the direct Rust all-pairs operator.",
+      "falsification": "Show that an independent implementation without the C tree traversal reproduces the localized gradients, or identify a diagnostic phase or field-conversion error that explains the measured divergence.",
+      "oracle": {
+        "type": "differential",
+        "classification": "property",
+        "rationale": "The post-kick state separates two half-kicks and compares the tree-based C operator with a direct all-pairs implementation while checking smooth-wave scale and conservation invariants."
+      },
+      "sources": [
+        {
+          "path": "run.c",
+          "line_start": 70,
+          "line_end": 133,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/run.c#L70-L133"
+        },
+        {
+          "path": "io.c",
+          "line_start": 236,
+          "line_end": 240,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/io.c#L236-L240"
+        },
+        {
+          "path": "hydro/gradients.c",
+          "line_start": 1940,
+          "line_end": 1995,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/gradients.c#L1940-L1995"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0009.md"
     }
   ]
 }

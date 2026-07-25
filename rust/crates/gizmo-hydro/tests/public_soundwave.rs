@@ -1,11 +1,12 @@
 use gizmo_hydro::{
-    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, MfmState1d, PrimitiveState1d,
-    ReconstructedPoint1d, RiemannMethod, SynchronizedTimeline1d, apply_entropic_pdv_1d,
-    cubic_kernel_1d, density_at_hsml_1d, face_closure_errors_1d, global_courant_timestep_1d,
-    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_pair_flux_1d,
-    mfm_spatial_rates_1d, solve_smoothing_lengths_1d,
+    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, MfmEvolvingState1d, MfmState1d,
+    PrimitiveState1d, ReconstructedPoint1d, RiemannMethod, SynchronizedTimeline1d,
+    advance_mfm_kdk_1d, apply_entropic_pdv_1d, cubic_kernel_1d, density_at_hsml_1d,
+    face_closure_errors_1d, global_courant_timestep_1d, gradients_at_hsml_1d, inverse_moments_1d,
+    meshless_face_geometry_1d, mfm_pair_flux_1d, mfm_spatial_rates_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
+use std::path::Path;
 
 #[test]
 #[ignore = "requires GIZMO_SOUNDWAVE_IC; run via validation oracle script"]
@@ -116,6 +117,184 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         &snapshot.gas.internal_energy,
         smoothing_lengths,
         snapshot.header.box_size,
+    );
+    assert_corrected_c_first_step();
+}
+
+#[derive(Debug)]
+struct EvolutionTable {
+    positions: Vec<f64>,
+    velocities: Vec<f64>,
+    densities: Vec<f64>,
+    specific_internal_energy: Vec<f64>,
+    smoothing_lengths: Vec<f64>,
+    masses: Vec<f64>,
+}
+
+fn read_evolution_table(path: &Path) -> EvolutionTable {
+    let contents = std::fs::read_to_string(path).expect("evolution table must be readable");
+    let mut lines = contents.lines();
+    assert_eq!(
+        lines.next(),
+        Some("particle_id,x,velocity_x,density,specific_internal_energy,smoothing_length,mass")
+    );
+    let mut table = EvolutionTable {
+        positions: Vec::new(),
+        velocities: Vec::new(),
+        densities: Vec::new(),
+        specific_internal_energy: Vec::new(),
+        smoothing_lengths: Vec::new(),
+        masses: Vec::new(),
+    };
+    for (expected_id, line) in lines.enumerate() {
+        let columns: Vec<&str> = line.split(',').collect();
+        assert_eq!(columns.len(), 7);
+        assert_eq!(
+            columns[0].parse::<usize>().expect("particle ID"),
+            expected_id
+        );
+        table
+            .positions
+            .push(columns[1].parse().expect("x coordinate"));
+        table
+            .velocities
+            .push(columns[2].parse().expect("x velocity"));
+        table.densities.push(columns[3].parse().expect("density"));
+        table
+            .specific_internal_energy
+            .push(columns[4].parse().expect("specific internal energy"));
+        table
+            .smoothing_lengths
+            .push(columns[5].parse().expect("smoothing length"));
+        table.masses.push(columns[6].parse().expect("mass"));
+    }
+    assert_eq!(table.positions.len(), 2048);
+    table
+}
+
+fn max_relative_error(actual: &[f64], expected: &[f64]) -> f64 {
+    assert_eq!(actual.len(), expected.len());
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| {
+            let error = (actual - expected).abs() / expected.abs().max(1.0e-30);
+            assert!(error.is_finite());
+            error
+        })
+        .fold(0.0, f64::max)
+}
+
+fn max_absolute_error(actual: &[f64], expected: &[f64]) -> f64 {
+    assert_eq!(actual.len(), expected.len());
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| {
+            let error = (actual - expected).abs();
+            assert!(error.is_finite());
+            error
+        })
+        .fold(0.0, f64::max)
+}
+
+fn assert_corrected_c_first_step() {
+    let initialized_path = std::env::var_os("GIZMO_SOUNDWAVE_C_T0")
+        .expect("corrected-C initialized table is required");
+    let expected_path = std::env::var_os("GIZMO_SOUNDWAVE_C_STEP1")
+        .expect("corrected-C first-step table is required");
+    let initialized = read_evolution_table(Path::new(&initialized_path));
+    let expected = read_evolution_table(Path::new(&expected_path));
+    let fixture_path =
+        std::env::var_os("GIZMO_SOUNDWAVE_IC").expect("pinned public fixture is required");
+    let initial = read_soundwave(fixture_path).expect("pinned public fixture must be valid");
+    let initial_positions: Vec<f64> = initial
+        .gas
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate[0])
+        .collect();
+    let initial_velocities: Vec<f64> = initial
+        .gas
+        .velocities
+        .iter()
+        .map(|velocity| velocity[0])
+        .collect();
+    assert!(max_absolute_error(&initial_positions, &initialized.positions) < 1.0e-15);
+    assert!(max_relative_error(&initial.gas.masses, &initialized.masses) < 1.0e-15);
+    let mut state = MfmEvolvingState1d {
+        positions: initial_positions.clone(),
+        masses: initial.gas.masses.clone(),
+        velocities: initial_velocities.clone(),
+        specific_internal_energy: initial.gas.internal_energy.clone(),
+        smoothing_lengths: initialized.smoothing_lengths.clone(),
+        box_size: initial.header.box_size,
+        gamma: 5.0 / 3.0,
+    };
+    let old_rates = mfm_spatial_rates_1d(state.as_view()).expect("initial Rust RHS must be valid");
+    let timestep = 8192.0 * 1.5 / 536_870_912.0;
+    let rust_half_velocity: Vec<f64> = initial_velocities
+        .iter()
+        .zip(&old_rates.acceleration)
+        .map(|(velocity, acceleration)| velocity + 0.5 * timestep * acceleration)
+        .collect();
+    let new_rates = advance_mfm_kdk_1d(&mut state, &old_rates, timestep, 4.0, 0.05, 0.0)
+        .expect("Rust first KDK step must succeed");
+    let densities: Vec<f64> = density_at_hsml_1d(
+        &state.positions,
+        &state.masses,
+        &state.smoothing_lengths,
+        state.box_size,
+    )
+    .expect("endpoint density must be valid")
+    .into_iter()
+    .map(|estimate| estimate.density)
+    .collect();
+
+    let position_error = max_absolute_error(&state.positions, &expected.positions);
+    let velocity_error = max_absolute_error(&state.velocities, &expected.velocities);
+    let density_error = max_relative_error(&densities, &expected.densities);
+    let energy_error = max_relative_error(
+        &state.specific_internal_energy,
+        &expected.specific_internal_energy,
+    );
+    let smoothing_error = max_relative_error(&state.smoothing_lengths, &expected.smoothing_lengths);
+    let position_signal = max_absolute_error(&expected.positions, &initial_positions);
+    let velocity_signal = max_absolute_error(&expected.velocities, &initial_velocities);
+    let density_signal = max_relative_error(&expected.densities, &initialized.densities);
+    let energy_signal = max_relative_error(
+        &expected.specific_internal_energy,
+        &initial.gas.internal_energy,
+    );
+    let smoothing_signal =
+        max_relative_error(&expected.smoothing_lengths, &initialized.smoothing_lengths);
+    let first_kick_error = max_absolute_error(&rust_half_velocity, &initialized.velocities);
+    let first_kick_signal = max_absolute_error(&initialized.velocities, &initial_velocities);
+    let rust_second_half_velocity: Vec<f64> = rust_half_velocity
+        .iter()
+        .zip(&new_rates.acceleration)
+        .map(|(velocity, acceleration)| velocity + 0.5 * timestep * acceleration)
+        .collect();
+    let second_kick_error = max_absolute_error(&rust_second_half_velocity, &expected.velocities);
+    let second_kick_signal = max_absolute_error(&expected.velocities, &initialized.velocities);
+    eprintln!(
+        "corrected-C first-step parity: max |dx|={position_error:.12e}, \
+         max |dv|={velocity_error:.12e}, max rel density/u/Hsml=\
+         {density_error:.12e}/{energy_error:.12e}/{smoothing_error:.12e}; \
+         C step signals={position_signal:.12e}/{velocity_signal:.12e}/\
+         {density_signal:.12e}/{energy_signal:.12e}/{smoothing_signal:.12e}; \
+         first/second kick error-to-signal={first_kick_error:.12e}/\
+         {first_kick_signal:.12e}, {second_kick_error:.12e}/{second_kick_signal:.12e}"
+    );
+
+    assert!(position_error < 0.01 * position_signal);
+    assert!(density_error < 0.01 * density_signal);
+    assert!(energy_error < 0.01 * energy_signal);
+    assert!(smoothing_error < 1.0e-9);
+    assert!(first_kick_error < 0.01 * first_kick_signal);
+    assert!(
+        second_kick_error > 0.1 * second_kick_signal,
+        "GZ-0009 remains under investigation; do not silently claim full endpoint parity"
     );
 }
 

@@ -36,3 +36,15 @@ uv run --with h5py --with numpy \
   python validation/oracles/reduce_soundwave_snapshot.py \
   snapshot_001.hdf5 evolution_t0.1.csv.gz
 ```
+
+Normal GIZMO snapshots are written during the drift, before the endpoint force
+and second kick, and `io.c` warns that their velocity is staggered. Therefore
+`evolution_step1.csv.gz` is generated with the pinned
+`post-kick-snapshot.patch`, which writes one additional snapshot immediately
+after the first `do_second_halfstep_kick()`. The patch only observes state and
+is checksum-pinned in the manifest. The ignored Rust integration test compares
+this completed 8192-tick state against the original IC. Position, density,
+internal energy, and the first half-kick are strict gates. The second half-kick
+currently has a localized corrected-C/Rust force divergence recorded as
+GZ-0009, so the test asserts that the discrepancy remains visible instead of
+silently claiming endpoint velocity parity.

@@ -2239,20 +2239,17 @@ fn estimate_particle(
 ) -> Result<DensityEstimate, HydroError> {
     let position = positions[index];
     let mut kernel_sum = 0.0;
-    let mut mass_weighted_sum = 0.0;
     let mut derivative_sum = 0.0;
-    for (&neighbor_position, &neighbor_mass) in positions.iter().zip(masses) {
+    for &neighbor_position in positions {
         let radius = periodic_displacement_1d(position, neighbor_position, box_size)?.abs();
         let kernel = cubic_kernel_1d(radius, hsml)?;
         kernel_sum += kernel.weight;
-        mass_weighted_sum += neighbor_mass * kernel.weight;
         if radius < hsml {
             derivative_sum += -(kernel.weight / hsml + (radius / hsml) * kernel.radial_derivative);
         }
     }
     for (field, value) in [
         ("kernel_sum", kernel_sum),
-        ("mass_weighted_sum", mass_weighted_sum),
         ("derivative_sum", derivative_sum),
     ] {
         if !value.is_finite() {
@@ -2263,8 +2260,16 @@ fn estimate_particle(
             });
         }
     }
+    let particle_density = masses[index] * kernel_sum;
+    if !particle_density.is_finite() {
+        return Err(HydroError::NonFiniteDensityEstimate {
+            index,
+            field: "density",
+            value: particle_density,
+        });
+    }
     Ok(DensityEstimate {
-        density: mass_weighted_sum,
+        density: particle_density,
         effective_neighbors: kernel_sum * 2.0 * hsml,
         dhsml_factor: if kernel_sum > 0.0 {
             let raw = derivative_sum * hsml / kernel_sum;
@@ -2724,11 +2729,21 @@ mod tests {
     }
 
     #[test]
+    fn mfm_density_uses_particle_mass_times_kernel_number_density() {
+        let estimates = density_at_hsml_1d(&[0.0, 0.25], &[1.0, 3.0], &[0.5; 2], 1.0).unwrap();
+        assert_close(estimates[0].density, estimates[1].density / 3.0);
+        assert_close(
+            estimates[0].density,
+            estimates[0].effective_neighbors / (2.0 * 0.5),
+        );
+    }
+
+    #[test]
     fn malformed_columns_fail_closed() {
         assert!(density_at_hsml_1d(&[0.0], &[], &[0.5], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.0], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.5], -1.0).is_err());
-        assert!(density_at_hsml_1d(&[0.0, 0.25], &[1.0e308; 2], &[0.5; 2], 1.0).is_err());
+        assert!(density_at_hsml_1d(&[0.0, 0.25], &[f64::MAX; 2], &[0.5; 2], 1.0).is_err());
         assert!(cubic_kernel_1d(0.0, f64::MIN_POSITIVE).is_err());
     }
 
