@@ -1,6 +1,7 @@
 use gizmo_hydro::{
-    GradientEstimate, MeshlessPoint1d, PrimitiveState1d, ReconstructedPoint1d, RiemannMethod,
-    density_at_hsml_1d, gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
+    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, PrimitiveState1d, ReconstructedPoint1d,
+    RiemannMethod, apply_entropic_pdv_1d, cubic_kernel_1d, density_at_hsml_1d,
+    face_closure_errors_1d, gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
     mfm_pair_flux_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
@@ -222,6 +223,7 @@ fn assert_public_faces(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn assert_public_pair_fluxes(
     positions: &[f64],
     masses: &[f64],
@@ -254,6 +256,10 @@ fn assert_public_pair_fluxes(
             .expect("public pressure gradients must be valid");
     let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)
         .expect("public geometry must have invertible moments");
+    let closure_errors = face_closure_errors_1d(positions, smoothing_lengths, box_size)
+        .expect("public geometry must have finite face-closure errors");
+    let density_estimates = density_at_hsml_1d(positions, masses, smoothing_lengths, box_size)
+        .expect("public density factors must be valid");
     let geometry = |index: usize| MeshlessPoint1d {
         position: positions[index],
         mass: masses[index],
@@ -270,13 +276,16 @@ fn assert_public_pair_fluxes(
         density_gradient: density_gradients[index].limited,
         velocity_gradient: velocity_gradients[index].limited,
         pressure_gradient: pressure_gradients[index].limited,
+        face_closure_error: closure_errors[index],
     };
     let mut spatial_order: Vec<usize> = (0..positions.len()).collect();
     spatial_order.sort_unstable_by(|left, right| positions[*left].total_cmp(&positions[*right]));
 
     let mut max_momentum_swap_error = 0.0_f64;
-    let mut max_energy_swap_error = 0.0_f64;
+    let mut max_raw_energy_swap_error = 0.0_f64;
+    let mut max_corrected_energy_swap_error = 0.0_f64;
     let mut hllc_pairs = 0_usize;
+    let mut entropic_pairs = 0_usize;
     for (order_index, &index) in spatial_order.iter().enumerate() {
         let neighbor = spatial_order[(order_index + 1) % spatial_order.len()];
         let face = meshless_face_geometry_1d(geometry(index), geometry(neighbor), box_size)
@@ -301,18 +310,51 @@ fn assert_public_pair_fluxes(
         assert!(reverse.mass.abs() <= f64::EPSILON);
         max_momentum_swap_error =
             max_momentum_swap_error.max((flux.momentum + reverse.momentum).abs());
-        max_energy_swap_error = max_energy_swap_error.max((flux.energy + reverse.energy).abs());
+        max_raw_energy_swap_error =
+            max_raw_energy_swap_error.max((flux.energy + reverse.energy).abs());
+        let distance = face.distance_from_i.abs() + face.distance_from_j.abs();
+        let entropic_point = |particle: usize| EntropicPoint1d {
+            velocity: velocity[particle],
+            density: density[particle],
+            pressure: pressure[particle],
+            sound_speed: ((5.0 / 3.0) * pressure[particle] / density[particle]).sqrt(),
+            volume: masses[particle] / density[particle],
+            dhsml_factor: density_estimates[particle].dhsml_factor,
+            kernel_radial_derivative: cubic_kernel_1d(distance, smoothing_lengths[particle])
+                .expect("public pair kernel derivative must be valid")
+                .radial_derivative,
+            condition_number: 1.0,
+            face_closure_error: closure_errors[particle],
+        };
+        let (corrected, selected) =
+            apply_entropic_pdv_1d(flux, face, entropic_point(index), entropic_point(neighbor))
+                .expect("public pair entropic correction must be valid");
+        let (corrected_reverse, reverse_selected) = apply_entropic_pdv_1d(
+            reverse,
+            reverse_face,
+            entropic_point(neighbor),
+            entropic_point(index),
+        )
+        .expect("reversed public pair entropic correction must be valid");
+        assert_eq!(selected, reverse_selected);
+        entropic_pairs += usize::from(selected);
+        max_corrected_energy_swap_error = max_corrected_energy_swap_error
+            .max((corrected.energy + corrected_reverse.energy).abs());
         if flux.method == RiemannMethod::Hllc {
             hllc_pairs += 1;
         }
     }
     eprintln!(
-        "public fixture pair fluxes: HLLC={hllc_pairs}/{}, \
+        "public fixture pair fluxes: HLLC={hllc_pairs}/{}, entropic={entropic_pairs}/{}, \
          max swap momentum error={max_momentum_swap_error:.12e}, \
-         max swap energy error={max_energy_swap_error:.12e}",
-        positions.len()
+         max raw/corrected swap energy error={max_raw_energy_swap_error:.12e}/\
+         {max_corrected_energy_swap_error:.12e}",
+        positions.len(),
+        positions.len(),
     );
     assert_eq!(hllc_pairs, positions.len());
+    assert_eq!(entropic_pairs, positions.len());
     assert!(max_momentum_swap_error < 1.0e-12);
-    assert!(max_energy_swap_error < 1.0e-12);
+    assert!(max_raw_energy_swap_error < 1.0e-12);
+    assert!(max_corrected_energy_swap_error < 1.0e-12);
 }

@@ -5,6 +5,9 @@ use std::fmt;
 
 /// Normalization of GIZMO's default cubic spline in one dimension.
 pub const CUBIC_1D_NORMALIZATION: f64 = 4.0 / 3.0;
+const EPSILON_ENTROPIC_BIG: f64 = 0.5;
+const EPSILON_ENTROPIC_SMALL: f64 = 1.0e-3;
+const CONDITION_NUMBER_DANGER_SQUARED: f64 = 1.0e6;
 
 /// Value and radial derivative of the default one-dimensional cubic kernel.
 ///
@@ -217,6 +220,52 @@ pub fn inverse_moments_1d(
             });
         }
         output.push(inverse);
+    }
+    Ok(output)
+}
+
+/// Compute the one-dimensional meshless face-closure diagnostic.
+///
+/// This is the scalar specialization of the legacy density-loop
+/// `FaceClosureError`: `|(1 / sum W) * inverse_moment * sum(W dx)|`.
+///
+/// # Errors
+///
+/// Returns an error for invalid columns, singular moments, or non-finite
+/// kernel arithmetic.
+pub fn face_closure_errors_1d(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<Vec<f64>, HydroError> {
+    let unit_masses = vec![1.0; positions.len()];
+    validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
+    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
+    let mut output = Vec::with_capacity(positions.len());
+    for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        let mut kernel_sum = 0.0;
+        let mut first_moment = 0.0;
+        for &neighbor_position in positions {
+            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let kernel = cubic_kernel_1d(displacement.abs(), hsml)?;
+            kernel_sum += kernel.weight;
+            if !legacy_float_equal(displacement, 0.0) {
+                first_moment += kernel.weight * displacement;
+            }
+        }
+        let closure_error = (first_moment * inverse_moments[index] / kernel_sum).abs();
+        if !kernel_sum.is_finite()
+            || kernel_sum <= 0.0
+            || !first_moment.is_finite()
+            || !closure_error.is_finite()
+        {
+            return Err(HydroError::NonFiniteGradient {
+                index,
+                field: "face_closure_error",
+                value: closure_error,
+            });
+        }
+        output.push(closure_error);
     }
     Ok(output)
 }
@@ -641,6 +690,25 @@ pub fn mfm_pair_flux_1d(
     }
     validate_riemann_state("i", i.primitive)?;
     validate_riemann_state("j", j.primitive)?;
+    if !i.face_closure_error.is_finite() || i.face_closure_error < 0.0 {
+        return Err(HydroError::InvalidReconstructionInput {
+            field: "i_face_closure_error",
+            value: i.face_closure_error,
+        });
+    }
+    if !j.face_closure_error.is_finite() || j.face_closure_error < 0.0 {
+        return Err(HydroError::InvalidReconstructionInput {
+            field: "j_face_closure_error",
+            value: j.face_closure_error,
+        });
+    }
+    let closure_leak = 0.5 * (i.face_closure_error + j.face_closure_error);
+    if !closure_leak.is_finite() {
+        return Err(HydroError::InvalidReconstructionInput {
+            field: "closure_leak",
+            value: closure_leak,
+        });
+    }
 
     let density = reconstruct_face_states_1d(
         i.primitive.density,
@@ -686,7 +754,7 @@ pub fn mfm_pair_flux_1d(
     let solve = |left: PrimitiveState1d, right: PrimitiveState1d, limit: f64| {
         ideal_gas_mfm_flux_1d(left, right, gamma, limit)
     };
-    let first = match (density, velocity, pressure) {
+    let first = (closure_leak <= 1.0).then(|| match (density, velocity, pressure) {
         (Ok(density), Ok(velocity), Ok(pressure)) => solve(
             PrimitiveState1d {
                 density: density.left,
@@ -701,12 +769,12 @@ pub fn mfm_pair_flux_1d(
             pressure_limit,
         ),
         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
-    };
+    });
     let (interface_flux, solve_path) = match first {
-        Ok(flux) if flux.star_pressure <= 1.4 * pressure_limit => {
+        Some(Ok(flux)) if flux.star_pressure <= 1.4 * pressure_limit => {
             (flux, PairSolvePath::Reconstructed)
         }
-        Ok(_) | Err(_) => {
+        Some(Ok(_) | Err(_)) | None => {
             let centered_left = PrimitiveState1d {
                 density: j.primitive.density,
                 velocity: (j.primitive.velocity - interface_velocity) * normal,
@@ -754,7 +822,212 @@ pub fn mfm_pair_flux_1d(
         solver_speed: interface_flux.solver_speed,
         method: interface_flux.method,
         solve_path,
+        closure_leak,
     })
+}
+
+/// Inputs to GIZMO's low-contact-speed MFM entropic/PdV energy correction.
+///
+/// `kernel_radial_derivative` is `dW(r,h)/dr` evaluated with this particle's
+/// smoothing length. `volume` is the particle mass divided by its density.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntropicPoint1d {
+    pub velocity: f64,
+    pub density: f64,
+    pub pressure: f64,
+    pub sound_speed: f64,
+    pub volume: f64,
+    pub dhsml_factor: f64,
+    pub kernel_radial_derivative: f64,
+    pub condition_number: f64,
+    pub face_closure_error: f64,
+}
+
+/// Apply the legacy non-cosmological 1-D MFM entropic/PdV energy correction.
+///
+/// The input must be the raw, area-integrated lab-frame result from
+/// [`mfm_pair_flux_1d`]. The returned boolean reports whether the entropic
+/// energy equation was selected. Momentum and mass fluxes are unchanged.
+///
+/// # Errors
+///
+/// Returns an error for invalid thermodynamic, geometric, kernel, or flux
+/// inputs, or if the correction produces a non-finite energy flux.
+#[allow(clippy::float_cmp, clippy::too_many_lines)]
+pub fn apply_entropic_pdv_1d(
+    mut flux: PairFlux1d,
+    face: MeshlessFace1d,
+    i: EntropicPoint1d,
+    j: EntropicPoint1d,
+) -> Result<(PairFlux1d, bool), HydroError> {
+    if !face.signed_area.is_finite()
+        || face.signed_area == 0.0
+        || !legacy_float_equal(face.area, face.signed_area.abs())
+        || !face.distance_from_i.is_finite()
+        || !face.distance_from_j.is_finite()
+        || legacy_float_equal(face.distance_from_i, face.distance_from_j)
+        || face.distance_from_i.signum() != -face.signed_area.signum()
+        || face.distance_from_j.signum() != face.signed_area.signum()
+        || (face.distance_from_i + face.distance_from_j).abs()
+            > f64::EPSILON * (face.distance_from_i.abs() + face.distance_from_j.abs())
+    {
+        return Err(HydroError::InvalidFaceInput {
+            side: "pair",
+            field: "signed_area",
+            value: face.signed_area,
+        });
+    }
+    validate_entropic_point("i", i)?;
+    validate_entropic_point("j", j)?;
+    for (field, value) in [
+        ("mass", flux.mass),
+        ("momentum", flux.momentum),
+        ("energy", flux.energy),
+        ("star_pressure", flux.star_pressure),
+        ("interface_velocity", flux.interface_velocity),
+        ("solver_speed", flux.solver_speed),
+        ("closure_leak", flux.closure_leak),
+    ] {
+        if !value.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult { field, value });
+        }
+    }
+    if flux.star_pressure < 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "star_pressure",
+            value: flux.star_pressure,
+        });
+    }
+    let midpoint_velocity = 0.5 * (i.velocity + j.velocity);
+    let expected_momentum = flux.star_pressure * face.area * face.signed_area.signum();
+    if !legacy_float_equal(flux.mass, 0.0)
+        || !legacy_float_equal(flux.interface_velocity, midpoint_velocity)
+        || !legacy_float_equal(flux.momentum, expected_momentum)
+    {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "entropic_source_flux",
+            value: flux.momentum,
+        });
+    }
+
+    let normal = face.signed_area / face.area;
+    let face_velocity_i = i.velocity * normal;
+    let face_velocity_j = j.velocity * normal;
+    let face_velocity = 0.5 * (face_velocity_i + face_velocity_j);
+    let relative_velocity = face_velocity_i - face_velocity_j;
+    let sound_speed = i.sound_speed.min(j.sound_speed);
+    let speed_ratio = flux.solver_speed.abs() / sound_speed;
+    let closure_leak = 0.5 * (i.face_closure_error + j.face_closure_error);
+    if !legacy_float_equal(flux.closure_leak, closure_leak) {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "closure_leak",
+            value: flux.closure_leak,
+        });
+    }
+    if !speed_ratio.is_finite() || !closure_leak.is_finite() {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "entropic_gate",
+            value: f64::NAN,
+        });
+    }
+    if speed_ratio >= EPSILON_ENTROPIC_BIG && closure_leak <= 1.0 {
+        return Ok((flux, false));
+    }
+
+    let pressure_area = flux.star_pressure * face.area;
+    let pdv_factor = flux.star_pressure * relative_velocity;
+    let pdv_i = i.kernel_radial_derivative * i.volume * i.volume * i.dhsml_factor * pdv_factor;
+    let pdv_j = j.kernel_radial_derivative * j.volume * j.volume * j.dhsml_factor * pdv_factor;
+    let old_energy = pressure_area * (flux.solver_speed + face_velocity);
+    let new_energy = 0.5 * (pdv_i - pdv_j + pressure_area * (face_velocity_i + face_velocity_j));
+    if !pressure_area.is_finite()
+        || !pdv_i.is_finite()
+        || !pdv_j.is_finite()
+        || !old_energy.is_finite()
+        || !new_energy.is_finite()
+    {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "entropic_energy",
+            value: f64::NAN,
+        });
+    }
+
+    let condition_i_squared = i.condition_number * i.condition_number;
+    let neighbor_condition_squared = j.condition_number * j.condition_number;
+    if !condition_i_squared.is_finite() || !neighbor_condition_squared.is_finite() {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "condition_number",
+            value: i.condition_number.max(j.condition_number),
+        });
+    }
+    let condition_threshold = CONDITION_NUMBER_DANGER_SQUARED - condition_i_squared;
+    let mut use_entropic_energy = true;
+    if speed_ratio > EPSILON_ENTROPIC_SMALL
+        && neighbor_condition_squared < condition_threshold
+        && i.pressure / i.density != j.pressure / j.density
+    {
+        if i.pressure / i.density > j.pressure / j.density {
+            let thermal_change_j = -old_energy + pressure_area * face_velocity_j;
+            if thermal_change_j > 0.0
+                || (thermal_change_j < 0.0
+                    && thermal_change_j > -new_energy + pressure_area * face_velocity_j)
+            {
+                use_entropic_energy = false;
+            }
+        } else {
+            let thermal_change_i = old_energy - pressure_area * face_velocity_i;
+            if thermal_change_i > 0.0
+                || (thermal_change_i < 0.0
+                    && thermal_change_i > new_energy - pressure_area * face_velocity_i)
+            {
+                use_entropic_energy = false;
+            }
+        }
+    }
+    if neighbor_condition_squared >= condition_threshold {
+        use_entropic_energy = true;
+    }
+    if use_entropic_energy {
+        flux.energy += new_energy - old_energy;
+        if !flux.energy.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "entropic_corrected_energy",
+                value: flux.energy,
+            });
+        }
+    }
+    Ok((flux, use_entropic_energy))
+}
+
+fn validate_entropic_point(side: &'static str, point: EntropicPoint1d) -> Result<(), HydroError> {
+    for (field, value) in [
+        ("density", point.density),
+        ("pressure", point.pressure),
+        ("sound_speed", point.sound_speed),
+        ("volume", point.volume),
+        ("dhsml_factor", point.dhsml_factor),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(HydroError::InvalidRiemannState { side, field, value });
+        }
+    }
+    for (field, value) in [
+        ("velocity", point.velocity),
+        ("kernel_radial_derivative", point.kernel_radial_derivative),
+    ] {
+        if !value.is_finite() || (field == "kernel_radial_derivative" && value > 0.0) {
+            return Err(HydroError::InvalidRiemannState { side, field, value });
+        }
+    }
+    for (field, value) in [
+        ("condition_number", point.condition_number),
+        ("face_closure_error", point.face_closure_error),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(HydroError::InvalidRiemannState { side, field, value });
+        }
+    }
+    Ok(())
 }
 
 enum HllcOutcome {
@@ -1386,6 +1659,7 @@ pub struct ReconstructedPoint1d {
     pub density_gradient: f64,
     pub velocity_gradient: f64,
     pub pressure_gradient: f64,
+    pub face_closure_error: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1417,6 +1691,7 @@ pub struct PairFlux1d {
     pub solver_speed: f64,
     pub method: RiemannMethod,
     pub solve_path: PairSolvePath,
+    pub closure_leak: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1708,6 +1983,9 @@ mod tests {
             assert!((estimate.density - 1.0).abs() < 1e-15);
             assert!((estimate.effective_neighbors - 4.0).abs() < 1e-15);
             assert!(estimate.dhsml_factor.is_finite());
+        }
+        for closure_error in face_closure_errors_1d(&positions, &hsml, 1.0).unwrap() {
+            assert_close(closure_error, 0.0);
         }
     }
 
@@ -2075,6 +2353,7 @@ mod tests {
             density_gradient: 0.0,
             velocity_gradient: 0.0,
             pressure_gradient: 0.0,
+            face_closure_error: 0.0,
         }
     }
 
@@ -2218,6 +2497,226 @@ mod tests {
         let flux = mfm_pair_flux_1d(i, j, retry_face, 5.0 / 3.0).unwrap();
         assert_eq!(flux.solve_path, PairSolvePath::Centered);
         assert!(flux.star_pressure.is_finite());
+    }
+
+    #[test]
+    fn pair_flux_disables_reconstruction_for_excessive_face_leak() {
+        let i = ReconstructedPoint1d {
+            pressure_gradient: 0.2,
+            face_closure_error: 2.1,
+            ..reconstructed_point(PrimitiveState1d {
+                density: 1.0,
+                velocity: 0.1,
+                pressure: 0.6,
+            })
+        };
+        let j = ReconstructedPoint1d {
+            pressure_gradient: -0.2,
+            face_closure_error: 0.1,
+            ..reconstructed_point(PrimitiveState1d {
+                density: 0.9,
+                velocity: -0.1,
+                pressure: 0.5,
+            })
+        };
+        let flux = mfm_pair_flux_1d(i, j, unit_pair_face(1.0), 5.0 / 3.0).unwrap();
+        assert_eq!(flux.solve_path, PairSolvePath::Centered);
+        assert_close(flux.closure_leak, 1.1);
+
+        let mut entropic_i = entropic_point(i.primitive.velocity);
+        entropic_i.face_closure_error = i.face_closure_error;
+        let mut entropic_j = entropic_point(j.primitive.velocity);
+        entropic_j.face_closure_error = j.face_closure_error;
+        let (_, selected) =
+            apply_entropic_pdv_1d(flux, unit_pair_face(1.0), entropic_i, entropic_j).unwrap();
+        assert!(selected);
+    }
+
+    fn entropic_point(velocity: f64) -> EntropicPoint1d {
+        EntropicPoint1d {
+            velocity,
+            density: 1.0,
+            pressure: 0.6,
+            sound_speed: 1.0,
+            volume: 1.0,
+            dhsml_factor: 1.0,
+            kernel_radial_derivative: -1.0,
+            condition_number: 1.0,
+            face_closure_error: 0.0,
+        }
+    }
+
+    fn entropic_flux(solver_speed: f64, energy: f64) -> PairFlux1d {
+        PairFlux1d {
+            mass: 0.0,
+            momentum: 0.6,
+            energy,
+            star_pressure: 0.6,
+            interface_velocity: 0.0,
+            solver_speed,
+            method: RiemannMethod::Hllc,
+            solve_path: PairSolvePath::Reconstructed,
+            closure_leak: 0.0,
+        }
+    }
+
+    #[test]
+    fn entropic_pdv_uniform_state_is_conservative_and_swap_antisymmetric() {
+        let i = entropic_point(0.2);
+        let j = EntropicPoint1d {
+            velocity: -0.1,
+            pressure: 0.5,
+            kernel_radial_derivative: -2.0,
+            ..entropic_point(-0.1)
+        };
+        let raw = PairFlux1d {
+            interface_velocity: 0.05,
+            ..entropic_flux(0.0, 0.03)
+        };
+        let (corrected, selected) = apply_entropic_pdv_1d(raw, unit_pair_face(1.0), i, j).unwrap();
+        assert!(selected);
+
+        let reverse_raw = PairFlux1d {
+            momentum: -raw.momentum,
+            energy: -raw.energy,
+            solver_speed: -raw.solver_speed,
+            ..raw
+        };
+        let (reverse, reverse_selected) =
+            apply_entropic_pdv_1d(reverse_raw, unit_pair_face(-1.0), j, i).unwrap();
+        assert!(reverse_selected);
+        assert_close(reverse.momentum, -corrected.momentum);
+        assert_close(reverse.energy, -corrected.energy);
+        assert_close(corrected.energy + reverse.energy, 0.0);
+
+        let boost = 3.0;
+        let boosted_i = EntropicPoint1d {
+            velocity: i.velocity + boost,
+            ..i
+        };
+        let boosted_j = EntropicPoint1d {
+            velocity: j.velocity + boost,
+            ..j
+        };
+        let boosted_raw = PairFlux1d {
+            energy: raw.energy + boost * raw.momentum,
+            interface_velocity: raw.interface_velocity + boost,
+            ..raw
+        };
+        let (boosted, boosted_selected) =
+            apply_entropic_pdv_1d(boosted_raw, unit_pair_face(1.0), boosted_i, boosted_j).unwrap();
+        assert!(boosted_selected);
+        assert_close(
+            boosted.energy,
+            corrected.energy + boost * corrected.momentum,
+        );
+
+        let uniform = entropic_point(2.0);
+        let uniform_raw = PairFlux1d {
+            interface_velocity: 2.0,
+            ..entropic_flux(0.0, 1.2)
+        };
+        let (uniform_corrected, uniform_selected) =
+            apply_entropic_pdv_1d(uniform_raw, unit_pair_face(1.0), uniform, uniform).unwrap();
+        assert!(uniform_selected);
+        assert_close(uniform_corrected.energy, uniform_raw.energy);
+    }
+
+    #[test]
+    fn entropic_pdv_preserves_strict_legacy_thresholds() {
+        let mut i = entropic_point(0.1);
+        i.pressure = 0.8;
+        i.kernel_radial_derivative = -1.0;
+        let mut j = entropic_point(0.0);
+        j.pressure = 0.4;
+        j.kernel_radial_derivative = -2.0;
+        let raw = PairFlux1d {
+            interface_velocity: 0.05,
+            ..entropic_flux(0.5, 7.0)
+        };
+
+        let (_, at_big_threshold) = apply_entropic_pdv_1d(raw, unit_pair_face(1.0), i, j).unwrap();
+        assert!(!at_big_threshold);
+        let just_below_half = f64::from_bits(0.5_f64.to_bits() - 1);
+        let (_, below_big_threshold) = apply_entropic_pdv_1d(
+            PairFlux1d {
+                interface_velocity: 0.05,
+                ..entropic_flux(just_below_half, 7.0)
+            },
+            unit_pair_face(1.0),
+            i,
+            j,
+        )
+        .unwrap();
+        assert!(below_big_threshold);
+
+        let (_, at_small_threshold) = apply_entropic_pdv_1d(
+            PairFlux1d {
+                interface_velocity: 0.05,
+                ..entropic_flux(1.0e-3, 7.0)
+            },
+            unit_pair_face(1.0),
+            i,
+            j,
+        )
+        .unwrap();
+        assert!(at_small_threshold);
+        let just_above_small = f64::from_bits(1.0e-3_f64.to_bits() + 1);
+        let (_, above_small_threshold) = apply_entropic_pdv_1d(
+            PairFlux1d {
+                interface_velocity: 0.05,
+                ..entropic_flux(just_above_small, 7.0)
+            },
+            unit_pair_face(1.0),
+            i,
+            j,
+        )
+        .unwrap();
+        assert!(!above_small_threshold);
+    }
+
+    #[test]
+    fn entropic_pdv_condition_boundary_forces_selection_and_kt_uses_delta() {
+        let mut i = entropic_point(0.1);
+        i.pressure = 0.8;
+        i.condition_number = 0.0;
+        let mut j = entropic_point(0.0);
+        j.pressure = 0.4;
+        j.kernel_radial_derivative = -2.0;
+        j.condition_number = 1000.0;
+        let mut raw = PairFlux1d {
+            interface_velocity: 0.05,
+            ..entropic_flux(0.01, 42.0)
+        };
+        raw.method = RiemannMethod::KurganovTadmor;
+
+        let (corrected, selected) = apply_entropic_pdv_1d(raw, unit_pair_face(1.0), i, j).unwrap();
+        assert!(selected);
+        let pressure_area = raw.star_pressure;
+        let relative_velocity = i.velocity - j.velocity;
+        let pdv_i = i.kernel_radial_derivative * relative_velocity * raw.star_pressure;
+        let pdv_j = j.kernel_radial_derivative * relative_velocity * raw.star_pressure;
+        let old_energy = pressure_area * (raw.solver_speed + 0.5 * (i.velocity + j.velocity));
+        let new_energy = 0.5 * (pdv_i - pdv_j + pressure_area * (i.velocity + j.velocity));
+        assert_close(corrected.energy, raw.energy + new_energy - old_energy);
+        assert!((corrected.energy - new_energy).abs() > 1.0);
+    }
+
+    #[test]
+    fn entropic_pdv_rejects_invalid_inputs() {
+        let invalid = EntropicPoint1d {
+            sound_speed: 0.0,
+            ..entropic_point(0.0)
+        };
+        assert!(
+            apply_entropic_pdv_1d(
+                entropic_flux(0.0, 0.0),
+                unit_pair_face(1.0),
+                invalid,
+                entropic_point(0.0)
+            )
+            .is_err()
+        );
     }
 
     #[test]

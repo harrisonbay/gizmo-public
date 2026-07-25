@@ -7,8 +7,9 @@ one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
 geometry, pairwise primitive reconstruction, and the ideal-gas one-dimensional
 MFM HLLC/KT/exact Riemann flux, including conservative pair orientation and
-lab-frame deboost. It does not update particle states or evolve a simulation
-yet.
+lab-frame deboost, face-closure fallback, and the low-contact-speed
+entropic/PdV energy correction. It does not update particle states or evolve a
+simulation yet.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -33,7 +34,8 @@ configuration parsing:
 - `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
-  reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact and pair fluxes.
+  reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact, pair, and
+  entropic/PdV fluxes.
 - `gizmo-cli`: the compatibility command-line boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From
@@ -52,7 +54,9 @@ fixture values accepted under the legacy solver's looser neighbor tolerance.
 The normalized mean errors of the reconstructed density, velocity, and pressure
 gradients against the fitted analytic wave are respectively `3.99e-6`,
 `9.99e-7`, and `1.09e-6`; adjacent face areas differ from the analytic unit
-area by at most `4.07e-9`.
+area by at most `4.07e-9`. All 2,048 adjacent pairs use HLLC and the entropic
+branch, and both raw and corrected fluxes are exactly antisymmetric under pair
+reversal in this fixture-backed invariant test.
 
 The Riemann port preserves the corrected two-rarefaction vacuum criterion and
 the legacy distinction between HLLC failure modes: negative or non-finite
@@ -60,6 +64,8 @@ pressure falls back to the MFM KT flux, while a positive pressure above the
 configured limiter invokes a finite-checked exact ideal-gas solve. Exact-solver
 nonconvergence is reported explicitly and cannot be misclassified as vacuum.
 The pair API includes the legacy reconstruction retries, orientation, area
-integration, and lab-frame deboost. It currently returns the conservative
-Riemann contribution before GIZMO's low-contact-speed entropic/PdV energy
-replacement; that correction remains the next hydro substep.
+integration, lab-frame deboost, and the closure-leak rule that disables
+reconstruction before solving. The entropic/PdV API then preserves the legacy
+strict speed thresholds, condition-number override, independent kernel
+derivatives, and KT-specific energy-delta semantics. Particle state updates and
+time integration remain the next hydro substep.
