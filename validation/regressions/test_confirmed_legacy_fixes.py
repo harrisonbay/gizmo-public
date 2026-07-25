@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 GRAVTREE = (ROOT / "gravity" / "gravtree.c").read_text()
 RT_INJECTION = (ROOT / "radiation" / "rt_source_injection.c").read_text()
+HYDRO_EVALUATE = (ROOT / "hydro" / "hydro_evaluate.h").read_text()
 
 
 class AdaptiveTreeforceRegression(unittest.TestCase):
@@ -89,6 +90,21 @@ class ReinjectAccretedPhotonsRegression(unittest.TestCase):
         self.assertEqual(local_payload, 7.5)
         self.assertEqual(export_payload, local_payload)
         self.assertEqual(accumulator, 0.0)
+
+
+class HydroTimestepInitializationRegression(unittest.TestCase):
+    def test_target_timestep_is_initialized_before_neighbor_flux_work(self):
+        assignment = "dt_hydrostep_i = local.dt_hydrostep_i;"
+        neighbor_loop = "for(n = 0; n < numngb; n++)"
+        maximum = "dt_hydrostep = DMAX(dt_hydrostep_i , dt_hydrostep_j);"
+
+        self.assertEqual(HYDRO_EVALUATE.count(assignment), 1)
+        self.assertLess(HYDRO_EVALUATE.index(assignment), HYDRO_EVALUATE.index(neighbor_loop))
+        self.assertLess(HYDRO_EVALUATE.index(assignment), HYDRO_EVALUATE.index(maximum))
+
+    def test_target_timestep_is_not_defaulted_to_zero(self):
+        pre_neighbor = HYDRO_EVALUATE[: HYDRO_EVALUATE.index("for(n = 0; n < numngb; n++)")]
+        self.assertNotIn("dt_hydrostep_i = 0", pre_neighbor)
 
 
 if __name__ == "__main__":

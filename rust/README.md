@@ -1,9 +1,10 @@
 # GIZMO Rust port
 
 This workspace is the correctness-oriented Rust replacement for GIZMO. It is
-currently a bootstrap: it can validate and fingerprint legacy `Config.sh`
-files, model core particle data with checked typed interfaces, and parse the
-legacy executable's primary invocation. It does not run simulations yet.
+currently ports the sound-wave initialization path: strict configuration and
+parameter parsing, validated HDF5 gas input, the exact default one-dimensional
+cubic kernel, density summation, and adaptive smoothing-length constraints. It
+does not evolve a simulation yet.
 
 ```console
 cargo run -p gizmo-cli -- --config ../Config.sh ../params.txt 0
@@ -20,5 +21,22 @@ configuration parsing:
 - `gizmo-config`: strict legacy `Config.sh` parsing and deterministic SHA-256
   manifests.
 - `gizmo-audit`: finding and provenance records used by correctness tooling.
+- `gizmo-params`: strict typed parsing for the legacy runtime parameters used
+  by the first vertical slice.
+- `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
+- `gizmo-hydro`: one-dimensional kernel, density, and adaptive `Hsml` solve.
 - `gizmo-cli`: the compatibility command-line boundary.
 
+The public sound-wave fixture is byte-pinned outside the Rust workspace. From
+the repository root, run the pinned-data initialization oracle with:
+
+```console
+validation/oracles/run_rust_soundwave_init.sh
+```
+
+On the pinned fixture, the Rust density sum differs from the stored density by
+at most `1.58e-12` relative. The fixture's producer commit is not published, so
+this is pinned-data parity rather than proof of parity with our compiled C
+baseline. The Rust adaptive solver satisfies `N_eff=4` to floating-point
+precision; its smoothing lengths differ by at most `5.0e-4` relative from the
+fixture values accepted under the legacy solver's looser neighbor tolerance.

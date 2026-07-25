@@ -27,7 +27,7 @@ jobs:
   rust:
     name: Rust formatting and tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Detect Rust workspace
@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.rust.outputs.present == 'true'
         with:
-          components: rustfmt
+          components: clippy, rustfmt
       - name: Check formatting
         if: steps.rust.outputs.present == 'true'
         working-directory: rust
@@ -49,3 +49,10 @@ jobs:
         if: steps.rust.outputs.present == 'true'
         working-directory: rust
         run: cargo test
+      - name: Run pinned sound-wave initialization oracle
+        if: steps.rust.outputs.present == 'true'
+        run: validation/oracles/run_rust_soundwave_init.sh
+      - name: Deny Clippy warnings
+        if: steps.rust.outputs.present == 'true'
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings

@@ -132,6 +132,59 @@
         }
       ],
       "dossier": "audit/findings/GZ-0004.md"
+    },
+    {
+      "id": "GZ-0005",
+      "title": "Meshless hydro uses an uninitialized target timestep in flux reconstruction",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "HYDRO_SPH"
+      ],
+      "summary": "hydro_force_evaluate() declares dt_hydrostep_i but, after a timestep-field refactor, no longer initializes the local variable before combining it with the neighbor timestep. Meshless solvers use the result in flux limiting, reconstruction, and face prediction; SPH uses it in the artificial-viscosity limiter. The input structure already carries the intended local.dt_hydrostep_i value.",
+      "impact": "Undefined stack data can perturb meshless reconstruction and fluxes or SPH artificial viscosity, making hydrodynamic evolution compiler- and layout-dependent.",
+      "reproduction": "Compile a meshless hydro configuration with Clang warnings enabled; the compiler reports dt_hydrostep_i is uninitialized at the first DMAX use. Trace subsequent inclusion of hydro_core_meshless.h, which consumes the same value during every interacting pair.",
+      "falsification": "Identify a dominating assignment to the local dt_hydrostep_i on every path before the neighbor loop, or prove all uses are removed by preprocessing for every affected meshless configuration.",
+      "oracle": {
+        "type": "static_analysis",
+        "classification": "static",
+        "rationale": "Definite-assignment analysis plus the input-structure producer establishes both the undefined read and intended source value."
+      },
+      "sources": [
+        {
+          "path": "hydro/hydro_evaluate.h",
+          "line_start": 25,
+          "line_end": 25,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_evaluate.h#L25"
+        },
+        {
+          "path": "hydro/hydro_evaluate.h",
+          "line_start": 154,
+          "line_end": 156,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_evaluate.h#L154-L156"
+        },
+        {
+          "path": "hydro/hydro_toplevel.c",
+          "line_start": 192,
+          "line_end": 192,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_toplevel.c#L192"
+        },
+        {
+          "path": "hydro/hydro_toplevel.c",
+          "line_start": 419,
+          "line_end": 419,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_toplevel.c#L419"
+        },
+        {
+          "path": "hydro/hydro_core_sph.h",
+          "line_start": 178,
+          "line_end": 199,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_core_sph.h#L178-L199"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0005.md"
     }
   ]
 }

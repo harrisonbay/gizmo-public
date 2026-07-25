@@ -79,6 +79,7 @@ int hydro_force_evaluate(int target, int mode, int *exportflag, int *exportnodec
     hinv_j=hinv3_j=hinv4_j=0;
     V_i = local.Mass / local.Density;
     Particle_Size_i = pow(V_i,1./NUMDIMS) * All.cf_atime; // in physical, used below in some routines //
+    dt_hydrostep_i = local.dt_hydrostep_i;
     out.MaxSignalVel = kernel.sound_i;
     kernel_mode = 0; /* need dwk and wk */
     double cnumcrit2; cnumcrit2 = ((double)CONDITION_NUMBER_DANGER)*((double)CONDITION_NUMBER_DANGER) - local.ConditionNumber*local.ConditionNumber;

@@ -14,6 +14,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 validation/artifacts/
+validation/oracles/*/*.hdf5
 
 # Local editor and platform files
 .DS_Store

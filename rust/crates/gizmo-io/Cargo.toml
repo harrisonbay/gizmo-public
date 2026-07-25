@@ -1,0 +1,13 @@
+[package]
+name = "gizmo-io"
+description = "Validated HDF5 input for the GIZMO Rust port"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+hdf5 = { package = "hdf5-metno", version = "0.14.0", features = ["static"] }
+
+[lints]
+workspace = true
