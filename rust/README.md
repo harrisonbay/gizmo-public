@@ -76,7 +76,11 @@ The hydro crate also contains the first synchronized evolution slice: exact
 unordered-pair accumulation into extensive momentum/total-energy rates,
 conversion to acceleration and specific-internal-energy rate, the raw legacy
 Courant estimate, and the noncosmological kick-drift-kick predictor ordering
-with the half-loss energy limiter. This is not yet wired to normal CLI
+with the half-loss energy limiter. The non-`LONG_INTEGER_TIME` synchronized
+power-of-two timeline is also ported; it maps the fixture's raw
+`3.6621e-5` Courant bound to the same initial `8192`-tick,
+`2.288818359375e-5` step seen in the C run. This is not yet wired to normal CLI
 execution. Before evolved snapshots can be called C-parity results, the
-integer power-of-two timeline and the remaining timestep bounds must be ported
-and checked against a freshly generated, named-commit C oracle.
+remaining acceleration/displacement timestep bounds must be proven inactive
+or ported and the result checked against a freshly generated, named-commit C
+oracle.

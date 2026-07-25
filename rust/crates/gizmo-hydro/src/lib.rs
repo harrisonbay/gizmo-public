@@ -1276,6 +1276,156 @@ pub fn global_courant_timestep_1d(
     Ok(timestep)
 }
 
+pub const LEGACY_TIMEBASE_TICKS: u64 = 1_u64 << 29;
+
+/// Integer power-of-two timeline for the default (non-`LONG_INTEGER_TIME`)
+/// synchronized GIZMO integration mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SynchronizedTimeline1d {
+    time_begin: f64,
+    time_max: f64,
+    current_tick: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SynchronizedStep1d {
+    pub ticks: u64,
+    pub duration: f64,
+    pub end_time: f64,
+}
+
+// Timeline values are bounded by 2^29 and therefore exactly representable in
+// f64; the checked positive/floor operation intentionally mirrors C's cast.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+impl SynchronizedTimeline1d {
+    /// Construct an integer timeline at its initial time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both times are finite and `time_max` is later
+    /// than `time_begin`.
+    pub fn new(time_begin: f64, time_max: f64) -> Result<Self, HydroError> {
+        if !time_begin.is_finite() || !time_max.is_finite() || time_max <= time_begin {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "timeline",
+                value: time_max,
+            });
+        }
+        Ok(Self {
+            time_begin,
+            time_max,
+            current_tick: 0,
+        })
+    }
+
+    #[must_use]
+    pub fn current_tick(self) -> u64 {
+        self.current_tick
+    }
+
+    #[must_use]
+    pub fn current_time(self) -> f64 {
+        self.time_begin + self.tick_duration() * self.current_tick as f64
+    }
+
+    #[must_use]
+    pub fn is_finished(self) -> bool {
+        self.current_tick >= LEGACY_TIMEBASE_TICKS
+    }
+
+    /// Quantize a physical bound to the largest synchronized power-of-two
+    /// timestep that does not cross the end of the timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid desired/cap timestep or a finished
+    /// timeline.
+    pub fn select_step(
+        self,
+        desired_timestep: f64,
+        maximum_timestep: f64,
+    ) -> Result<SynchronizedStep1d, HydroError> {
+        if self.is_finished()
+            || !desired_timestep.is_finite()
+            || desired_timestep <= 0.0
+            || !maximum_timestep.is_finite()
+            || maximum_timestep <= 0.0
+        {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "timeline_timestep",
+                value: desired_timestep,
+            });
+        }
+        let bounded = desired_timestep.min(maximum_timestep);
+        let raw_ticks = (bounded / self.tick_duration()).floor();
+        if !raw_ticks.is_finite() || raw_ticks < 2.0 || raw_ticks >= LEGACY_TIMEBASE_TICKS as f64 {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "timeline_ticks",
+                value: raw_ticks,
+            });
+        }
+        let integer_ticks = raw_ticks as u64;
+        let next_power = integer_ticks.next_power_of_two();
+        let mut ticks = if next_power > integer_ticks {
+            next_power >> 1
+        } else {
+            next_power
+        };
+        while self.current_tick % ticks != 0 {
+            ticks >>= 1;
+        }
+        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
+        while ticks > remaining {
+            ticks >>= 1;
+        }
+        if ticks == 0 {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "timeline_remaining",
+                value: remaining as f64,
+            });
+        }
+        let duration = ticks as f64 * self.tick_duration();
+        let end_time = self.current_time() + duration;
+        Ok(SynchronizedStep1d {
+            ticks,
+            duration,
+            end_time,
+        })
+    }
+
+    /// Commit a previously selected step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the step is zero, unsynchronized, or would cross
+    /// the end of the timeline.
+    pub fn advance(&mut self, step: SynchronizedStep1d) -> Result<(), HydroError> {
+        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
+        if step.ticks == 0
+            || !step.ticks.is_power_of_two()
+            || self.current_tick % step.ticks != 0
+            || step.ticks > remaining
+            || !legacy_float_equal(step.duration, step.ticks as f64 * self.tick_duration())
+            || !legacy_float_equal(step.end_time, self.current_time() + step.duration)
+        {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "timeline_step",
+                value: step.duration,
+            });
+        }
+        self.current_tick += step.ticks;
+        Ok(())
+    }
+
+    fn tick_duration(self) -> f64 {
+        (self.time_max - self.time_begin) / LEGACY_TIMEBASE_TICKS as f64
+    }
+}
+
 /// Advance one synchronized kick-drift-kick step of the default 1-D MFM path.
 ///
 /// Endpoint forces use full-step old-RHS predictions for velocity and internal
@@ -3447,6 +3597,29 @@ mod tests {
             assert!(new_rates.acceleration[index].abs() < 1.0e-14);
             assert!(new_rates.specific_internal_energy[index].abs() < 1.0e-14);
         }
+    }
+
+    #[test]
+    fn synchronized_timeline_matches_legacy_power_of_two_bins() {
+        let mut timeline = SynchronizedTimeline1d::new(0.0, 1.5).unwrap();
+        let initial = timeline.select_step(3.0e-5, 1.0e-3).unwrap();
+        assert_eq!(initial.ticks, 8192);
+        assert_close(initial.duration, 2.288_818_359_375e-5);
+        timeline.advance(initial).unwrap();
+
+        let blocked_increase = timeline.select_step(5.0e-5, 1.0e-3).unwrap();
+        assert_eq!(blocked_increase.ticks, 8192);
+        timeline.advance(blocked_increase).unwrap();
+        let synchronized_increase = timeline.select_step(5.0e-5, 1.0e-3).unwrap();
+        assert_eq!(synchronized_increase.ticks, 16_384);
+
+        let mut ending = SynchronizedTimeline1d::new(0.0, 1.5).unwrap();
+        ending.current_tick = LEGACY_TIMEBASE_TICKS - 8192;
+        let final_step = ending.select_step(1.0e-3, 1.0e-3).unwrap();
+        assert_eq!(final_step.ticks, 8192);
+        ending.advance(final_step).unwrap();
+        assert!(ending.is_finished());
+        assert_close(ending.current_time(), 1.5);
     }
 
     #[test]
