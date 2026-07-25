@@ -1,10 +1,11 @@
 # GIZMO Rust port
 
-This workspace is the correctness-oriented Rust replacement for GIZMO. It is
-currently ports the sound-wave initialization path: strict configuration and
-parameter parsing, validated HDF5 gas input, the exact default one-dimensional
-cubic kernel, density summation, and adaptive smoothing-length constraints. It
-does not evolve a simulation yet.
+This workspace is the correctness-oriented Rust replacement for GIZMO. It
+currently ports the sound-wave initialization and gradient path: strict
+configuration and parameter parsing, validated HDF5 gas input, the exact default
+one-dimensional cubic kernel, density summation, adaptive smoothing-length
+constraints, and slope-limited moving-least-squares reconstruction. It does not
+evolve a simulation yet.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -12,8 +13,9 @@ validation/oracles/run_rust_soundwave_init.sh
 
 Initialization-only mode validates the sound-wave profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive
-`Hsml`, and prints a deterministic JSON summary. Normal invocations still exit
-with an explicit `not yet ported` error before evolution.
+`Hsml`, reconstructs density, velocity, and pressure gradients, and prints a
+deterministic JSON summary. Normal invocations still exit with an explicit `not
+yet ported` error before evolution.
 
 Crates are layered so that scientific code does not depend on command-line or
 configuration parsing:
@@ -26,7 +28,8 @@ configuration parsing:
 - `gizmo-params`: strict typed parsing for the legacy runtime parameters used
   by the first vertical slice.
 - `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
-- `gizmo-hydro`: one-dimensional kernel, density, and adaptive `Hsml` solve.
+- `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
+  slope-limited moving-least-squares gradients.
 - `gizmo-cli`: the compatibility command-line boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From
@@ -42,3 +45,6 @@ this is pinned-data parity rather than proof of parity with our compiled C
 baseline. The Rust adaptive solver satisfies `N_eff=4` to floating-point
 precision; its smoothing lengths differ by at most `5.0e-4` relative from the
 fixture values accepted under the legacy solver's looser neighbor tolerance.
+The normalized mean errors of the reconstructed density, velocity, and pressure
+gradients against the fitted analytic wave are respectively `3.99e-6`,
+`9.99e-7`, and `1.09e-6`.

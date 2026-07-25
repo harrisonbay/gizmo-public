@@ -6,7 +6,9 @@ use std::process::ExitCode;
 
 use gizmo_cli::{CliError, Invocation, USAGE};
 use gizmo_config::ConfigManifest;
-use gizmo_hydro::{density_at_hsml_1d, solve_smoothing_lengths_1d};
+use gizmo_hydro::{
+    GradientEstimate, density_at_hsml_1d, gradients_at_hsml_1d, solve_smoothing_lengths_1d,
+};
 use gizmo_io::read_soundwave;
 use gizmo_params::SoundwaveParameters;
 
@@ -170,31 +172,194 @@ fn initialize_soundwave(
             (particle.estimate.effective_neighbors - parameters.desired_num_neighbors).abs()
         })
         .fold(0.0, f64::max);
-    if !max_density_relative_error.is_finite() || max_density_relative_error > 1.0e-10 {
-        return Err(ApplicationError::StateMismatch(format!(
-            "density parity exceeded 1e-10: {max_density_relative_error}"
-        )));
-    }
-    if !max_hsml_relative_difference.is_finite() || max_hsml_relative_difference > 1.0e-3 {
-        return Err(ApplicationError::StateMismatch(format!(
-            "Hsml parity exceeded 1e-3: {max_hsml_relative_difference}"
-        )));
-    }
-    if !max_neighbor_deviation.is_finite() || max_neighbor_deviation > 1.0e-8 {
-        return Err(ApplicationError::StateMismatch(format!(
-            "neighbor constraint exceeded 1e-8: {max_neighbor_deviation}"
-        )));
+    let [
+        density_gradient_error,
+        velocity_gradient_error,
+        pressure_gradient_error,
+    ] = soundwave_gradient_errors(&snapshot, &positions, expected_density, legacy_hsml)?;
+    let summary = InitializationSummary {
+        particle_count,
+        box_size: snapshot.header.box_size,
+        max_density_relative_error,
+        max_hsml_relative_difference,
+        max_neighbor_deviation,
+        density_gradient_error,
+        velocity_gradient_error,
+        pressure_gradient_error,
+    };
+    summary.validate()?;
+    summary.print(&manifest.sha256());
+    Ok(())
+}
+
+fn soundwave_gradient_errors(
+    snapshot: &gizmo_io::SoundWaveSnapshot,
+    positions: &[f64],
+    density: &[f64],
+    smoothing_lengths: &[f64],
+) -> Result<[f64; 3], ApplicationError> {
+    let velocity: Vec<f64> = snapshot
+        .gas
+        .velocities
+        .iter()
+        .map(|components| components[0])
+        .collect();
+    let pressure: Vec<f64> = density
+        .iter()
+        .zip(&snapshot.gas.internal_energy)
+        .map(|(density, internal_energy)| (2.0 / 3.0) * density * internal_energy)
+        .collect();
+    let density_gradient_error = soundwave_gradient_error(
+        positions,
+        density,
+        smoothing_lengths,
+        snapshot.header.box_size,
+        0.0,
+        true,
+    )?;
+    let velocity_gradient_error = soundwave_gradient_error(
+        positions,
+        &velocity,
+        smoothing_lengths,
+        snapshot.header.box_size,
+        0.1,
+        false,
+    )?;
+    let pressure_gradient_error = soundwave_gradient_error(
+        positions,
+        &pressure,
+        smoothing_lengths,
+        snapshot.header.box_size,
+        0.1,
+        true,
+    )?;
+    Ok([
+        density_gradient_error,
+        velocity_gradient_error,
+        pressure_gradient_error,
+    ])
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InitializationSummary {
+    particle_count: u32,
+    box_size: f64,
+    max_density_relative_error: f64,
+    max_hsml_relative_difference: f64,
+    max_neighbor_deviation: f64,
+    density_gradient_error: f64,
+    velocity_gradient_error: f64,
+    pressure_gradient_error: f64,
+}
+
+impl InitializationSummary {
+    fn validate(self) -> Result<(), ApplicationError> {
+        for (field, value, limit) in [
+            ("density parity", self.max_density_relative_error, 1.0e-10),
+            ("Hsml parity", self.max_hsml_relative_difference, 1.0e-3),
+            ("neighbor constraint", self.max_neighbor_deviation, 1.0e-8),
+            ("density gradient", self.density_gradient_error, 1.0e-4),
+            ("velocity gradient", self.velocity_gradient_error, 1.0e-4),
+            ("pressure gradient", self.pressure_gradient_error, 1.0e-4),
+        ] {
+            if !value.is_finite() || value > limit {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "{field} exceeded {limit}: {value}"
+                )));
+            }
+        }
+        Ok(())
     }
 
-    println!("{{");
-    println!("  \"config_sha256\": \"{}\",", manifest.sha256());
-    println!("  \"particles\": {particle_count},");
-    println!("  \"box_size\": {},", snapshot.header.box_size);
-    println!("  \"max_density_relative_error\": {max_density_relative_error:.17e},");
-    println!("  \"max_hsml_relative_difference\": {max_hsml_relative_difference:.17e},");
-    println!("  \"max_neighbor_deviation\": {max_neighbor_deviation:.17e}");
-    println!("}}");
-    Ok(())
+    fn print(self, config_sha256: &str) {
+        println!("{{");
+        println!("  \"config_sha256\": \"{config_sha256}\",");
+        println!("  \"particles\": {},", self.particle_count);
+        println!("  \"box_size\": {},", self.box_size);
+        println!(
+            "  \"max_density_relative_error\": {:.17e},",
+            self.max_density_relative_error
+        );
+        println!(
+            "  \"max_hsml_relative_difference\": {:.17e},",
+            self.max_hsml_relative_difference
+        );
+        println!(
+            "  \"max_neighbor_deviation\": {:.17e},",
+            self.max_neighbor_deviation
+        );
+        println!(
+            "  \"density_gradient_error\": {:.17e},",
+            self.density_gradient_error
+        );
+        println!(
+            "  \"velocity_gradient_error\": {:.17e},",
+            self.velocity_gradient_error
+        );
+        println!(
+            "  \"pressure_gradient_error\": {:.17e}",
+            self.pressure_gradient_error
+        );
+        println!("}}");
+    }
+}
+
+fn soundwave_gradient_error(
+    positions: &[f64],
+    values: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    shoot_tolerance: f64,
+    positivity_preserving: bool,
+) -> Result<f64, ApplicationError> {
+    let gradients = gradients_at_hsml_1d(
+        positions,
+        values,
+        smoothing_lengths,
+        box_size,
+        shoot_tolerance,
+        positivity_preserving,
+    )
+    .map_err(ApplicationError::Hydro)?;
+    Ok(fundamental_mode_gradient_error(
+        positions, values, &gradients, box_size,
+    ))
+}
+
+fn fundamental_mode_gradient_error(
+    positions: &[f64],
+    values: &[f64],
+    gradients: &[GradientEstimate],
+    box_size: f64,
+) -> f64 {
+    let count = u32::try_from(positions.len()).expect("validated particle count fits in u32");
+    let count_float = f64::from(count);
+    let sine = 2.0
+        * positions
+            .iter()
+            .zip(values)
+            .map(|(position, value)| value * (std::f64::consts::TAU * position / box_size).sin())
+            .sum::<f64>()
+        / count_float;
+    let cosine = 2.0
+        * positions
+            .iter()
+            .zip(values)
+            .map(|(position, value)| value * (std::f64::consts::TAU * position / box_size).cos())
+            .sum::<f64>()
+        / count_float;
+    let amplitude = sine.hypot(cosine);
+    positions
+        .iter()
+        .zip(gradients)
+        .map(|(position, estimate)| {
+            let wave_number = std::f64::consts::TAU / box_size;
+            let phase = wave_number * position;
+            let expected = wave_number * (sine * phase.cos() - cosine * phase.sin());
+            (estimate.limited - expected).abs()
+        })
+        .sum::<f64>()
+        / (count_float * (std::f64::consts::TAU / box_size) * amplitude)
 }
 
 fn resolve_initial_conditions(configured: &str) -> PathBuf {

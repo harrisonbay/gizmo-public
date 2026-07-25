@@ -1,4 +1,6 @@
-use gizmo_hydro::{density_at_hsml_1d, solve_smoothing_lengths_1d};
+use gizmo_hydro::{
+    GradientEstimate, density_at_hsml_1d, gradients_at_hsml_1d, solve_smoothing_lengths_1d,
+};
 use gizmo_io::read_soundwave;
 
 #[test]
@@ -85,4 +87,83 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         "adaptive Hsml diverged from the legacy-accepted state: \
          max relative difference {max_hsml_relative_difference}"
     );
+
+    assert_public_gradients(
+        &positions,
+        expected_density,
+        &snapshot.gas.velocities,
+        &snapshot.gas.internal_energy,
+        smoothing_lengths,
+        snapshot.header.box_size,
+    );
+}
+
+fn assert_public_gradients(
+    positions: &[f64],
+    density: &[f64],
+    velocities: &[[f64; 3]],
+    internal_energy: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) {
+    let velocity: Vec<f64> = velocities.iter().map(|components| components[0]).collect();
+    let pressure: Vec<f64> = density
+        .iter()
+        .zip(internal_energy)
+        .map(|(density, internal_energy)| (2.0 / 3.0) * density * internal_energy)
+        .collect();
+    for (name, values, shoot_tolerance, positivity_preserving) in [
+        ("density", density, 0.0, true),
+        ("velocity", velocity.as_slice(), 0.1, false),
+        ("pressure", pressure.as_slice(), 0.1, true),
+    ] {
+        let gradients = gradients_at_hsml_1d(
+            positions,
+            values,
+            smoothing_lengths,
+            box_size,
+            shoot_tolerance,
+            positivity_preserving,
+        )
+        .expect("moving-least-squares gradient must accept the pinned state");
+        let error = fundamental_mode_gradient_error(positions, values, &gradients, box_size);
+        eprintln!("public fixture {name} gradient normalized L1 error={error:.12e}");
+        assert!(error < 1.0e-4, "{name} gradient error {error}");
+    }
+}
+
+fn fundamental_mode_gradient_error(
+    positions: &[f64],
+    values: &[f64],
+    gradients: &[GradientEstimate],
+    box_size: f64,
+) -> f64 {
+    let count = u32::try_from(positions.len()).expect("particle count fits in u32");
+    let count_float = f64::from(count);
+    let sine = 2.0
+        * positions
+            .iter()
+            .zip(values)
+            .map(|(position, value)| value * (std::f64::consts::TAU * position / box_size).sin())
+            .sum::<f64>()
+        / count_float;
+    let cosine = 2.0
+        * positions
+            .iter()
+            .zip(values)
+            .map(|(position, value)| value * (std::f64::consts::TAU * position / box_size).cos())
+            .sum::<f64>()
+        / count_float;
+    let amplitude = sine.hypot(cosine);
+    positions
+        .iter()
+        .zip(gradients)
+        .map(|(position, estimate)| {
+            let wave_number = std::f64::consts::TAU / box_size;
+            let phase = wave_number * position;
+            let expected = wave_number * (sine * phase.cos() - cosine * phase.sin());
+            (estimate.limited - expected).abs()
+        })
+        .sum::<f64>()
+        / (count_float * (std::f64::consts::TAU / box_size) * amplitude)
 }
