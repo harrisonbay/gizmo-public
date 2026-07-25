@@ -700,23 +700,26 @@ void Riemann_solver_exact(struct Input_vec_Riemann Riemann_vec, struct Riemann_o
     {
         /* we're in a Vaccuum! */
         Riemann_out->P_M = Riemann_out->S_M = 0;
-#ifdef HYDRO_MESHLESS_FINITE_VOLUME
         Riemann_out->Fluxes.rho = Riemann_out->Fluxes.p = Riemann_out->Fluxes.v[0] = Riemann_out->Fluxes.v[1] = Riemann_out->Fluxes.v[2] = 0;
-#endif
         return;
     }
     /* the usual situation is here:: */
     if((Riemann_vec.L.rho > 0) && (Riemann_vec.R.rho > 0))
     {
-        if(iterative_Riemann_solver(Riemann_vec, Riemann_out, v_line_L, v_line_R, cs_L, cs_R))
+        int exact_status = iterative_Riemann_solver(Riemann_vec, Riemann_out, v_line_L, v_line_R, cs_L, cs_R);
+        if(exact_status > 0)
         {
             /* this is the 'normal' Reimann solution */
             sample_reimann_standard(0.0,Riemann_vec,Riemann_out,n_unit,v_line_L,v_line_R,cs_L,cs_R);
-        }
-        else
+        } else if(exact_status == 0)
         {
             /* ICs lead to vacuum, need to sample vacuum solution */
             sample_reimann_vaccum_internal(0.0,Riemann_vec,Riemann_out,n_unit,v_line_L,v_line_R,cs_L,cs_R);
+        } else {
+            /* Numerical failure is not a physical vacuum. Return an invalid
+               state so the caller retries with safer reconstruction. */
+            Riemann_out->P_M = NAN;
+            Riemann_out->S_M = 0;
         }
     } else {
         /* one of the densities is zero or negative */
@@ -730,6 +733,12 @@ void Riemann_solver_exact(struct Input_vec_Riemann Riemann_vec, struct Riemann_o
 #ifdef HYDRO_MESHLESS_FINITE_VOLUME
     /* if we got a valid solution, this solver returns face states: need to convert these to fluxes */
     convert_face_to_flux(Riemann_out, n_unit);
+#else
+    /* MFM fluxes are determined by the exact contact pressure and speed.
+       Do not leave the stale HLLC/KT fluxes that triggered this fallback. */
+    Riemann_out->Fluxes.rho = 0;
+    int k; for(k=0;k<3;k++) {Riemann_out->Fluxes.v[k] = Riemann_out->P_M * n_unit[k];}
+    Riemann_out->Fluxes.p = Riemann_out->P_M * Riemann_out->S_M;
 #endif
 }
 
@@ -1049,10 +1058,11 @@ int iterative_Riemann_solver(struct Input_vec_Riemann Riemann_vec, struct Rieman
     dvel = v_line_R - v_line_L;
     check_vel = GAMMA_G4 * (cs_R + cs_L) - dvel;
     /* if check_vel<0, this will produce a vacuum: need to use vacuum-specific subroutine */
-    if(check_vel < 0) return 0;
+    if(check_vel <= 0) return 0;
     
     tol=100.0;
     Pg = guess_for_pressure(Riemann_vec, Riemann_out, v_line_L, v_line_R, cs_L, cs_R);
+    if((Pg <= 0)||(!isfinite(Pg))) return -1;
     while((tol>TOL_ITER)&&(niter_Riemann<NMAX_ITER))
     {
         Pg_prev=Pg;
@@ -1084,25 +1094,28 @@ int iterative_Riemann_solver(struct Input_vec_Riemann Riemann_vec, struct Rieman
             W_R = GAMMA_G4 * cs_R * (pow(pratio, GAMMA_G1)-1);
             Z_R = 1 / (Riemann_vec.R.rho*cs_R) * pow(pratio, -GAMMA_G2);
         }
+        double derivative_sum = Z_L + Z_R;
+        if((!isfinite(W_L))||(!isfinite(W_R))||(!isfinite(derivative_sum))||(derivative_sum <= 0)) return -1;
         if(niter_Riemann < NMAX_ITER / 2)
-            Pg -= (W_L + W_R + dvel) / (Z_L + Z_R);
+            Pg -= (W_L + W_R + dvel) / derivative_sum;
         else
-            Pg -= 0.5 * (W_L + W_R + dvel) / (Z_L + Z_R);
+            Pg -= 0.5 * (W_L + W_R + dvel) / derivative_sum;
         
         if(Pg < 0.1 * Pg_prev)
             Pg = 0.1 * Pg_prev;
+        if((Pg <= 0)||(!isfinite(Pg))) return -1;
         
         tol = 2.0 * fabs((Pg-Pg_prev)/(Pg+Pg_prev));
+        if(!isfinite(tol)) return -1;
         niter_Riemann++;
     }
-    if(niter_Riemann<NMAX_ITER)
+    if((niter_Riemann<NMAX_ITER)&&isfinite(Pg)&&isfinite(W_L)&&isfinite(W_R))
     {
         Riemann_out->P_M = Pg;
         Riemann_out->S_M = 0.5*(v_line_L+v_line_R) + 0.5*(W_R-W_L);
         return 1;
-    } else {
-        return 0;
     }
+    return -1;
 }
 
 
@@ -1115,7 +1128,7 @@ double guess_for_pressure(struct Input_vec_Riemann Riemann_vec, struct Riemann_o
 {
     double pmin, pmax;
     /* start with the usual lowest-order guess for the contact wave pressure */
-    double pv = 0.5*(Riemann_vec.L.p+Riemann_vec.R.p) - 0.125*(v_line_R-v_line_L)*(Riemann_vec.L.p+Riemann_vec.R.p)*(cs_L+cs_R);
+    double pv = 0.5*(Riemann_vec.L.p+Riemann_vec.R.p) - 0.125*(v_line_R-v_line_L)*(Riemann_vec.L.rho+Riemann_vec.R.rho)*(cs_L+cs_R);
     pmin = DMIN(Riemann_vec.L.p,Riemann_vec.R.p);
     pmax = DMAX(Riemann_vec.L.p,Riemann_vec.R.p);
     

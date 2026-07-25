@@ -150,5 +150,85 @@ class RiemannVacuumThresholdRegression(unittest.TestCase):
         self.assertLess(stronger_non_vacuum_jump, exact_threshold)
 
 
+class ExactMfmFluxRegression(unittest.TestCase):
+    def test_exact_fallback_rebuilds_mfm_flux_from_final_star_state(self):
+        start = RIEMANN.rindex("void Riemann_solver_exact")
+        end = RIEMANN.index("void sample_reimann_vaccum_left", start)
+        exact_solver = RIEMANN[start:end]
+
+        self.assertIn("Riemann_out->Fluxes.rho = 0;", exact_solver)
+        self.assertIn(
+            "Riemann_out->Fluxes.v[k] = Riemann_out->P_M * n_unit[k];",
+            exact_solver,
+        )
+        self.assertIn(
+            "Riemann_out->Fluxes.p = "
+            "Riemann_out->P_M * Riemann_out->S_M;",
+            exact_solver,
+        )
+        self.assertLess(
+            exact_solver.index("Riemann_solver_exact"),
+            exact_solver.index("Riemann_out->Fluxes.rho = 0;"),
+        )
+
+    def test_contact_frame_flux_uses_one_consistent_exact_state(self):
+        pressure = 0.37
+        contact_speed = -0.42
+        normal = (1.0, 0.0, 0.0)
+
+        mass_flux = 0.0
+        momentum_flux = tuple(pressure * component for component in normal)
+        energy_flux = pressure * contact_speed
+
+        self.assertEqual(mass_flux, 0.0)
+        self.assertEqual(momentum_flux, (0.37, 0.0, 0.0))
+        self.assertAlmostEqual(energy_flux, -0.1554)
+
+
+class ExactRiemannIterationRegression(unittest.TestCase):
+    def test_vacuum_convergence_and_failure_have_distinct_statuses(self):
+        start = RIEMANN.rindex("int iterative_Riemann_solver")
+        end = RIEMANN.rindex("double guess_for_pressure")
+        iteration = RIEMANN[start:end]
+        exact_start = RIEMANN.rindex("void Riemann_solver_exact")
+        exact_end = RIEMANN.index("void sample_reimann_vaccum_left", exact_start)
+        exact_wrapper = RIEMANN[exact_start:exact_end]
+
+        self.assertIn("if(check_vel <= 0) return 0;", iteration)
+        self.assertIn("return -1;", iteration)
+        self.assertIn("if(exact_status > 0)", exact_wrapper)
+        self.assertIn("else if(exact_status == 0)", exact_wrapper)
+        self.assertIn("Riemann_out->P_M = NAN;", exact_wrapper)
+
+    def test_iteration_rejects_nonfinite_arithmetic(self):
+        start = RIEMANN.rindex("int iterative_Riemann_solver")
+        end = RIEMANN.rindex("double guess_for_pressure")
+        iteration = RIEMANN[start:end]
+
+        self.assertIn("(!isfinite(Pg))", iteration)
+        self.assertIn("(!isfinite(W_L))", iteration)
+        self.assertIn("(!isfinite(W_R))", iteration)
+        self.assertIn("(!isfinite(derivative_sum))", iteration)
+        self.assertIn("if(!isfinite(tol)) return -1;", iteration)
+
+    def test_pressure_guess_uses_density_for_dimensional_consistency(self):
+        start = RIEMANN.rindex("double guess_for_pressure")
+        end = RIEMANN.index("void convert_face_to_flux", start)
+        guess = RIEMANN[start:end]
+
+        self.assertIn(
+            "(v_line_R-v_line_L)"
+            "*(Riemann_vec.L.rho+Riemann_vec.R.rho)"
+            "*(cs_L+cs_R)",
+            guess,
+        )
+        self.assertNotIn(
+            "(v_line_R-v_line_L)"
+            "*(Riemann_vec.L.p+Riemann_vec.R.p)"
+            "*(cs_L+cs_R)",
+            guess,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

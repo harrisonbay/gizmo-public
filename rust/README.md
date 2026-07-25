@@ -6,8 +6,8 @@ configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
 geometry, pairwise primitive reconstruction, and the ideal-gas one-dimensional
-MFM HLLC/KT Riemann flux. It does not apply pair fluxes or evolve a simulation
-yet.
+MFM HLLC/KT/exact Riemann flux. It does not apply pair fluxes or evolve a
+simulation yet.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -32,7 +32,7 @@ configuration parsing:
 - `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
-  reconstruction, plus the corrected ideal-gas MFM HLLC/KT Riemann flux.
+  reconstruction, plus the corrected ideal-gas MFM HLLC/KT/exact Riemann flux.
 - `gizmo-cli`: the compatibility command-line boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From
@@ -56,6 +56,5 @@ area by at most `4.07e-9`.
 The Riemann port preserves the corrected two-rarefaction vacuum criterion and
 the legacy distinction between HLLC failure modes: negative or non-finite
 pressure falls back to the MFM KT flux, while a positive pressure above the
-configured limiter requires the exact solver. The exact ideal-gas solver is not
-ported yet, so that path fails explicitly instead of substituting a different
-flux.
+configured limiter invokes a finite-checked exact ideal-gas solve. Exact-solver
+nonconvergence is reported explicitly and cannot be misclassified as vacuum.

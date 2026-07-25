@@ -496,8 +496,8 @@ pub fn reconstruct_face_states_1d(
 ///
 /// # Errors
 ///
-/// Returns an error for invalid primitives, non-finite arithmetic, or a KT
-/// result that would require the not-yet-ported exact-solver fallback.
+/// Returns an error for invalid primitives, non-finite arithmetic, or failure
+/// of the finite-checked exact-solver fallback to converge.
 pub fn ideal_gas_mfm_flux_1d(
     left: PrimitiveState1d,
     right: PrimitiveState1d,
@@ -537,10 +537,7 @@ pub fn ideal_gas_mfm_flux_1d(
     if velocity_jump > vacuum_threshold {
         let vacuum_pressure = 1.0e-56;
         if vacuum_pressure > pressure_limit {
-            return Err(HydroError::ExactRiemannSolverRequired {
-                star_pressure: vacuum_pressure,
-                pressure_limit,
-            });
+            return exact_mfm_flux(left, right, gamma, sound_left, sound_right);
         }
         return Ok(MfmFlux1d {
             mass: 0.0,
@@ -583,15 +580,13 @@ pub fn ideal_gas_mfm_flux_1d(
             });
         }
         HllcOutcome::NeedsExact { star_pressure } => {
-            return Err(HydroError::ExactRiemannSolverRequired {
-                star_pressure,
-                pressure_limit,
-            });
+            debug_assert!(star_pressure > pressure_limit);
+            return exact_mfm_flux(left, right, gamma, sound_left, sound_right);
         }
         HllcOutcome::NeedsKt => {}
     }
 
-    kt_mfm_flux(
+    match kt_mfm_flux(
         left,
         right,
         sound_left,
@@ -599,7 +594,13 @@ pub fn ideal_gas_mfm_flux_1d(
         enthalpy_left,
         enthalpy_right,
         pressure_limit,
-    )
+    ) {
+        Ok(flux) => Ok(flux),
+        Err(HydroError::ExactRiemannSolverRequired { .. }) => {
+            exact_mfm_flux(left, right, gamma, sound_left, sound_right)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 enum HllcOutcome {
@@ -787,6 +788,194 @@ fn kt_mfm_flux(
         solver_speed: signal_speed,
         method: RiemannMethod::KurganovTadmor,
     })
+}
+
+fn exact_mfm_flux(
+    left: PrimitiveState1d,
+    right: PrimitiveState1d,
+    gamma: f64,
+    sound_left: f64,
+    sound_right: f64,
+) -> Result<MfmFlux1d, HydroError> {
+    let rarefaction_factor = 2.0 / (gamma - 1.0);
+    let vacuum_threshold = rarefaction_factor * (sound_left + sound_right);
+    if right.velocity - left.velocity >= vacuum_threshold {
+        let left_fan_edge = left.velocity + rarefaction_factor * sound_left;
+        let right_fan_edge = right.velocity - rarefaction_factor * sound_right;
+        let contact_speed = if 0.0 <= left_fan_edge {
+            left_fan_edge
+        } else if 0.0 >= right_fan_edge {
+            right_fan_edge
+        } else {
+            0.0
+        };
+        return Ok(MfmFlux1d {
+            mass: 0.0,
+            momentum: 0.0,
+            energy: 0.0,
+            star_pressure: 0.0,
+            solver_speed: contact_speed,
+            method: RiemannMethod::Exact,
+        });
+    }
+
+    let mut star_pressure = exact_pressure_guess(left, right, gamma, sound_left, sound_right);
+    if !star_pressure.is_finite() || star_pressure <= 0.0 {
+        return Err(HydroError::ExactRiemannSolverDidNotConverge {
+            iterations: 0,
+            pressure: star_pressure,
+        });
+    }
+
+    let mut converged = false;
+    let mut iterations = 0_u32;
+    while iterations < 1_000 {
+        let previous = star_pressure;
+        let wave_left = exact_wave_curve(previous, left, gamma, sound_left);
+        let wave_right = exact_wave_curve(previous, right, gamma, sound_right);
+        if !wave_left.value.is_finite()
+            || !wave_left.derivative.is_finite()
+            || !wave_right.value.is_finite()
+            || !wave_right.derivative.is_finite()
+        {
+            break;
+        }
+        let derivative = wave_left.derivative + wave_right.derivative;
+        if !derivative.is_finite() || derivative <= 0.0 {
+            break;
+        }
+        star_pressure -=
+            (wave_left.value + wave_right.value + right.velocity - left.velocity) / derivative;
+        if star_pressure < 0.1 * previous {
+            star_pressure = 0.1 * previous;
+        }
+        iterations += 1;
+        if !star_pressure.is_finite() || star_pressure <= 0.0 {
+            break;
+        }
+        let tolerance = 2.0 * ((star_pressure - previous) / (star_pressure + previous)).abs();
+        if !tolerance.is_finite() {
+            break;
+        }
+        if tolerance <= 1.0e-6 {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return Err(HydroError::ExactRiemannSolverDidNotConverge {
+            iterations,
+            pressure: star_pressure,
+        });
+    }
+
+    let wave_left = exact_wave_curve(star_pressure, left, gamma, sound_left);
+    let wave_right = exact_wave_curve(star_pressure, right, gamma, sound_right);
+    let residual = wave_left.value + wave_right.value + right.velocity - left.velocity;
+    let residual_scale =
+        (sound_left + sound_right + (right.velocity - left.velocity).abs()).max(1.0);
+    if !residual.is_finite() || residual.abs() > 2.0e-6 * residual_scale {
+        return Err(HydroError::ExactRiemannSolverDidNotConverge {
+            iterations,
+            pressure: star_pressure,
+        });
+    }
+    let contact_speed =
+        0.5 * (left.velocity + right.velocity) + 0.5 * (wave_right.value - wave_left.value);
+    let energy = star_pressure * contact_speed;
+    if [star_pressure, contact_speed, energy]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "exact_flux",
+            value: f64::NAN,
+        });
+    }
+    Ok(MfmFlux1d {
+        mass: 0.0,
+        momentum: star_pressure,
+        energy,
+        star_pressure,
+        solver_speed: contact_speed,
+        method: RiemannMethod::Exact,
+    })
+}
+
+struct ExactWaveCurve {
+    value: f64,
+    derivative: f64,
+}
+
+fn exact_wave_curve(
+    pressure: f64,
+    state: PrimitiveState1d,
+    gamma: f64,
+    sound_speed: f64,
+) -> ExactWaveCurve {
+    if pressure > state.pressure {
+        let coefficient = 2.0 / ((gamma + 1.0) * state.density);
+        let offset = (gamma - 1.0) * state.pressure / (gamma + 1.0);
+        let root = (coefficient / (pressure + offset)).sqrt();
+        ExactWaveCurve {
+            value: (pressure - state.pressure) * root,
+            derivative: root * (1.0 - 0.5 * (pressure - state.pressure) / (pressure + offset)),
+        }
+    } else {
+        let pressure_ratio = pressure / state.pressure;
+        let pressure_exponent = (gamma - 1.0) / (2.0 * gamma);
+        ExactWaveCurve {
+            value: 2.0 * sound_speed / (gamma - 1.0)
+                * (pressure_ratio.powf(pressure_exponent) - 1.0),
+            derivative: pressure_ratio.powf(-(gamma + 1.0) / (2.0 * gamma))
+                / (state.density * sound_speed),
+        }
+    }
+}
+
+fn exact_pressure_guess(
+    left: PrimitiveState1d,
+    right: PrimitiveState1d,
+    gamma: f64,
+    sound_left: f64,
+    sound_right: f64,
+) -> f64 {
+    let minimum = left.pressure.min(right.pressure);
+    let maximum = left.pressure.max(right.pressure);
+    let primitive = 0.5 * (left.pressure + right.pressure)
+        - 0.125
+            * (right.velocity - left.velocity)
+            * (left.density + right.density)
+            * (sound_left + sound_right);
+    if maximum / minimum <= 2.0 && (minimum..=maximum).contains(&primitive) {
+        return primitive;
+    }
+    if primitive < minimum {
+        let exponent = (gamma - 1.0) / (2.0 * gamma);
+        let numerator =
+            sound_left + sound_right - 0.5 * (gamma - 1.0) * (right.velocity - left.velocity);
+        let denominator =
+            sound_left / left.pressure.powf(exponent) + sound_right / right.pressure.powf(exponent);
+        return (numerator / denominator).powf(2.0 * gamma / (gamma - 1.0));
+    }
+    let left_weight = (2.0
+        / ((gamma + 1.0)
+            * left.density
+            * ((gamma - 1.0) * left.pressure / (gamma + 1.0) + primitive)))
+        .sqrt();
+    let right_weight = (2.0
+        / ((gamma + 1.0)
+            * right.density
+            * ((gamma - 1.0) * right.pressure / (gamma + 1.0) + primitive)))
+        .sqrt();
+    let two_shock = (left_weight * left.pressure + right_weight * right.pressure
+        - (right.velocity - left.velocity))
+        / (left_weight + right_weight);
+    if two_shock < minimum || two_shock > maximum {
+        minimum
+    } else {
+        two_shock
+    }
 }
 
 fn specific_enthalpy(state: PrimitiveState1d, gamma: f64) -> f64 {
@@ -1041,6 +1230,7 @@ pub struct PrimitiveState1d {
 pub enum RiemannMethod {
     Hllc,
     KurganovTadmor,
+    Exact,
     Vacuum,
 }
 
@@ -1145,6 +1335,10 @@ pub enum HydroError {
     ExactRiemannSolverRequired {
         star_pressure: f64,
         pressure_limit: f64,
+    },
+    ExactRiemannSolverDidNotConverge {
+        iterations: u32,
+        pressure: f64,
     },
 }
 
@@ -1273,6 +1467,14 @@ impl fmt::Display for HydroError {
                 "Riemann star pressure {star_pressure} is outside the accepted range \
                  (0, {pressure_limit}]; \
                  exact Riemann solver is required"
+            ),
+            Self::ExactRiemannSolverDidNotConverge {
+                iterations,
+                pressure,
+            } => write!(
+                formatter,
+                "exact Riemann solver did not converge after {iterations} iterations; \
+                 last pressure={pressure}"
             ),
         }
     }
@@ -1603,15 +1805,16 @@ mod tests {
                 .unwrap();
         assert_eq!(vacuum.method, RiemannMethod::Vacuum);
         assert_close(vacuum.momentum, 1.0e-56);
-        assert!(matches!(
-            ideal_gas_mfm_flux_1d(
-                soundwave_state(-3.1),
-                soundwave_state(3.1),
-                5.0 / 3.0,
-                1.0e-57
-            ),
-            Err(HydroError::ExactRiemannSolverRequired { .. })
-        ));
+        let exact_vacuum = ideal_gas_mfm_flux_1d(
+            soundwave_state(-3.1),
+            soundwave_state(3.1),
+            5.0 / 3.0,
+            1.0e-57,
+        )
+        .unwrap();
+        assert_eq!(exact_vacuum.method, RiemannMethod::Exact);
+        assert_close(exact_vacuum.star_pressure, 0.0);
+        assert_close(exact_vacuum.momentum, 0.0);
     }
 
     #[test]
@@ -1637,7 +1840,56 @@ mod tests {
     }
 
     #[test]
-    fn mfm_riemann_solver_fails_closed_for_invalid_or_unported_cases() {
+    fn exact_mfm_solver_matches_reference_star_states() {
+        let sod = ideal_gas_mfm_flux_1d(
+            PrimitiveState1d {
+                density: 1.0,
+                velocity: 0.0,
+                pressure: 1.0,
+            },
+            PrimitiveState1d {
+                density: 0.125,
+                velocity: 0.0,
+                pressure: 0.1,
+            },
+            5.0 / 3.0,
+            0.01,
+        )
+        .unwrap();
+        assert_eq!(sod.method, RiemannMethod::Exact);
+        assert!((sod.star_pressure - 0.293_945_187_666_017_85).abs() < 1.0e-12);
+        assert!((sod.solver_speed - 0.841_194_852_168_808_3).abs() < 1.0e-12);
+        assert!((sod.energy - 0.247_265_178_684_448_5).abs() < 1.0e-12);
+
+        let expansion =
+            ideal_gas_mfm_flux_1d(soundwave_state(-1.0), soundwave_state(1.0), 5.0 / 3.0, 0.05)
+                .unwrap();
+        assert_eq!(expansion.method, RiemannMethod::Exact);
+        assert!((expansion.star_pressure - 0.079_012_345_679_012_3).abs() < 1.0e-12);
+        assert_close(expansion.solver_speed, 0.0);
+        assert_close(expansion.energy, 0.0);
+
+        let compression =
+            ideal_gas_mfm_flux_1d(soundwave_state(1.0), soundwave_state(-1.0), 5.0 / 3.0, 0.01)
+                .unwrap();
+        assert_eq!(compression.method, RiemannMethod::Exact);
+        assert!((compression.star_pressure - 2.468_517_091_821_330_4).abs() < 1.0e-12);
+        assert_close(compression.solver_speed, 0.0);
+        assert_close(compression.energy, 0.0);
+
+        let exact_boundary = ideal_gas_mfm_flux_1d(
+            soundwave_state(-3.0),
+            soundwave_state(3.0),
+            5.0 / 3.0,
+            1.0e-57,
+        )
+        .unwrap();
+        assert_eq!(exact_boundary.method, RiemannMethod::Exact);
+        assert_close(exact_boundary.star_pressure, 0.0);
+    }
+
+    #[test]
+    fn mfm_riemann_solver_fails_closed_for_invalid_or_nonfinite_cases() {
         let invalid_density = PrimitiveState1d {
             density: 0.0,
             ..soundwave_state(0.0)
@@ -1648,10 +1900,11 @@ mod tests {
         assert!(
             ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 1.0, 1.0).is_err()
         );
-        assert!(matches!(
-            ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 5.0 / 3.0, 0.5),
-            Err(HydroError::ExactRiemannSolverRequired { .. })
-        ));
+        let exact_uniform =
+            ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 5.0 / 3.0, 0.5)
+                .unwrap();
+        assert_eq!(exact_uniform.method, RiemannMethod::Exact);
+        assert_close(exact_uniform.star_pressure, 0.6);
         assert!(
             ideal_gas_mfm_flux_1d(
                 PrimitiveState1d {

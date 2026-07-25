@@ -193,7 +193,9 @@
       "confidence": "high",
       "affected_flags": [
         "HYDRO_MESHLESS_FINITE_MASS",
-        "HYDRO_MESHLESS_FINITE_VOLUME"
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "!MAGNETIC",
+        "!EOS_GENERAL"
       ],
       "summary": "The default HLLC pressure-star path classifies a pair as vacuum when the normal velocity jump exceeds max(c_L,c_R). For an ideal gas, the exact solver in the same file uses the two-rarefaction criterion 2(c_L+c_R)/(gamma-1). At gamma=5/3 with equal sound speeds, the legacy shortcut fires at c instead of 6c and replaces the star pressure with MIN_REAL_NUMBER. Three later floors also turn failed non-vacuum estimates into the same positive sentinel, disabling their immediately following fallback checks.",
       "impact": "Ordinary strong rarefactions can lose nearly all pairwise pressure force across a sharp numerical threshold even though the physical Riemann solution is non-vacuum.",
@@ -219,6 +221,93 @@
         }
       ],
       "dossier": "audit/findings/GZ-0006.md"
+    },
+    {
+      "id": "GZ-0007",
+      "title": "Exact MFM Riemann fallback leaves stale approximate fluxes",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "!MAGNETIC",
+        "!EOS_GENERAL",
+        "!COOLING",
+        "!GALSF"
+      ],
+      "summary": "The ideal-gas solver invokes Riemann_solver_exact() after an invalid or pressure-limited approximate solution. In MFM mode the exact sampler updates P_M and S_M but deliberately skips face-state flux evaluation, and the exact wrapper only converts MFV states to fluxes. The returned MFM momentum and energy fluxes therefore remain from the rejected HLLC or KT solution.",
+      "impact": "Whenever the exact fallback is selected, downstream hydro can consume an internally inconsistent result: exact contact pressure and speed alongside stale approximate momentum and energy fluxes. The fallback therefore does not actually correct the primary MFM flux.",
+      "reproduction": "Choose positive ideal-gas states whose final HLLC pressure exceeds press_tot_limiter. HLLC first writes Fluxes from its rejected P_M/S_M, then Riemann_solver_exact() changes P_M/S_M. Before the fix, no non-MFV statement rewrites Fluxes before hydro_core_meshless.h consumes them.",
+      "falsification": "Identify a post-exact MFM conversion that overwrites density, momentum, and energy fluxes from the final P_M/S_M before hydro_core_meshless.h reads Riemann_out.Fluxes, or prove the exact and rejected approximate star states are identical for every fallback-triggering input.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "For MFM in the contact frame, the returned flux must be mass=0, momentum=P_M*n, and energy=P_M*S_M using the same final star state."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 350,
+          "line_end": 370,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L350-L370"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 695,
+          "line_end": 739,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L695-L739"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 880,
+          "line_end": 888,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L880-L888"
+        },
+        {
+          "path": "hydro/hydro_core_meshless.h",
+          "line_start": 270,
+          "line_end": 302,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_core_meshless.h#L270-L302"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0007.md"
+    },
+    {
+      "id": "GZ-0008",
+      "title": "Exact Riemann iteration can report numerical failure as vacuum or success",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "!MAGNETIC",
+        "!EOS_GENERAL",
+        "!COOLING",
+        "!GALSF"
+      ],
+      "summary": "iterative_Riemann_solver() used the same zero return for a physical vacuum and exhaustion of 1,000 Newton iterations, so the wrapper sampled both as vacuum. Non-finite Newton arithmetic could also make tol NaN, terminate the loop, and be reported as success because the only success test was the iteration count. Its PVRS seed additionally multiplied velocity and sound speed by pressure rather than density, which is dimensionally inconsistent.",
+      "impact": "Difficult but non-vacuum interfaces can silently receive zero-pressure vacuum coupling or a NaN exact state instead of triggering the caller's safer-reconstruction retries.",
+      "reproduction": "Force the Newton loop to exhaust its iteration budget or produce a non-finite update. Before the fix it returns zero or exits with niter below the maximum; Riemann_solver_exact() respectively samples a physical vacuum or accepts the non-finite pressure as converged.",
+      "falsification": "Prove finite positive pressure and convergence before every success return and show that the nonconvergence return is distinguishable from the physical two-rarefaction vacuum outcome.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Physical vacuum, converged positive-pressure solution, and numerical failure are mutually exclusive solver outcomes and must not share success semantics."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 1044,
+          "line_end": 1138,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L1044-L1138"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 695,
+          "line_end": 728,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L695-L728"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0008.md"
     }
   ]
 }
