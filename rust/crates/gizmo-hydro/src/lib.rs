@@ -486,6 +486,328 @@ pub fn reconstruct_face_states_1d(
     Ok(FaceStates1d { left, right })
 }
 
+/// Solve the corrected ideal-gas, nonmagnetic 1-D MFM Riemann problem.
+///
+/// Inputs are primitive states in the rest frame of the interface, with
+/// velocities projected along the face normal. The fast HLLC pressure-star
+/// estimates match the legacy default path; failed estimates use its KT
+/// fallback. A true two-rarefaction vacuum is the only path that emits the
+/// positive minimum-pressure sentinel.
+///
+/// # Errors
+///
+/// Returns an error for invalid primitives, non-finite arithmetic, or a KT
+/// result that would require the not-yet-ported exact-solver fallback.
+pub fn ideal_gas_mfm_flux_1d(
+    left: PrimitiveState1d,
+    right: PrimitiveState1d,
+    gamma: f64,
+    pressure_limit: f64,
+) -> Result<MfmFlux1d, HydroError> {
+    validate_riemann_state("left", left)?;
+    validate_riemann_state("right", right)?;
+    if !gamma.is_finite() || gamma <= 1.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "gamma",
+            value: gamma,
+        });
+    }
+    if !pressure_limit.is_finite() || pressure_limit <= 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "pressure_limit",
+            value: pressure_limit,
+        });
+    }
+    let sound_left = (gamma * left.pressure / left.density).sqrt();
+    let sound_right = (gamma * right.pressure / right.density).sqrt();
+    let enthalpy_left = specific_enthalpy(left, gamma);
+    let enthalpy_right = specific_enthalpy(right, gamma);
+    if [sound_left, sound_right, enthalpy_left, enthalpy_right]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "thermodynamic_state",
+            value: f64::NAN,
+        });
+    }
+
+    let velocity_jump = right.velocity - left.velocity;
+    let vacuum_threshold = 2.0 * (sound_left + sound_right) / (gamma - 1.0);
+    if velocity_jump > vacuum_threshold {
+        let vacuum_pressure = 1.0e-56;
+        if vacuum_pressure > pressure_limit {
+            return Err(HydroError::ExactRiemannSolverRequired {
+                star_pressure: vacuum_pressure,
+                pressure_limit,
+            });
+        }
+        return Ok(MfmFlux1d {
+            mass: 0.0,
+            momentum: vacuum_pressure,
+            energy: 0.0,
+            star_pressure: vacuum_pressure,
+            solver_speed: 0.0,
+            method: RiemannMethod::Vacuum,
+        });
+    }
+
+    match hllc_star_state(
+        left,
+        right,
+        gamma,
+        sound_left,
+        sound_right,
+        enthalpy_left,
+        enthalpy_right,
+        pressure_limit,
+    ) {
+        HllcOutcome::Flux {
+            star_pressure,
+            contact_speed,
+        } => {
+            let energy = star_pressure * contact_speed;
+            if !energy.is_finite() {
+                return Err(HydroError::NonFiniteRiemannResult {
+                    field: "hllc_energy_flux",
+                    value: energy,
+                });
+            }
+            return Ok(MfmFlux1d {
+                mass: 0.0,
+                momentum: star_pressure,
+                energy,
+                star_pressure,
+                solver_speed: contact_speed,
+                method: RiemannMethod::Hllc,
+            });
+        }
+        HllcOutcome::NeedsExact { star_pressure } => {
+            return Err(HydroError::ExactRiemannSolverRequired {
+                star_pressure,
+                pressure_limit,
+            });
+        }
+        HllcOutcome::NeedsKt => {}
+    }
+
+    kt_mfm_flux(
+        left,
+        right,
+        sound_left,
+        sound_right,
+        enthalpy_left,
+        enthalpy_right,
+        pressure_limit,
+    )
+}
+
+enum HllcOutcome {
+    Flux {
+        star_pressure: f64,
+        contact_speed: f64,
+    },
+    NeedsKt,
+    NeedsExact {
+        star_pressure: f64,
+    },
+}
+
+fn accepted_hllc_flux(
+    star_pressure: f64,
+    contact_speed: f64,
+    pressure_limit: f64,
+) -> Option<HllcOutcome> {
+    (star_pressure.is_finite()
+        && contact_speed.is_finite()
+        && star_pressure > 0.0
+        && star_pressure <= pressure_limit)
+        .then_some(HllcOutcome::Flux {
+            star_pressure,
+            contact_speed,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hllc_star_state(
+    left: PrimitiveState1d,
+    right: PrimitiveState1d,
+    gamma: f64,
+    sound_left: f64,
+    sound_right: f64,
+    enthalpy_left: f64,
+    enthalpy_right: f64,
+    pressure_limit: f64,
+) -> HllcOutcome {
+    let sound_maximum = sound_left.max(sound_right);
+    let mut wave_left = left.velocity.min(right.velocity) - sound_maximum;
+    let mut wave_right = left.velocity.max(right.velocity) + sound_maximum;
+    let mut density_weight_left = left.density * (wave_left - left.velocity);
+    let mut density_weight_right = right.density * (wave_right - right.velocity);
+    let mut contact_speed = ((right.pressure - left.pressure)
+        + density_weight_left * left.velocity
+        - density_weight_right * right.velocity)
+        / (density_weight_left - density_weight_right);
+    let mut star_pressure = (left.pressure * density_weight_right
+        - right.pressure * density_weight_left
+        + density_weight_left * density_weight_right * (right.velocity - left.velocity))
+        / (density_weight_right - density_weight_left);
+    if let Some(outcome) = accepted_hllc_flux(star_pressure, contact_speed, pressure_limit) {
+        return outcome;
+    }
+
+    let sqrt_density_left = left.density.sqrt();
+    let sqrt_density_right = right.density.sqrt();
+    let inverse_sum = (sqrt_density_left + sqrt_density_right).recip();
+    let roe_velocity =
+        (sqrt_density_left * left.velocity + sqrt_density_right * right.velocity) * inverse_sum;
+    let roe_enthalpy =
+        (sqrt_density_left * enthalpy_left + sqrt_density_right * enthalpy_right) * inverse_sum;
+    let roe_sound = ((gamma - 1.0) * (roe_enthalpy - 0.5 * roe_velocity * roe_velocity))
+        .max(1.0e-30)
+        .sqrt();
+    wave_right = (right.velocity + sound_right).max(roe_velocity + roe_sound);
+    wave_left = (left.velocity - sound_left).min(roe_velocity - roe_sound);
+    density_weight_right = right.density * (wave_right - right.velocity);
+    density_weight_left = -left.density * (wave_left - left.velocity);
+    contact_speed = (density_weight_right * right.velocity
+        + density_weight_left * left.velocity
+        + left.pressure
+        - right.pressure)
+        / (density_weight_right + density_weight_left);
+    star_pressure = left.density * (left.velocity - wave_left) * (left.velocity - contact_speed)
+        + left.pressure;
+    if let Some(outcome) = accepted_hllc_flux(star_pressure, contact_speed, pressure_limit) {
+        return outcome;
+    }
+
+    star_pressure = 0.5
+        * (left.pressure
+            + right.pressure
+            + (left.velocity - right.velocity)
+                * 0.25
+                * (left.density + right.density)
+                * (sound_left + sound_right));
+    contact_speed = 0.5 * (right.velocity + left.velocity)
+        + 2.0 * (left.pressure - right.pressure)
+            / ((left.density + right.density) * (sound_left + sound_right));
+    let signal_speed = [
+        (left.velocity - sound_left).abs(),
+        (right.velocity - sound_right).abs(),
+        (left.velocity + sound_left).abs(),
+        (right.velocity + sound_right).abs(),
+    ]
+    .into_iter()
+    .fold(0.0, f64::max);
+    contact_speed = contact_speed.clamp(-signal_speed, signal_speed);
+    if !star_pressure.is_finite() || !contact_speed.is_finite() || star_pressure < 0.0 {
+        HllcOutcome::NeedsKt
+    } else if star_pressure > pressure_limit {
+        HllcOutcome::NeedsExact { star_pressure }
+    } else {
+        HllcOutcome::Flux {
+            star_pressure,
+            contact_speed,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kt_mfm_flux(
+    left: PrimitiveState1d,
+    right: PrimitiveState1d,
+    sound_left: f64,
+    sound_right: f64,
+    enthalpy_left: f64,
+    enthalpy_right: f64,
+    pressure_limit: f64,
+) -> Result<MfmFlux1d, HydroError> {
+    let momentum_difference = right.density * right.velocity - left.density * left.velocity;
+    let threshold = 0.001 * 0.5 * (left.density + right.density) * 0.5 * (sound_left + sound_right);
+    let alpha = momentum_difference.abs()
+        / (threshold * threshold + momentum_difference * momentum_difference).sqrt();
+    let wave_left = alpha * sound_left + left.velocity.abs();
+    let wave_right = alpha * sound_right + right.velocity.abs();
+    let diffusion_speed = wave_left.max(wave_right);
+    let signal_speed = (sound_left + left.velocity.abs()).max(sound_right + right.velocity.abs());
+    let weighted_left = left.density * (left.velocity + diffusion_speed);
+    let weighted_right = right.density * (right.velocity - diffusion_speed);
+    let denominator_base = left.density * left.velocity - right.density * right.velocity
+        + diffusion_speed * (left.density + right.density);
+    if !denominator_base.is_finite() || denominator_base == 0.0 {
+        return Err(HydroError::ExactRiemannSolverRequired {
+            star_pressure: f64::NAN,
+            pressure_limit,
+        });
+    }
+    let denominator = denominator_base.recip();
+    let weighted_product = weighted_left * weighted_right;
+    let star_pressure =
+        (weighted_left * right.pressure - weighted_right * left.pressure) * denominator;
+    if !star_pressure.is_finite() {
+        return Err(HydroError::ExactRiemannSolverRequired {
+            star_pressure,
+            pressure_limit,
+        });
+    }
+    if star_pressure <= 0.0 || star_pressure > pressure_limit {
+        return Err(HydroError::ExactRiemannSolverRequired {
+            star_pressure,
+            pressure_limit,
+        });
+    }
+    let momentum =
+        (right.velocity - left.velocity) * weighted_product * denominator + star_pressure;
+    let energy = (diffusion_speed
+        * (weighted_left * right.pressure + weighted_right * left.pressure)
+        + (enthalpy_right - enthalpy_left) * weighted_product)
+        * denominator;
+    if [
+        alpha,
+        diffusion_speed,
+        signal_speed,
+        denominator,
+        momentum,
+        energy,
+        star_pressure,
+    ]
+    .iter()
+    .any(|value| !value.is_finite())
+    {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "kt_flux",
+            value: f64::NAN,
+        });
+    }
+    Ok(MfmFlux1d {
+        mass: 0.0,
+        momentum,
+        energy,
+        star_pressure,
+        solver_speed: signal_speed,
+        method: RiemannMethod::KurganovTadmor,
+    })
+}
+
+fn specific_enthalpy(state: PrimitiveState1d, gamma: f64) -> f64 {
+    state.pressure / state.density
+        + state.pressure / ((gamma - 1.0) * state.density)
+        + 0.5 * state.velocity * state.velocity
+}
+
+fn validate_riemann_state(side: &'static str, state: PrimitiveState1d) -> Result<(), HydroError> {
+    for (field, value, positive) in [
+        ("density", state.density, true),
+        ("velocity", state.velocity, false),
+        ("pressure", state.pressure, true),
+    ] {
+        if !value.is_finite() || (positive && value <= 0.0) {
+            return Err(HydroError::InvalidRiemannState { side, field, value });
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::float_cmp)]
 fn legacy_float_equal(left: f64, right: f64) -> bool {
     left == right
@@ -708,6 +1030,31 @@ pub struct FaceStates1d {
     pub right: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrimitiveState1d {
+    pub density: f64,
+    pub velocity: f64,
+    pub pressure: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiemannMethod {
+    Hllc,
+    KurganovTadmor,
+    Vacuum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MfmFlux1d {
+    pub mass: f64,
+    pub momentum: f64,
+    pub energy: f64,
+    pub star_pressure: f64,
+    /// HLLC contact speed or the fallback solver's signal speed.
+    pub solver_speed: f64,
+    pub method: RiemannMethod,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HydroError {
     InvalidKernelInput {
@@ -782,9 +1129,27 @@ pub enum HydroError {
         left: f64,
         right: f64,
     },
+    InvalidRiemannState {
+        side: &'static str,
+        field: &'static str,
+        value: f64,
+    },
+    InvalidRiemannParameter {
+        field: &'static str,
+        value: f64,
+    },
+    NonFiniteRiemannResult {
+        field: &'static str,
+        value: f64,
+    },
+    ExactRiemannSolverRequired {
+        star_pressure: f64,
+        pressure_limit: f64,
+    },
 }
 
 impl fmt::Display for HydroError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidKernelInput { radius, hsml } => {
@@ -885,6 +1250,30 @@ impl fmt::Display for HydroError {
                     "non-finite reconstructed states left={left}, right={right}"
                 )
             }
+            Self::InvalidRiemannState { side, field, value } => {
+                write!(
+                    formatter,
+                    "Riemann {side} state has invalid {field} {value}"
+                )
+            }
+            Self::InvalidRiemannParameter { field, value } => {
+                write!(formatter, "invalid Riemann parameter {field}={value}")
+            }
+            Self::NonFiniteRiemannResult { field, value } => {
+                write!(
+                    formatter,
+                    "Riemann solver produced non-finite {field}={value}"
+                )
+            }
+            Self::ExactRiemannSolverRequired {
+                star_pressure,
+                pressure_limit,
+            } => write!(
+                formatter,
+                "Riemann star pressure {star_pressure} is outside the accepted range \
+                 (0, {pressure_limit}]; \
+                 exact Riemann solver is required"
+            ),
         }
     }
 }
@@ -1154,6 +1543,125 @@ mod tests {
                 0.0,
                 face,
                 ReconstructionOrder::First
+            )
+            .is_err()
+        );
+    }
+
+    fn soundwave_state(velocity: f64) -> PrimitiveState1d {
+        PrimitiveState1d {
+            density: 1.0,
+            velocity,
+            pressure: 0.6,
+        }
+    }
+
+    #[test]
+    fn mfm_hllc_flux_preserves_a_uniform_state() {
+        let flux =
+            ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 5.0 / 3.0, 1.0)
+                .unwrap();
+        assert_eq!(flux.method, RiemannMethod::Hllc);
+        assert_close(flux.mass, 0.0);
+        assert_close(flux.momentum, 0.6);
+        assert_close(flux.energy, 0.0);
+        assert_close(flux.star_pressure, 0.6);
+        assert_close(flux.solver_speed, 0.0);
+    }
+
+    #[test]
+    fn mfm_hllc_flux_resolves_a_weak_symmetric_expansion() {
+        let flux =
+            ideal_gas_mfm_flux_1d(soundwave_state(-0.1), soundwave_state(0.1), 5.0 / 3.0, 1.0)
+                .unwrap();
+        assert_eq!(flux.method, RiemannMethod::Hllc);
+        assert_close(flux.momentum, 0.5);
+        assert_close(flux.energy, 0.0);
+        assert_close(flux.star_pressure, 0.5);
+        assert_close(flux.solver_speed, 0.0);
+    }
+
+    #[test]
+    fn failed_hllc_estimates_fall_back_instead_of_declaring_false_vacuum() {
+        let flux =
+            ideal_gas_mfm_flux_1d(soundwave_state(-1.0), soundwave_state(1.0), 5.0 / 3.0, 1.0)
+                .unwrap();
+        assert_eq!(flux.method, RiemannMethod::KurganovTadmor);
+        assert_close(flux.star_pressure, 0.6);
+
+        let below_threshold = ideal_gas_mfm_flux_1d(
+            soundwave_state(-2.999),
+            soundwave_state(2.999),
+            5.0 / 3.0,
+            1.0,
+        )
+        .unwrap();
+        assert_ne!(below_threshold.method, RiemannMethod::Vacuum);
+
+        let vacuum =
+            ideal_gas_mfm_flux_1d(soundwave_state(-3.1), soundwave_state(3.1), 5.0 / 3.0, 1.0)
+                .unwrap();
+        assert_eq!(vacuum.method, RiemannMethod::Vacuum);
+        assert_close(vacuum.momentum, 1.0e-56);
+        assert!(matches!(
+            ideal_gas_mfm_flux_1d(
+                soundwave_state(-3.1),
+                soundwave_state(3.1),
+                5.0 / 3.0,
+                1.0e-57
+            ),
+            Err(HydroError::ExactRiemannSolverRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn kt_fallback_uses_the_lagrangian_mfm_flux_not_the_mfv_flux() {
+        let left = PrimitiveState1d {
+            density: 1.0,
+            velocity: -1.0,
+            pressure: 0.6,
+        };
+        let right = PrimitiveState1d {
+            density: 2.0,
+            velocity: 1.0,
+            pressure: 0.8,
+        };
+        let flux = ideal_gas_mfm_flux_1d(left, right, 5.0 / 3.0, 1.0).unwrap();
+        assert_eq!(flux.method, RiemannMethod::KurganovTadmor);
+        assert!((flux.star_pressure - 2.0 / 3.0).abs() < 1.0e-12);
+        assert!((flux.momentum - (-0.666_666_529_18)).abs() < 1.0e-10);
+        assert!((flux.energy - 0.066_666_646_04).abs() < 1.0e-10);
+
+        // The accidental MFV/MFM hybrid returned about -0.8 here.
+        assert!((flux.momentum - (-0.8)).abs() > 0.1);
+    }
+
+    #[test]
+    fn mfm_riemann_solver_fails_closed_for_invalid_or_unported_cases() {
+        let invalid_density = PrimitiveState1d {
+            density: 0.0,
+            ..soundwave_state(0.0)
+        };
+        assert!(
+            ideal_gas_mfm_flux_1d(invalid_density, soundwave_state(0.0), 5.0 / 3.0, 1.0).is_err()
+        );
+        assert!(
+            ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 1.0, 1.0).is_err()
+        );
+        assert!(matches!(
+            ideal_gas_mfm_flux_1d(soundwave_state(0.0), soundwave_state(0.0), 5.0 / 3.0, 0.5),
+            Err(HydroError::ExactRiemannSolverRequired { .. })
+        ));
+        assert!(
+            ideal_gas_mfm_flux_1d(
+                PrimitiveState1d {
+                    density: f64::MAX,
+                    velocity: f64::MAX,
+                    pressure: f64::MAX,
+                },
+                soundwave_state(0.0),
+                5.0 / 3.0,
+                f64::MAX
             )
             .is_err()
         );
