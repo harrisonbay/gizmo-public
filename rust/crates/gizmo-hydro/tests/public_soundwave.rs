@@ -1,11 +1,13 @@
 use gizmo_hydro::{
-    GradientEstimate, MeshlessPoint1d, density_at_hsml_1d, gradients_at_hsml_1d,
-    inverse_moments_1d, meshless_face_geometry_1d, solve_smoothing_lengths_1d,
+    GradientEstimate, MeshlessPoint1d, PrimitiveState1d, ReconstructedPoint1d, RiemannMethod,
+    density_at_hsml_1d, gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
+    mfm_pair_flux_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 
 #[test]
 #[ignore = "requires GIZMO_SOUNDWAVE_IC; run via validation oracle script"]
+#[allow(clippy::too_many_lines)]
 fn rust_density_matches_pinned_public_soundwave_state() {
     let path = std::env::var_os("GIZMO_SOUNDWAVE_IC")
         .expect("GIZMO_SOUNDWAVE_IC must identify the pinned fixture");
@@ -101,6 +103,15 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         &positions,
         &snapshot.gas.masses,
         expected_density,
+        smoothing_lengths,
+        snapshot.header.box_size,
+    );
+    assert_public_pair_fluxes(
+        &positions,
+        &snapshot.gas.masses,
+        expected_density,
+        &snapshot.gas.velocities,
+        &snapshot.gas.internal_energy,
         smoothing_lengths,
         snapshot.header.box_size,
     );
@@ -209,4 +220,99 @@ fn assert_public_faces(
         max_area_deviation < 1.0e-6,
         "public face areas diverged from unit geometry: {max_area_deviation}"
     );
+}
+
+fn assert_public_pair_fluxes(
+    positions: &[f64],
+    masses: &[f64],
+    density: &[f64],
+    velocities: &[[f64; 3]],
+    internal_energy: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) {
+    let velocity: Vec<f64> = velocities.iter().map(|components| components[0]).collect();
+    let pressure: Vec<f64> = density
+        .iter()
+        .zip(internal_energy)
+        .map(|(density, internal_energy)| (2.0 / 3.0) * density * internal_energy)
+        .collect();
+    let density_gradients =
+        gradients_at_hsml_1d(positions, density, smoothing_lengths, box_size, 0.0, true)
+            .expect("public density gradients must be valid");
+    let velocity_gradients = gradients_at_hsml_1d(
+        positions,
+        &velocity,
+        smoothing_lengths,
+        box_size,
+        0.1,
+        false,
+    )
+    .expect("public velocity gradients must be valid");
+    let pressure_gradients =
+        gradients_at_hsml_1d(positions, &pressure, smoothing_lengths, box_size, 0.1, true)
+            .expect("public pressure gradients must be valid");
+    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)
+        .expect("public geometry must have invertible moments");
+    let geometry = |index: usize| MeshlessPoint1d {
+        position: positions[index],
+        mass: masses[index],
+        density: density[index],
+        smoothing_length: smoothing_lengths[index],
+        inverse_moment: inverse_moments[index],
+    };
+    let reconstructed = |index: usize| ReconstructedPoint1d {
+        primitive: PrimitiveState1d {
+            density: density[index],
+            velocity: velocity[index],
+            pressure: pressure[index],
+        },
+        density_gradient: density_gradients[index].limited,
+        velocity_gradient: velocity_gradients[index].limited,
+        pressure_gradient: pressure_gradients[index].limited,
+    };
+    let mut spatial_order: Vec<usize> = (0..positions.len()).collect();
+    spatial_order.sort_unstable_by(|left, right| positions[*left].total_cmp(&positions[*right]));
+
+    let mut max_momentum_swap_error = 0.0_f64;
+    let mut max_energy_swap_error = 0.0_f64;
+    let mut hllc_pairs = 0_usize;
+    for (order_index, &index) in spatial_order.iter().enumerate() {
+        let neighbor = spatial_order[(order_index + 1) % spatial_order.len()];
+        let face = meshless_face_geometry_1d(geometry(index), geometry(neighbor), box_size)
+            .expect("adjacent public particles must form a valid face");
+        let reverse_face = meshless_face_geometry_1d(geometry(neighbor), geometry(index), box_size)
+            .expect("reversed public pair must form a valid face");
+        let flux = mfm_pair_flux_1d(
+            reconstructed(index),
+            reconstructed(neighbor),
+            face,
+            5.0 / 3.0,
+        )
+        .expect("public adjacent pair flux must be valid");
+        let reverse = mfm_pair_flux_1d(
+            reconstructed(neighbor),
+            reconstructed(index),
+            reverse_face,
+            5.0 / 3.0,
+        )
+        .expect("reversed public adjacent pair flux must be valid");
+        assert!(flux.mass.abs() <= f64::EPSILON);
+        assert!(reverse.mass.abs() <= f64::EPSILON);
+        max_momentum_swap_error =
+            max_momentum_swap_error.max((flux.momentum + reverse.momentum).abs());
+        max_energy_swap_error = max_energy_swap_error.max((flux.energy + reverse.energy).abs());
+        if flux.method == RiemannMethod::Hllc {
+            hllc_pairs += 1;
+        }
+    }
+    eprintln!(
+        "public fixture pair fluxes: HLLC={hllc_pairs}/{}, \
+         max swap momentum error={max_momentum_swap_error:.12e}, \
+         max swap energy error={max_energy_swap_error:.12e}",
+        positions.len()
+    );
+    assert_eq!(hllc_pairs, positions.len());
+    assert!(max_momentum_swap_error < 1.0e-12);
+    assert!(max_energy_swap_error < 1.0e-12);
 }

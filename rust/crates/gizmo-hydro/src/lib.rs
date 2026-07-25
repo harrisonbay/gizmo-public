@@ -603,6 +603,160 @@ pub fn ideal_gas_mfm_flux_1d(
     }
 }
 
+/// Reconstruct and solve the non-cosmological 1-D MFM pair Riemann flux.
+///
+/// The returned momentum and energy fluxes are area-integrated and oriented
+/// from particle `j` toward particle `i`, matching `face.signed_area`. They are
+/// de-boosted from the midpoint interface frame back to the simulation frame.
+/// The legacy pair-level reconstruction retries are included. Its subsequent
+/// low-contact-speed entropic/PdV energy replacement is not.
+///
+/// # Errors
+///
+/// Returns an error for an inconsistent face, invalid primitive state,
+/// non-finite reconstruction, or Riemann-solver failure.
+#[allow(clippy::too_many_lines)]
+pub fn mfm_pair_flux_1d(
+    i: ReconstructedPoint1d,
+    j: ReconstructedPoint1d,
+    face: MeshlessFace1d,
+    gamma: f64,
+) -> Result<PairFlux1d, HydroError> {
+    if !face.signed_area.is_finite()
+        || face.signed_area == 0.0
+        || !legacy_float_equal(face.area, face.signed_area.abs())
+        || !face.distance_from_i.is_finite()
+        || !face.distance_from_j.is_finite()
+        || legacy_float_equal(face.distance_from_i, face.distance_from_j)
+        || face.distance_from_i.signum() != -face.signed_area.signum()
+        || face.distance_from_j.signum() != face.signed_area.signum()
+        || (face.distance_from_i + face.distance_from_j).abs()
+            > f64::EPSILON * (face.distance_from_i.abs() + face.distance_from_j.abs())
+    {
+        return Err(HydroError::InvalidFaceInput {
+            side: "pair",
+            field: "signed_area",
+            value: face.signed_area,
+        });
+    }
+    validate_riemann_state("i", i.primitive)?;
+    validate_riemann_state("j", j.primitive)?;
+
+    let density = reconstruct_face_states_1d(
+        i.primitive.density,
+        i.density_gradient,
+        j.primitive.density,
+        j.density_gradient,
+        face,
+        ReconstructionOrder::First,
+    );
+    let velocity = reconstruct_face_states_1d(
+        i.primitive.velocity,
+        i.velocity_gradient,
+        j.primitive.velocity,
+        j.velocity_gradient,
+        face,
+        ReconstructionOrder::First,
+    );
+    let pressure = reconstruct_face_states_1d(
+        i.primitive.pressure,
+        i.pressure_gradient,
+        j.primitive.pressure,
+        j.pressure_gradient,
+        face,
+        ReconstructionOrder::First,
+    );
+
+    let normal = face.signed_area.signum();
+    let interface_velocity = 0.5 * (i.primitive.velocity + j.primitive.velocity);
+    let normal_velocity_i = i.primitive.velocity * normal;
+    let normal_velocity_j = j.primitive.velocity * normal;
+    let approach_velocity = (normal_velocity_i - normal_velocity_j).min(0.0);
+    let approach_speed_squared = approach_velocity * approach_velocity;
+    let pressure_limit = 1.1
+        * (i.primitive.pressure + i.primitive.density * approach_speed_squared)
+            .max(j.primitive.pressure + j.primitive.density * approach_speed_squared);
+    if !pressure_limit.is_finite() || pressure_limit <= 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "pair_pressure_limit",
+            value: pressure_limit,
+        });
+    }
+
+    let solve = |left: PrimitiveState1d, right: PrimitiveState1d, limit: f64| {
+        ideal_gas_mfm_flux_1d(left, right, gamma, limit)
+    };
+    let first = match (density, velocity, pressure) {
+        (Ok(density), Ok(velocity), Ok(pressure)) => solve(
+            PrimitiveState1d {
+                density: density.left,
+                velocity: (velocity.left - interface_velocity) * normal,
+                pressure: pressure.left,
+            },
+            PrimitiveState1d {
+                density: density.right,
+                velocity: (velocity.right - interface_velocity) * normal,
+                pressure: pressure.right,
+            },
+            pressure_limit,
+        ),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    };
+    let (interface_flux, solve_path) = match first {
+        Ok(flux) if flux.star_pressure <= 1.4 * pressure_limit => {
+            (flux, PairSolvePath::Reconstructed)
+        }
+        Ok(_) | Err(_) => {
+            let centered_left = PrimitiveState1d {
+                density: j.primitive.density,
+                velocity: (j.primitive.velocity - interface_velocity) * normal,
+                pressure: j.primitive.pressure,
+            };
+            let centered_right = PrimitiveState1d {
+                density: i.primitive.density,
+                velocity: (i.primitive.velocity - interface_velocity) * normal,
+                pressure: i.primitive.pressure,
+            };
+            match solve(centered_left, centered_right, 1.4 * pressure_limit) {
+                Ok(flux) => (flux, PairSolvePath::Centered),
+                Err(_) => (
+                    solve(
+                        PrimitiveState1d {
+                            velocity: 0.0,
+                            ..centered_left
+                        },
+                        PrimitiveState1d {
+                            velocity: 0.0,
+                            ..centered_right
+                        },
+                        2.0 * pressure_limit,
+                    )?,
+                    PairSolvePath::ZeroRelativeVelocity,
+                ),
+            }
+        }
+    };
+    let momentum = face.area * interface_flux.momentum * normal;
+    let energy =
+        face.area * (interface_flux.energy + interface_velocity * interface_flux.momentum * normal);
+    if !momentum.is_finite() || !energy.is_finite() {
+        return Err(HydroError::NonFiniteRiemannResult {
+            field: "pair_flux",
+            value: f64::NAN,
+        });
+    }
+    Ok(PairFlux1d {
+        mass: 0.0,
+        momentum,
+        energy,
+        star_pressure: interface_flux.star_pressure,
+        interface_velocity,
+        solver_speed: interface_flux.solver_speed,
+        method: interface_flux.method,
+        solve_path,
+    })
+}
+
 enum HllcOutcome {
     Flux {
         star_pressure: f64,
@@ -1226,6 +1380,14 @@ pub struct PrimitiveState1d {
     pub pressure: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReconstructedPoint1d {
+    pub primitive: PrimitiveState1d,
+    pub density_gradient: f64,
+    pub velocity_gradient: f64,
+    pub pressure_gradient: f64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RiemannMethod {
     Hllc,
@@ -1243,6 +1405,25 @@ pub struct MfmFlux1d {
     /// HLLC contact speed or the fallback solver's signal speed.
     pub solver_speed: f64,
     pub method: RiemannMethod,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairFlux1d {
+    pub mass: f64,
+    pub momentum: f64,
+    pub energy: f64,
+    pub star_pressure: f64,
+    pub interface_velocity: f64,
+    pub solver_speed: f64,
+    pub method: RiemannMethod,
+    pub solve_path: PairSolvePath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairSolvePath {
+    Reconstructed,
+    Centered,
+    ZeroRelativeVelocity,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1886,6 +2067,157 @@ mod tests {
         .unwrap();
         assert_eq!(exact_boundary.method, RiemannMethod::Exact);
         assert_close(exact_boundary.star_pressure, 0.0);
+    }
+
+    fn reconstructed_point(state: PrimitiveState1d) -> ReconstructedPoint1d {
+        ReconstructedPoint1d {
+            primitive: state,
+            density_gradient: 0.0,
+            velocity_gradient: 0.0,
+            pressure_gradient: 0.0,
+        }
+    }
+
+    fn unit_pair_face(normal: f64) -> MeshlessFace1d {
+        MeshlessFace1d {
+            signed_area: normal,
+            area: 1.0,
+            distance_from_i: -0.5 * normal,
+            distance_from_j: 0.5 * normal,
+        }
+    }
+
+    #[test]
+    fn pair_flux_is_oriented_conservative_and_galilean_deboosted() {
+        let state = PrimitiveState1d {
+            density: 1.0,
+            velocity: 2.0,
+            pressure: 0.6,
+        };
+        let point = reconstructed_point(state);
+        let forward = mfm_pair_flux_1d(point, point, unit_pair_face(1.0), 5.0 / 3.0).unwrap();
+        let reverse = mfm_pair_flux_1d(point, point, unit_pair_face(-1.0), 5.0 / 3.0).unwrap();
+
+        assert_close(forward.mass, 0.0);
+        assert_close(forward.momentum, 0.6);
+        assert_close(forward.energy, 1.2);
+        assert_close(forward.interface_velocity, 2.0);
+        assert_eq!(forward.solve_path, PairSolvePath::Reconstructed);
+        assert_close(reverse.momentum, -forward.momentum);
+        assert_close(reverse.energy, -forward.energy);
+
+        let double_area = mfm_pair_flux_1d(
+            point,
+            point,
+            MeshlessFace1d {
+                signed_area: 2.0,
+                area: 2.0,
+                ..unit_pair_face(1.0)
+            },
+            5.0 / 3.0,
+        )
+        .unwrap();
+        assert_close(double_area.momentum, 2.0 * forward.momentum);
+        assert_close(double_area.energy, 2.0 * forward.energy);
+
+        let i = reconstructed_point(PrimitiveState1d {
+            density: 1.0,
+            velocity: 0.2,
+            pressure: 0.7,
+        });
+        let j = reconstructed_point(PrimitiveState1d {
+            density: 0.8,
+            velocity: -0.1,
+            pressure: 0.5,
+        });
+        let asymmetric = mfm_pair_flux_1d(i, j, unit_pair_face(1.0), 5.0 / 3.0).unwrap();
+        let swapped = mfm_pair_flux_1d(j, i, unit_pair_face(-1.0), 5.0 / 3.0).unwrap();
+        assert!((asymmetric.momentum + swapped.momentum).abs() < 1.0e-14);
+        assert!((asymmetric.energy + swapped.energy).abs() < 1.0e-14);
+        assert_close(asymmetric.star_pressure, swapped.star_pressure);
+
+        let gradient_i = ReconstructedPoint1d {
+            density_gradient: 0.2,
+            velocity_gradient: -0.3,
+            pressure_gradient: 0.1,
+            ..i
+        };
+        let gradient_j = ReconstructedPoint1d {
+            density_gradient: -0.1,
+            velocity_gradient: 0.2,
+            pressure_gradient: -0.15,
+            ..j
+        };
+        let gradient_flux =
+            mfm_pair_flux_1d(gradient_i, gradient_j, unit_pair_face(1.0), 5.0 / 3.0).unwrap();
+        let gradient_swap =
+            mfm_pair_flux_1d(gradient_j, gradient_i, unit_pair_face(-1.0), 5.0 / 3.0).unwrap();
+        assert!((gradient_flux.momentum + gradient_swap.momentum).abs() < 1.0e-14);
+        assert!((gradient_flux.energy + gradient_swap.energy).abs() < 1.0e-14);
+
+        let boost = |mut point: ReconstructedPoint1d| {
+            point.primitive.velocity += 3.0;
+            point
+        };
+        let boosted = mfm_pair_flux_1d(
+            boost(gradient_i),
+            boost(gradient_j),
+            unit_pair_face(1.0),
+            5.0 / 3.0,
+        )
+        .unwrap();
+        assert_close(boosted.momentum, gradient_flux.momentum);
+        assert!(
+            (boosted.energy - (gradient_flux.energy + 3.0 * gradient_flux.momentum)).abs()
+                < 1.0e-14
+        );
+    }
+
+    #[test]
+    fn pair_flux_rejects_inconsistent_face_geometry() {
+        let point = reconstructed_point(soundwave_state(0.0));
+        let invalid_face = MeshlessFace1d {
+            signed_area: 1.0,
+            area: 2.0,
+            distance_from_i: -0.5,
+            distance_from_j: 0.5,
+        };
+        assert!(mfm_pair_flux_1d(point, point, invalid_face, 5.0 / 3.0).is_err());
+
+        let off_center = MeshlessFace1d {
+            distance_from_i: -0.25,
+            distance_from_j: 0.5,
+            ..unit_pair_face(1.0)
+        };
+        assert!(mfm_pair_flux_1d(point, point, off_center, 5.0 / 3.0).is_err());
+    }
+
+    #[test]
+    fn pair_flux_retries_centered_states_after_bad_reconstruction() {
+        let i = ReconstructedPoint1d {
+            pressure_gradient: f64::MAX,
+            ..reconstructed_point(PrimitiveState1d {
+                density: 1.0,
+                velocity: 0.0,
+                pressure: 0.6,
+            })
+        };
+        let j = ReconstructedPoint1d {
+            pressure_gradient: -f64::MAX,
+            ..reconstructed_point(PrimitiveState1d {
+                density: 1.0,
+                velocity: 0.0,
+                pressure: 0.5,
+            })
+        };
+        let retry_face = MeshlessFace1d {
+            distance_from_i: -2.0,
+            distance_from_j: 2.0,
+            ..unit_pair_face(1.0)
+        };
+        let flux = mfm_pair_flux_1d(i, j, retry_face, 5.0 / 3.0).unwrap();
+        assert_eq!(flux.solve_path, PairSolvePath::Centered);
+        assert!(flux.star_pressure.is_finite());
     }
 
     #[test]

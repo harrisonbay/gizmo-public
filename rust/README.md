@@ -6,8 +6,9 @@ configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
 geometry, pairwise primitive reconstruction, and the ideal-gas one-dimensional
-MFM HLLC/KT/exact Riemann flux. It does not apply pair fluxes or evolve a
-simulation yet.
+MFM HLLC/KT/exact Riemann flux, including conservative pair orientation and
+lab-frame deboost. It does not update particle states or evolve a simulation
+yet.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -32,7 +33,7 @@ configuration parsing:
 - `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
-  reconstruction, plus the corrected ideal-gas MFM HLLC/KT/exact Riemann flux.
+  reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact and pair fluxes.
 - `gizmo-cli`: the compatibility command-line boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From
@@ -58,3 +59,7 @@ the legacy distinction between HLLC failure modes: negative or non-finite
 pressure falls back to the MFM KT flux, while a positive pressure above the
 configured limiter invokes a finite-checked exact ideal-gas solve. Exact-solver
 nonconvergence is reported explicitly and cannot be misclassified as vacuum.
+The pair API includes the legacy reconstruction retries, orientation, area
+integration, and lab-frame deboost. It currently returns the conservative
+Riemann contribution before GIZMO's low-contact-speed entropic/PdV energy
+replacement; that correction remains the next hydro substep.
