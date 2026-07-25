@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GRAVTREE = (ROOT / "gravity" / "gravtree.c").read_text()
 RT_INJECTION = (ROOT / "radiation" / "rt_source_injection.c").read_text()
 HYDRO_EVALUATE = (ROOT / "hydro" / "hydro_evaluate.h").read_text()
+RIEMANN = (ROOT / "hydro" / "reimann.h").read_text()
 
 
 class AdaptiveTreeforceRegression(unittest.TestCase):
@@ -105,6 +106,48 @@ class HydroTimestepInitializationRegression(unittest.TestCase):
     def test_target_timestep_is_not_defaulted_to_zero(self):
         pre_neighbor = HYDRO_EVALUATE[: HYDRO_EVALUATE.index("for(n = 0; n < numngb; n++)")]
         self.assertNotIn("dt_hydrostep_i = 0", pre_neighbor)
+
+
+class RiemannVacuumThresholdRegression(unittest.TestCase):
+    def test_ideal_gas_vacuum_guard_uses_the_exact_threshold(self):
+        threshold = "return GAMMA_G4 * (cs_L + cs_R);"
+        guard = (
+            "(v_line_R - v_line_L) > "
+            "riemann_vacuum_velocity_threshold(cs_L,cs_R)"
+        )
+
+        self.assertEqual(RIEMANN.count(threshold), 1)
+        self.assertEqual(RIEMANN.count(guard), 2)
+        self.assertIn(
+            "check_vel = GAMMA_G4 * (cs_R + cs_L) - dvel;",
+            RIEMANN,
+        )
+
+    def test_failed_non_vacuum_estimates_reach_the_fallback_chain(self):
+        start = RIEMANN.rindex("void get_wavespeeds_and_pressure_star")
+        end = RIEMANN.index("void HLLC_fluxes", start)
+        star_estimator = RIEMANN[start:end]
+        self.assertNotIn("P_M <= MIN_REAL_NUMBER", star_estimator)
+        self.assertIn("if((Riemann_out->P_M <= 0)", star_estimator)
+        self.assertIn("if((Riemann_out->P_M<0)", RIEMANN)
+
+    def test_one_sound_speed_rarefaction_is_not_a_physical_vacuum(self):
+        gamma = 5.0 / 3.0
+        sound_left = sound_right = 1.0
+        velocity_jump = 1.01
+
+        legacy_threshold = max(sound_left, sound_right)
+        exact_threshold = 2.0 * (sound_left + sound_right) / (gamma - 1.0)
+
+        self.assertGreater(velocity_jump, legacy_threshold)
+        self.assertLess(velocity_jump, exact_threshold)
+        self.assertAlmostEqual(exact_threshold, 6.0)
+
+        pressure = 1.0 / gamma
+        stronger_non_vacuum_jump = 2.0
+        first_hllc_pressure = pressure - 0.5 * stronger_non_vacuum_jump
+        self.assertLess(first_hllc_pressure, 0.0)
+        self.assertLess(stronger_non_vacuum_jump, exact_threshold)
 
 
 if __name__ == "__main__":

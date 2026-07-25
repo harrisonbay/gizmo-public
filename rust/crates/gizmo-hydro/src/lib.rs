@@ -178,6 +178,49 @@ pub fn solve_smoothing_lengths_1d(
     Ok(output)
 }
 
+/// Build the inverse one-dimensional MLS moment for each particle.
+///
+/// This is the `NV_T` geometry produced by the legacy density loop and consumed
+/// by both gradient construction and meshless face geometry.
+///
+/// # Errors
+///
+/// Returns an error for invalid columns, a singular local moment, or non-finite
+/// arithmetic.
+pub fn inverse_moments_1d(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<Vec<f64>, HydroError> {
+    let unit_masses = vec![1.0; positions.len()];
+    validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
+    let mut output = Vec::with_capacity(positions.len());
+    for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        let mut moment = 0.0;
+        for &neighbor_position in positions {
+            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let distance = displacement.abs();
+            if distance <= 0.0 || distance >= hsml {
+                continue;
+            }
+            moment += cubic_kernel_1d(distance, hsml)?.weight * displacement * displacement;
+        }
+        if !moment.is_finite() || moment <= 0.0 {
+            return Err(HydroError::SingularGradientMoment { index, moment });
+        }
+        let inverse = moment.recip();
+        if !inverse.is_finite() {
+            return Err(HydroError::NonFiniteGradient {
+                index,
+                field: "inverse_moment",
+                value: inverse,
+            });
+        }
+        output.push(inverse);
+    }
+    Ok(output)
+}
+
 /// Reconstruct a slope-limited moving-least-squares gradient in one dimension.
 ///
 /// This is the one-dimensional specialization of the default meshless
@@ -217,6 +260,7 @@ pub fn gradients_at_hsml_1d(
     if !shoot_tolerance.is_finite() || shoot_tolerance < 0.0 {
         return Err(HydroError::InvalidGradientTolerance(shoot_tolerance));
     }
+    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
 
     let mut output = Vec::with_capacity(positions.len());
     for (index, ((&position, &center), &hsml)) in positions
@@ -225,7 +269,6 @@ pub fn gradients_at_hsml_1d(
         .zip(smoothing_lengths)
         .enumerate()
     {
-        let mut moment = 0.0;
         let mut numerator = 0.0;
         let mut minimum_delta = 0.0_f64;
         let mut maximum_delta = 0.0_f64;
@@ -244,12 +287,8 @@ pub fn gradients_at_hsml_1d(
             max_distance = max_distance.max(distance);
             if distance < hsml {
                 let weight = cubic_kernel_1d(distance, hsml)?.weight;
-                moment += weight * displacement * displacement;
                 numerator += -weight * displacement * delta;
             }
-        }
-        if !moment.is_finite() || moment <= 0.0 {
-            return Err(HydroError::SingularGradientMoment { index, moment });
         }
         if !numerator.is_finite() {
             return Err(HydroError::NonFiniteGradient {
@@ -258,7 +297,7 @@ pub fn gradients_at_hsml_1d(
                 value: numerator,
             });
         }
-        let unlimited = numerator / moment;
+        let unlimited = numerator * inverse_moments[index];
         if !unlimited.is_finite() {
             return Err(HydroError::NonFiniteGradient {
                 index,
@@ -294,6 +333,162 @@ pub fn gradients_at_hsml_1d(
         });
     }
     Ok(output)
+}
+
+/// Construct the default non-cosmological 1-D MFM face between two particles.
+///
+/// The signed area follows the legacy orientation from particle `j` toward
+/// particle `i`. The reconstruction offsets point from each particle center to
+/// the default midpoint face.
+///
+/// # Errors
+///
+/// Returns an error for invalid particle geometry, coincident or
+/// non-interacting particles, or non-finite face arithmetic.
+pub fn meshless_face_geometry_1d(
+    i: MeshlessPoint1d,
+    j: MeshlessPoint1d,
+    box_size: f64,
+) -> Result<MeshlessFace1d, HydroError> {
+    validate_meshless_point("i", i, box_size)?;
+    validate_meshless_point("j", j, box_size)?;
+    let displacement = periodic_displacement_1d(i.position, j.position, box_size)?;
+    let distance = displacement.abs();
+    if distance <= 0.0 || (distance >= i.smoothing_length && distance >= j.smoothing_length) {
+        return Err(HydroError::InvalidFacePair {
+            distance,
+            hsml_i: i.smoothing_length,
+            hsml_j: j.smoothing_length,
+        });
+    }
+    let kernel_i = cubic_kernel_1d(distance, i.smoothing_length)?;
+    let kernel_j = cubic_kernel_1d(distance, j.smoothing_length)?;
+    let volume_i = i.mass / i.density;
+    let volume_j = j.mass / j.density;
+    let relative_volume_jump = (volume_i - volume_j).abs() / volume_i.min(volume_j);
+    let (weight_i, weight_j) = if relative_volume_jump > 1.25 {
+        let denominator = volume_i * kernel_i.weight + volume_j * kernel_j.weight;
+        let centered = volume_i * volume_j * (kernel_i.weight + kernel_j.weight) / denominator;
+        (centered, centered)
+    } else {
+        (volume_i, volume_j)
+    };
+    let signed_area = displacement
+        * (kernel_i.weight * weight_i * i.inverse_moment
+            + kernel_j.weight * weight_j * j.inverse_moment);
+    let area = signed_area.abs();
+    if !volume_i.is_finite()
+        || !volume_j.is_finite()
+        || !weight_i.is_finite()
+        || !weight_j.is_finite()
+        || !signed_area.is_finite()
+        || area <= 0.0
+    {
+        return Err(HydroError::NonFiniteFaceGeometry {
+            signed_area,
+            volume_i,
+            volume_j,
+        });
+    }
+    Ok(MeshlessFace1d {
+        signed_area,
+        area,
+        distance_from_i: -0.5 * displacement,
+        distance_from_j: 0.5 * displacement,
+    })
+}
+
+/// Reconstruct a scalar pair state using the default pure-hydro face limiter.
+///
+/// `right` is the state originating at particle `i`; `left` originates at
+/// particle `j`, matching the legacy face-normal convention.
+///
+/// # Errors
+///
+/// Returns an error unless every input and reconstructed output is finite.
+pub fn reconstruct_face_states_1d(
+    value_i: f64,
+    gradient_i: f64,
+    value_j: f64,
+    gradient_j: f64,
+    face: MeshlessFace1d,
+    order: ReconstructionOrder,
+) -> Result<FaceStates1d, HydroError> {
+    for (field, value) in [
+        ("value_i", value_i),
+        ("gradient_i", gradient_i),
+        ("value_j", value_j),
+        ("gradient_j", gradient_j),
+        ("signed_area", face.signed_area),
+        ("area", face.area),
+        ("distance_from_i", face.distance_from_i),
+        ("distance_from_j", face.distance_from_j),
+    ] {
+        if !value.is_finite() {
+            return Err(HydroError::InvalidReconstructionInput { field, value });
+        }
+    }
+    if face.area <= 0.0 {
+        return Err(HydroError::InvalidReconstructionInput {
+            field: "area",
+            value: face.area,
+        });
+    }
+    if order == ReconstructionOrder::Zeroth || legacy_float_equal(value_i, value_j) {
+        return Ok(FaceStates1d {
+            left: value_j,
+            right: value_i,
+        });
+    }
+
+    let mut right = value_i + gradient_i * face.distance_from_i;
+    let mut left = value_j + gradient_j * face.distance_from_j;
+    let midpoint = 0.5 * (value_i + value_j);
+    let minimum = value_i.min(value_j);
+    let maximum = value_i.max(value_j);
+    let spread = maximum - minimum;
+    let mut effective_maximum = maximum + 0.5 * spread;
+    let mut effective_minimum = minimum - 0.5 * spread;
+    if maximum < 0.0 && effective_maximum > 0.0 {
+        effective_maximum = maximum * maximum / (maximum - (effective_maximum - maximum));
+    }
+    if minimum > 0.0 && effective_minimum < 0.0 {
+        effective_minimum = minimum * minimum / (minimum + (minimum - effective_minimum));
+    }
+    let midpoint_tolerance = 0.375 * spread;
+    let midpoint_maximum = (midpoint + midpoint_tolerance).min(effective_maximum);
+    let midpoint_minimum = (midpoint - midpoint_tolerance).max(effective_minimum);
+    if [
+        right,
+        left,
+        midpoint,
+        spread,
+        effective_minimum,
+        effective_maximum,
+        midpoint_minimum,
+        midpoint_maximum,
+    ]
+    .iter()
+    .any(|value| !value.is_finite())
+    {
+        return Err(HydroError::NonFiniteReconstruction { left, right });
+    }
+    if value_i < value_j {
+        right = right.clamp(effective_minimum, midpoint_maximum);
+        left = left.clamp(midpoint_minimum, effective_maximum);
+    } else {
+        right = right.clamp(midpoint_minimum, effective_maximum);
+        left = left.clamp(effective_minimum, midpoint_maximum);
+    }
+    if !left.is_finite() || !right.is_finite() {
+        return Err(HydroError::NonFiniteReconstruction { left, right });
+    }
+    Ok(FaceStates1d { left, right })
+}
+
+#[allow(clippy::float_cmp)]
+fn legacy_float_equal(left: f64, right: f64) -> bool {
+    left == right
 }
 
 fn limit_gradient_1d(
@@ -337,6 +532,28 @@ struct GradientLimiter {
     max_distance: f64,
     shoot_tolerance: f64,
     positivity_preserving: bool,
+}
+
+fn validate_meshless_point(
+    side: &'static str,
+    point: MeshlessPoint1d,
+    box_size: f64,
+) -> Result<(), HydroError> {
+    for (field, value, positive) in [
+        ("position", point.position, false),
+        ("mass", point.mass, true),
+        ("density", point.density, true),
+        ("smoothing_length", point.smoothing_length, true),
+        ("inverse_moment", point.inverse_moment, true),
+    ] {
+        if !value.is_finite()
+            || (positive && value <= 0.0)
+            || (field == "position" && (value < 0.0 || value >= box_size))
+        {
+            return Err(HydroError::InvalidFaceInput { side, field, value });
+        }
+    }
+    Ok(())
 }
 
 fn validate_particle_columns(
@@ -462,6 +679,35 @@ pub struct GradientEstimate {
     pub max_distance: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshlessPoint1d {
+    pub position: f64,
+    pub mass: f64,
+    pub density: f64,
+    pub smoothing_length: f64,
+    pub inverse_moment: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshlessFace1d {
+    pub signed_area: f64,
+    pub area: f64,
+    pub distance_from_i: f64,
+    pub distance_from_j: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconstructionOrder {
+    Zeroth,
+    First,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceStates1d {
+    pub left: f64,
+    pub right: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HydroError {
     InvalidKernelInput {
@@ -512,6 +758,29 @@ pub enum HydroError {
         index: usize,
         field: &'static str,
         value: f64,
+    },
+    InvalidFaceInput {
+        side: &'static str,
+        field: &'static str,
+        value: f64,
+    },
+    InvalidFacePair {
+        distance: f64,
+        hsml_i: f64,
+        hsml_j: f64,
+    },
+    NonFiniteFaceGeometry {
+        signed_area: f64,
+        volume_i: f64,
+        volume_j: f64,
+    },
+    InvalidReconstructionInput {
+        field: &'static str,
+        value: f64,
+    },
+    NonFiniteReconstruction {
+        left: f64,
+        right: f64,
     },
 }
 
@@ -585,6 +854,37 @@ impl fmt::Display for HydroError {
                 formatter,
                 "particle {index} produced non-finite gradient `{field}`={value}"
             ),
+            Self::InvalidFaceInput { side, field, value } => {
+                write!(
+                    formatter,
+                    "face particle {side} has invalid {field} {value}"
+                )
+            }
+            Self::InvalidFacePair {
+                distance,
+                hsml_i,
+                hsml_j,
+            } => write!(
+                formatter,
+                "invalid face pair distance={distance}, hsml_i={hsml_i}, hsml_j={hsml_j}"
+            ),
+            Self::NonFiniteFaceGeometry {
+                signed_area,
+                volume_i,
+                volume_j,
+            } => write!(
+                formatter,
+                "invalid face geometry area={signed_area}, volumes={volume_i}/{volume_j}"
+            ),
+            Self::InvalidReconstructionInput { field, value } => {
+                write!(formatter, "invalid reconstruction input {field}={value}")
+            }
+            Self::NonFiniteReconstruction { left, right } => {
+                write!(
+                    formatter,
+                    "non-finite reconstructed states left={left}, right={right}"
+                )
+            }
         }
     }
 }
@@ -723,6 +1023,140 @@ mod tests {
         .unwrap();
         assert!((estimates[0].minimum_delta + 10.0).abs() < f64::EPSILON);
         assert!((estimates[0].max_distance - 0.3).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn uniform_lattice_has_unit_antisymmetric_faces() {
+        let positions = [0.125, 0.375, 0.625, 0.875];
+        let hsml = [0.5; 4];
+        let moments = inverse_moments_1d(&positions, &hsml, 1.0).unwrap();
+        let point = |index| MeshlessPoint1d {
+            position: positions[index],
+            mass: 0.25,
+            density: 1.0,
+            smoothing_length: hsml[index],
+            inverse_moment: moments[index],
+        };
+        let forward = meshless_face_geometry_1d(point(1), point(0), 1.0).unwrap();
+        let reverse = meshless_face_geometry_1d(point(0), point(1), 1.0).unwrap();
+        assert_close(forward.signed_area, 1.0);
+        assert_close(forward.area, 1.0);
+        assert_close(reverse.signed_area, -1.0);
+        assert_close(reverse.area, 1.0);
+        assert_close(forward.distance_from_i, -0.125);
+        assert_close(forward.distance_from_j, 0.125);
+        let across_seam = meshless_face_geometry_1d(point(0), point(3), 1.0).unwrap();
+        assert_close(across_seam.signed_area, 1.0);
+        assert_close(across_seam.area, 1.0);
+    }
+
+    #[test]
+    fn face_geometry_matches_centered_and_single_kernel_branches() {
+        let i = MeshlessPoint1d {
+            position: 0.6,
+            mass: 1.0,
+            density: 1.0,
+            smoothing_length: 0.5,
+            inverse_moment: 0.5,
+        };
+        let j = MeshlessPoint1d {
+            position: 0.4,
+            mass: 3.0,
+            density: 1.0,
+            smoothing_length: 0.4,
+            inverse_moment: 0.25,
+        };
+        let kernel_i = cubic_kernel_1d(0.2, i.smoothing_length).unwrap().weight;
+        let kernel_j = cubic_kernel_1d(0.2, j.smoothing_length).unwrap().weight;
+        let centered_weight = 3.0 * (kernel_i + kernel_j) / (kernel_i + 3.0 * kernel_j);
+        let expected_centered =
+            0.2 * centered_weight * (kernel_i * i.inverse_moment + kernel_j * j.inverse_moment);
+        let centered = meshless_face_geometry_1d(i, j, 1.0).unwrap();
+        assert_close(centered.signed_area, expected_centered);
+
+        let strict_boundary = MeshlessPoint1d { mass: 2.25, ..j };
+        let expected_unmodified =
+            0.2 * (kernel_i * i.inverse_moment + kernel_j * 2.25 * strict_boundary.inverse_moment);
+        let unmodified = meshless_face_geometry_1d(i, strict_boundary, 1.0).unwrap();
+        assert_close(unmodified.signed_area, expected_unmodified);
+
+        let outside_j = MeshlessPoint1d {
+            mass: 1.0,
+            smoothing_length: 0.1,
+            ..j
+        };
+        let single_kernel = meshless_face_geometry_1d(i, outside_j, 1.0).unwrap();
+        assert_close(single_kernel.signed_area, 0.2 * kernel_i * i.inverse_moment);
+    }
+
+    #[test]
+    fn face_reconstruction_matches_legacy_orientation_and_limits() {
+        let face = MeshlessFace1d {
+            signed_area: 1.0,
+            area: 1.0,
+            distance_from_i: -1.0,
+            distance_from_j: 1.0,
+        };
+        let linear =
+            reconstruct_face_states_1d(2.0, 1.0, 0.0, 1.0, face, ReconstructionOrder::First)
+                .unwrap();
+        assert_close(linear.left, 1.0);
+        assert_close(linear.right, 1.0);
+
+        let saturated =
+            reconstruct_face_states_1d(1.0, 11.0, 2.0, 8.0, face, ReconstructionOrder::First)
+                .unwrap();
+        assert_close(saturated.right, 0.5);
+        assert_close(saturated.left, 2.5);
+
+        let zeroth =
+            reconstruct_face_states_1d(1.0, 11.0, 2.0, 8.0, face, ReconstructionOrder::Zeroth)
+                .unwrap();
+        assert_close(zeroth.right, 1.0);
+        assert_close(zeroth.left, 2.0);
+    }
+
+    #[test]
+    fn face_geometry_and_reconstruction_fail_closed() {
+        let point = MeshlessPoint1d {
+            position: 0.25,
+            mass: 1.0,
+            density: 1.0,
+            smoothing_length: 0.1,
+            inverse_moment: 1.0,
+        };
+        assert!(meshless_face_geometry_1d(point, point, 1.0).is_err());
+        let distant = MeshlessPoint1d {
+            position: 0.75,
+            ..point
+        };
+        assert!(meshless_face_geometry_1d(point, distant, 1.0).is_err());
+        let invalid = MeshlessPoint1d {
+            inverse_moment: f64::INFINITY,
+            ..point
+        };
+        assert!(meshless_face_geometry_1d(invalid, distant, 1.0).is_err());
+        let face = MeshlessFace1d {
+            signed_area: 1.0,
+            area: 1.0,
+            distance_from_i: -0.1,
+            distance_from_j: 0.1,
+        };
+        assert!(
+            reconstruct_face_states_1d(1.0, f64::NAN, 2.0, 0.0, face, ReconstructionOrder::First)
+                .is_err()
+        );
+        assert!(
+            reconstruct_face_states_1d(
+                f64::MAX,
+                0.0,
+                0.5 * f64::MAX,
+                0.0,
+                face,
+                ReconstructionOrder::First
+            )
+            .is_err()
+        );
     }
 
     #[test]

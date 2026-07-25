@@ -426,6 +426,19 @@ void HLLC_Riemann_solver(struct Input_vec_Riemann Riemann_vec, struct Riemann_ou
 
 
 
+static inline double riemann_vacuum_velocity_threshold(double cs_L, double cs_R)
+{
+#ifndef EOS_GENERAL
+    return GAMMA_G4 * (cs_L + cs_R);
+#else
+    /* No general-EOS vacuum integral is available here; retain the legacy
+       conservative estimate for configurations that reconstruct sound speed. */
+    return DMAX(cs_L,cs_R);
+#endif
+}
+
+
+
 /*  Rusanov flux: generally not used, because it's too diffusive. But here if we need it. 
         (this implementation written by P. Hopkins) */
 void Riemann_solver_Rusanov(struct Input_vec_Riemann Riemann_vec, struct Riemann_outputs *Riemann_out, double n_unit[3],
@@ -433,7 +446,7 @@ void Riemann_solver_Rusanov(struct Input_vec_Riemann Riemann_vec, struct Riemann
 {
     /* estimate wave speed and simplest-average intermediate state (Primitive Variable Riemann Solvers approximate Riemann solver from Toro) */
     double S_L, S_R, S_plus, P_M, S_M;
-    if((v_line_R - v_line_L) > DMAX(cs_L,cs_R)) // first check for vacuum solution, which is not accounted for in this
+    if((v_line_R - v_line_L) > riemann_vacuum_velocity_threshold(cs_L,cs_R)) // first check for vacuum solution, which is not accounted for in this
     {
         Riemann_out->P_M = P_M = MIN_REAL_NUMBER; Riemann_out->S_M = S_L = S_R = S_plus = S_M = 0;
     } else {
@@ -531,7 +544,7 @@ void get_wavespeeds_and_pressure_star(struct Input_vec_Riemann Riemann_vec, stru
     double S_L, S_R;
     
     /* first, check for vacuum conditions, not accounted for in the standard HLLC scheme */
-    if((v_line_R - v_line_L) > DMAX(cs_L,cs_R))
+    if((v_line_R - v_line_L) > riemann_vacuum_velocity_threshold(cs_L,cs_R))
     {
         Riemann_out->P_M = MIN_REAL_NUMBER; Riemann_out->S_M = S_L = S_R = 0;
     } else {
@@ -544,7 +557,6 @@ void get_wavespeeds_and_pressure_star(struct Input_vec_Riemann Riemann_vec, stru
         double rho_wt_R = Riemann_vec.R.rho*(S_R-v_line_R);
         Riemann_out->S_M = ((PT_R-PT_L) + rho_wt_L*v_line_L - rho_wt_R*v_line_R) / (rho_wt_L - rho_wt_R);
         Riemann_out->P_M = (PT_L*rho_wt_R - PT_R*rho_wt_L + rho_wt_L*rho_wt_R*(v_line_R - v_line_L)) / (rho_wt_R - rho_wt_L);
-        if(Riemann_out->P_M <= MIN_REAL_NUMBER) {Riemann_out->P_M = MIN_REAL_NUMBER; Riemann_out->S_M = S_L = S_R = 0;}
         
         if((Riemann_out->P_M <= 0)||(isnan(Riemann_out->P_M))||(Riemann_out->P_M>press_tot_limiter))
         {
@@ -573,7 +585,6 @@ void get_wavespeeds_and_pressure_star(struct Input_vec_Riemann Riemann_vec, stru
             /* S_M = v_line_L* = v_line_R* = v_line_M --- this is the speed at interface */
             /* contact pressure (pressure at contact surface): */
             Riemann_out->P_M = Riemann_vec.L.rho * (v_line_L-S_L)*(v_line_L-Riemann_out->S_M) + PT_L;
-            if(Riemann_out->P_M <= MIN_REAL_NUMBER) {Riemann_out->P_M = MIN_REAL_NUMBER; Riemann_out->S_M = S_L = S_R = 0;}
             /* p_M = p_L* = p_R*  */
             
             if((Riemann_out->P_M <= 0)||(isnan(Riemann_out->P_M))||(Riemann_out->P_M>press_tot_limiter))
@@ -584,7 +595,6 @@ void get_wavespeeds_and_pressure_star(struct Input_vec_Riemann Riemann_vec, stru
                 Riemann_out->S_M = 0.5*(v_line_R+v_line_L) + 2.0*(PT_L-PT_R)/((Riemann_vec.L.rho+Riemann_vec.R.rho)*(cs_L+cs_R));
                 double S_plus = DMAX(DMAX(fabs(v_line_L - cs_L), fabs(v_line_R - cs_R)), DMAX(fabs(v_line_L + cs_L), fabs(v_line_R + cs_R)));
                 S_L=-S_plus; S_R=S_plus; if(Riemann_out->S_M<S_L) Riemann_out->S_M=S_L; if(Riemann_out->S_M>S_R) Riemann_out->S_M=S_R;
-                if(Riemann_out->P_M <= MIN_REAL_NUMBER) {Riemann_out->P_M = MIN_REAL_NUMBER; Riemann_out->S_M = S_L = S_R = 0;}
             }
         }
     }
@@ -1726,4 +1736,3 @@ void rotate_fluxes_back_to_lab(struct Riemann_outputs *Riemann_out, struct rotat
 
 
 #endif // MAGNETIC //
-

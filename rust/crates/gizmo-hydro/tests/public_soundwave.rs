@@ -1,5 +1,6 @@
 use gizmo_hydro::{
-    GradientEstimate, density_at_hsml_1d, gradients_at_hsml_1d, solve_smoothing_lengths_1d,
+    GradientEstimate, MeshlessPoint1d, density_at_hsml_1d, gradients_at_hsml_1d,
+    inverse_moments_1d, meshless_face_geometry_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 
@@ -96,6 +97,13 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         smoothing_lengths,
         snapshot.header.box_size,
     );
+    assert_public_faces(
+        &positions,
+        &snapshot.gas.masses,
+        expected_density,
+        smoothing_lengths,
+        snapshot.header.box_size,
+    );
 }
 
 fn assert_public_gradients(
@@ -166,4 +174,39 @@ fn fundamental_mode_gradient_error(
         })
         .sum::<f64>()
         / (count_float * (std::f64::consts::TAU / box_size) * amplitude)
+}
+
+fn assert_public_faces(
+    positions: &[f64],
+    masses: &[f64],
+    density: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) {
+    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)
+        .expect("public geometry must have invertible moments");
+    let point = |index| MeshlessPoint1d {
+        position: positions[index],
+        mass: masses[index],
+        density: density[index],
+        smoothing_length: smoothing_lengths[index],
+        inverse_moment: inverse_moments[index],
+    };
+    let mut spatial_order: Vec<usize> = (0..positions.len()).collect();
+    spatial_order.sort_unstable_by(|left, right| positions[*left].total_cmp(&positions[*right]));
+    let max_area_deviation = spatial_order
+        .iter()
+        .enumerate()
+        .map(|(order_index, &index)| {
+            let neighbor = spatial_order[(order_index + 1) % spatial_order.len()];
+            let face = meshless_face_geometry_1d(point(index), point(neighbor), box_size)
+                .expect("adjacent public particles must form a valid face");
+            (face.area - 1.0).abs()
+        })
+        .fold(0.0, f64::max);
+    eprintln!("public fixture max 1-D face-area deviation={max_area_deviation:.12e}");
+    assert!(
+        max_area_deviation < 1.0e-6,
+        "public face areas diverged from unit geometry: {max_area_deviation}"
+    );
 }

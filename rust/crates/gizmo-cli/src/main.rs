@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use gizmo_cli::{CliError, Invocation, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    GradientEstimate, density_at_hsml_1d, gradients_at_hsml_1d, solve_smoothing_lengths_1d,
+    GradientEstimate, MeshlessPoint1d, density_at_hsml_1d, gradients_at_hsml_1d,
+    inverse_moments_1d, meshless_face_geometry_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 use gizmo_params::SoundwaveParameters;
@@ -177,6 +178,13 @@ fn initialize_soundwave(
         velocity_gradient_error,
         pressure_gradient_error,
     ] = soundwave_gradient_errors(&snapshot, &positions, expected_density, legacy_hsml)?;
+    let max_face_area_deviation = soundwave_face_area_deviation(
+        &positions,
+        &snapshot.gas.masses,
+        expected_density,
+        legacy_hsml,
+        snapshot.header.box_size,
+    )?;
     let summary = InitializationSummary {
         particle_count,
         box_size: snapshot.header.box_size,
@@ -186,6 +194,7 @@ fn initialize_soundwave(
         density_gradient_error,
         velocity_gradient_error,
         pressure_gradient_error,
+        max_face_area_deviation,
     };
     summary.validate()?;
     summary.print(&manifest.sha256());
@@ -240,6 +249,38 @@ fn soundwave_gradient_errors(
     ])
 }
 
+fn soundwave_face_area_deviation(
+    positions: &[f64],
+    masses: &[f64],
+    density: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<f64, ApplicationError> {
+    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)
+        .map_err(ApplicationError::Hydro)?;
+    let point = |index| MeshlessPoint1d {
+        position: positions[index],
+        mass: masses[index],
+        density: density[index],
+        smoothing_length: smoothing_lengths[index],
+        inverse_moment: inverse_moments[index],
+    };
+    let mut spatial_order: Vec<usize> = (0..positions.len()).collect();
+    spatial_order.sort_unstable_by(|left, right| positions[*left].total_cmp(&positions[*right]));
+    spatial_order
+        .iter()
+        .enumerate()
+        .map(|(order_index, &index)| {
+            let neighbor = spatial_order[(order_index + 1) % spatial_order.len()];
+            meshless_face_geometry_1d(point(index), point(neighbor), box_size)
+                .map(|face| (face.area - 1.0).abs())
+                .map_err(ApplicationError::Hydro)
+        })
+        .try_fold(0.0, |maximum, deviation| {
+            deviation.map(|value| f64::max(maximum, value))
+        })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InitializationSummary {
     particle_count: u32,
@@ -250,6 +291,7 @@ struct InitializationSummary {
     density_gradient_error: f64,
     velocity_gradient_error: f64,
     pressure_gradient_error: f64,
+    max_face_area_deviation: f64,
 }
 
 impl InitializationSummary {
@@ -261,6 +303,7 @@ impl InitializationSummary {
             ("density gradient", self.density_gradient_error, 1.0e-4),
             ("velocity gradient", self.velocity_gradient_error, 1.0e-4),
             ("pressure gradient", self.pressure_gradient_error, 1.0e-4),
+            ("face area", self.max_face_area_deviation, 1.0e-6),
         ] {
             if !value.is_finite() || value > limit {
                 return Err(ApplicationError::StateMismatch(format!(
@@ -297,8 +340,12 @@ impl InitializationSummary {
             self.velocity_gradient_error
         );
         println!(
-            "  \"pressure_gradient_error\": {:.17e}",
+            "  \"pressure_gradient_error\": {:.17e},",
             self.pressure_gradient_error
+        );
+        println!(
+            "  \"max_face_area_deviation\": {:.17e}",
+            self.max_face_area_deviation
         );
         println!("}}");
     }

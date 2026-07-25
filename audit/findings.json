@@ -185,6 +185,40 @@
         }
       ],
       "dossier": "audit/findings/GZ-0005.md"
+    },
+    {
+      "id": "GZ-0006",
+      "title": "Ideal-gas HLLC solver declares vacuum far below the physical threshold",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME"
+      ],
+      "summary": "The default HLLC pressure-star path classifies a pair as vacuum when the normal velocity jump exceeds max(c_L,c_R). For an ideal gas, the exact solver in the same file uses the two-rarefaction criterion 2(c_L+c_R)/(gamma-1). At gamma=5/3 with equal sound speeds, the legacy shortcut fires at c instead of 6c and replaces the star pressure with MIN_REAL_NUMBER. Three later floors also turn failed non-vacuum estimates into the same positive sentinel, disabling their immediately following fallback checks.",
+      "impact": "Ordinary strong rarefactions can lose nearly all pairwise pressure force across a sharp numerical threshold even though the physical Riemann solution is non-vacuum.",
+      "reproduction": "Evaluate symmetric ideal-gas states with equal density, pressure, and sound speed and v_R-v_L just above c but below 6c. The legacy HLLC guard returns P_M=1e-56 and S_M=0, while the exact vacuum test remains false. Above 2c/gamma, the first approximate pressure is non-positive but is floored to the positive sentinel, preventing the fallback branch from running.",
+      "falsification": "Demonstrate that the max-sound-speed condition is a documented non-vacuum stability switch whose zero-pressure flux converges to the exact solution throughout c < v_R-v_L < 2(c_L+c_R)/(gamma-1), or provide a physical derivation equating the two thresholds.",
+      "oracle": {
+        "type": "reference",
+        "classification": "exact",
+        "rationale": "The exact ideal-gas Riemann vacuum criterion is already implemented independently in the same solver and gives a closed-form threshold."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 533,
+          "line_end": 537,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L533-L537"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 1034,
+          "line_end": 1042,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L1034-L1042"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0006.md"
     }
   ]
 }
