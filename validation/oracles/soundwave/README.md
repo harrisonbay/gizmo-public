@@ -21,3 +21,18 @@ Run the Rust HDF5, density, and adaptive-smoothing-length parity gate with:
 ```sh
 validation/oracles/run_rust_soundwave_init.sh
 ```
+
+`evolution-manifest.json` pins a fresh corrected-C run from commit
+`f408a498ec42990fa6b3cc413ded2223f3d33dc2`. The run used one MPI rank,
+completed all 65,536 shared `8192`-tick steps to `t=1.5`, and kept every gas
+particle in timebin 44. ID-sorted semantic tables at `t=0`, `0.1`, and `1.5`
+contain position, velocity, density, specific internal energy, smoothing
+length, and mass. Raw snapshots are identified by checksum but omitted.
+
+Regenerate a semantic table from a raw snapshot with:
+
+```sh
+uv run --with h5py --with numpy \
+  python validation/oracles/reduce_soundwave_snapshot.py \
+  snapshot_001.hdf5 evolution_t0.1.csv.gz
+```

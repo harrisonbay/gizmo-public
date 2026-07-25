@@ -82,5 +82,7 @@ power-of-two timeline is also ported; it maps the fixture's raw
 `2.288818359375e-5` step seen in the C run. This is not yet wired to normal CLI
 execution. Before evolved snapshots can be called C-parity results, the
 remaining acceleration/displacement timestep bounds must be proven inactive
-or ported and the result checked against a freshly generated, named-commit C
-oracle.
+or ported and the Rust result checked against the named-commit C evolution
+tables in `validation/oracles/soundwave/evolution-manifest.json`. The baseline
+run confirms all particles remain in the same `8192`-tick bin through all
+65,536 steps, so global synchronized stepping is valid for this fixture.
