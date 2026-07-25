@@ -1,5 +1,32 @@
 Welcome!
 
+## Correctness fork and Rust bootstrap
+
+This fork adds an independently reviewable correctness layer around the public
+GIZMO baseline at commit `a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f`.
+It is an experimental engineering fork, not a claim that the Rust code is
+scientifically interchangeable with GIZMO.
+
+- `audit/` records suspected and confirmed issues with source evidence,
+  severity, and verification status.
+- `validation/` contains deterministic regression and differential-test
+  infrastructure. A passing legacy test is compatibility evidence, not proof
+  that the underlying physics is correct.
+- `rust/` is a memory-safe bootstrap for configuration, state, provenance, and
+  audit-compatible CLI behavior. Physics kernels should move only behind
+  independently specified invariants and cross-implementation comparisons.
+
+Run the available correctness checks with:
+
+```sh
+python3 -m unittest discover -s validation/tests -p 'test_*.py'
+python3 -m unittest discover -s validation/regressions -p 'test_*.py'
+cargo test --manifest-path rust/Cargo.toml --workspace
+```
+
+Scientific users should pin an exact commit, retain the emitted provenance, and
+review the audit registry before using results in research.
+
 This is **GIZMO**: a flexible, multi-method multi-physics code. The code solves the fluid using Lagrangian mesh-free finite-volume Godunov methods (or SPH, or fixed-grid Eulerian methods), and self-gravity with fast hybrid PM-Tree methods and fully-adaptive resolution. Other physics include: magnetic fields (ideal and non-ideal), radiation-hydrodynamics, anisotropic conduction and viscosity, sub-grid turbulent diffusion, radiative cooling, cosmological integration, sink particles, dust-gas mixtures, cosmic rays, degenerate equations of state, galaxy/star/black hole formation and feedback, self-interacting and scalar-field dark matter, on-the-fly structure finding, and more. 
 
 See the [User Guide](http://www.tapir.caltech.edu/~phopkins/Site/GIZMO_files/gizmo_documentation.html) for an up-to-date physics list, or [the original code website](http://www.tapir.caltech.edu/~phopkins/Site/GIZMO.html) for examples demonstrating the advantages of the new methods, different types of **GIZMO** simulations, and its massively-parallel scalings.

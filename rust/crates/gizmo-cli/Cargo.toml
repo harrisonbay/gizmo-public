@@ -1,0 +1,17 @@
+[package]
+name = "gizmo-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+gizmo-config = { path = "../gizmo-config" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gizmo"
+path = "src/main.rs"
+

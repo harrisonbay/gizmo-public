@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "pinned_revision": {
+    "repository": "https://github.com/pfhopkins/gizmo-public",
+    "sha": "a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f"
+  },
+  "findings": [
+    {
+      "id": "GZ-0001",
+      "title": "Adaptive tree-force decision can skip the gravitational-constant conversion",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "ADAPTIVE_TREEFORCE_UPDATE"
+      ],
+      "summary": "gravity_tree() recomputes needs_new_treeforce() after the walk even though the walk can change inputs to that predicate. A true-to-false flip enters the jerk-only path with newly walked acceleration and continues before multiplying GravAccel and GravJerk by All.G.",
+      "impact": "Acceleration and jerk can be left in inconsistent units for an active particle, producing configuration-dependent dynamics.",
+      "reproduction": "Instrument both needs_new_treeforce() decisions for each active particle and force a walk that lowers min_bh_fb_time across the predicate threshold; observe a pre-walk true and post-walk false followed by the early continue.",
+      "falsification": "Show that every value read by needs_new_treeforce() is immutable from particle selection through final post-processing, or demonstrate that the pre- and post-walk decisions cannot differ over all enabled paths.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Particle selection and post-walk unit conversion must use one stable tree-force decision."
+      },
+      "sources": [
+        {
+          "path": "gravity/gravtree.c",
+          "line_start": 497,
+          "line_end": 508,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/gravtree.c#L497-L508"
+        },
+        {
+          "path": "gravity/gravtree.c",
+          "line_start": 710,
+          "line_end": 715,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/gravtree.c#L710-L715"
+        },
+        {
+          "path": "gravity/forcetree.c",
+          "line_start": 2818,
+          "line_end": 2820,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/forcetree.c#L2818-L2820"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0001.md"
+    },
+    {
+      "id": "GZ-0002",
+      "title": "Radiation input packing destructively resets reinjected photon energy",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "RT_SOURCE_INJECTION",
+        "RT_REINJECT_ACCRETED_PHOTONS"
+      ],
+      "summary": "INPUTFUNCTION_NAME transfers BH_accreted_photon_energy into an outbound input record and immediately zeros the particle accumulator. Input packing is not a commit point and may be repeated or abandoned when exchange buffers retry.",
+      "impact": "Accreted radiation energy can be lost or inconsistently reinjected when a packed interaction is not completed.",
+      "reproduction": "Set a sink's BH_accreted_photon_energy nonzero, invoke input packing, and abort or retry the exchange before evaluation; the particle accumulator is already zero.",
+      "falsification": "Prove input packing is called exactly once only after the corresponding injection is guaranteed to complete, including export-buffer and retry paths.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Packing communication data must not change conserved source state before successful application."
+      },
+      "sources": [
+        {
+          "path": "radiation/rt_source_injection.c",
+          "line_start": 65,
+          "line_end": 68,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/radiation/rt_source_injection.c#L65-L68"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0002.md"
+    },
+    {
+      "id": "GZ-0003",
+      "title": "Unknown chemistry ion reaches the end of a non-void function",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "SIMPLE_STEADYSTATE_CHEMISTRY"
+      ],
+      "summary": "ion_name_to_index() returns an index for known names but has no return or terminating path after the search loop. An unknown name therefore triggers undefined behavior and can index the recombination table arbitrarily.",
+      "impact": "Invalid input can cause out-of-bounds reads, corrupt chemistry rates, or crash depending on compiler optimization and runtime state.",
+      "reproduction": "Build with SIMPLE_STEADYSTATE_CHEMISTRY and UBSan, then call ion_name_to_index() with an unlisted ion such as Xe+.",
+      "falsification": "Demonstrate a checked contract that makes every caller's ion name one of ion_names and that the compiler can enforce this closed set.",
+      "oracle": {
+        "type": "sanitizer",
+        "classification": "dynamic",
+        "rationale": "UBSan or an explicit unknown-ion regression distinguishes a defined failure from fall-through UB."
+      },
+      "sources": [
+        {
+          "path": "cooling/simple_chemistry.c",
+          "line_start": 42,
+          "line_end": 54,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/cooling/simple_chemistry.c#L42-L54"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0003.md"
+    },
+    {
+      "id": "GZ-0004",
+      "title": "SIDM interaction sampling may race under OpenMP",
+      "status": "under_investigation",
+      "confidence": "medium",
+      "affected_flags": [
+        "DM_SIDM",
+        "_OPENMP"
+      ],
+      "summary": "The threaded neighbor loop calls gsl_rng_uniform(random_generator) through a shared-looking RNG object. Neighbor velocity and interaction-count writes are atomic, but no synchronization or per-thread ownership is visible around RNG state.",
+      "impact": "If the RNG is shared, concurrent mutation can create a data race, nondeterministic sampling corruption, or biased interaction statistics.",
+      "reproduction": "Run a dense DM_SIDM case with multiple OpenMP threads under ThreadSanitizer and compare seeded interaction counts against a one-thread run across repeated schedules.",
+      "falsification": "Trace random_generator ownership and show it is thread-local at this call site, or obtain a clean race-detector result with forced concurrent entry and verified instrumentation coverage.",
+      "oracle": {
+        "type": "concurrency_stress",
+        "classification": "dynamic",
+        "rationale": "The hypothesis depends on concurrent ownership and must be tested across threaded schedules."
+      },
+      "sources": [
+        {
+          "path": "sidm/sidm_core_flux_computation.h",
+          "line_start": 1,
+          "line_end": 34,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/sidm/sidm_core_flux_computation.h#L1-L34"
+        },
+        {
+          "path": "gravity/ags_hsml.c",
+          "line_start": 907,
+          "line_end": 907,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/ags_hsml.c#L907"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0004.md"
+    }
+  ]
+}

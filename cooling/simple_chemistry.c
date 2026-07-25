@@ -51,6 +51,10 @@ int ion_name_to_index(char *ion_name)
             return i;
         }
     }
+    char message[256];
+    snprintf(message, sizeof(message), "Unknown ion name '%s' in ion_name_to_index", ion_name);
+    terminate(message);
+    return -1; /* unreachable after terminate(), but keeps the contract explicit to the compiler */
 }
 
 /* Grain-assisted recomibination rate coefficient in cm^3 s^-1, from Weingartner & Draine 2001

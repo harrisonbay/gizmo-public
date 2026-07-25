@@ -43,6 +43,9 @@ pthread_mutex_t mutex_partnodedrift;
 double Ewaldcount, Costtotal;
 long long N_nodesinlist;
 int Ewald_iter;			/* global in file scope, for simplicity */
+#ifdef ADAPTIVE_TREEFORCE_UPDATE
+static unsigned char *NeedsNewTreeforce;
+#endif
 void sum_top_level_node_costfactors(void);
 
 
@@ -85,6 +88,9 @@ void gravity_tree(void)
     All.BunchSize = (long) ((MyBufferSize * 1024 * 1024) / (sizeof(struct data_index) + sizeof(struct data_nodelist) +
                                              sizeof(struct gravdata_in) + sizeof(struct gravdata_out) +
                                              sizemax(sizeof(struct gravdata_in),sizeof(struct gravdata_out))));
+#ifdef ADAPTIVE_TREEFORCE_UPDATE
+    NeedsNewTreeforce = (unsigned char *) mymalloc("NeedsNewTreeforce", All.MaxPart * sizeof(unsigned char));
+#endif
     DataIndexTable = (struct data_index *) mymalloc("DataIndexTable", All.BunchSize * sizeof(struct data_index));
     DataNodeList = (struct data_nodelist *) mymalloc("DataNodeList", All.BunchSize * sizeof(struct data_nodelist));
     if(All.HighestActiveTimeBin == All.HighestOccupiedTimeBin) {if(ThisTask == 0) printf(" ..All.BunchSize=%ld\n", All.BunchSize);}
@@ -133,6 +139,16 @@ void gravity_tree(void)
         TakeLevel = -1;
     }
     if(TakeLevel >= 0) {for(i = 0; i < NumPart; i++) {P[i].GravCost[TakeLevel] = 0;}} /* re-zero the cost [will be re-summed] */
+
+#ifdef ADAPTIVE_TREEFORCE_UPDATE
+    /*
+     * Cache this decision before the tree walk.  The walk updates quantities used
+     * by needs_new_treeforce(), so evaluating it again during post-processing can
+     * incorrectly take the jerk-only path after a full (not-yet-G-scaled) force
+     * was calculated.
+     */
+    for(i = FirstActiveParticle; i >= 0; i = NextActiveParticle[i]) {NeedsNewTreeforce[i] = needs_new_treeforce(i);}
+#endif
 
     /* begin main communication and tree-walk loop. note the ewald-iter terms here allow for multiple iterations for periodic-tree corrections if needed */
     for(Ewald_iter = 0; Ewald_iter <= ewald_max; Ewald_iter++)
@@ -496,7 +512,7 @@ void gravity_tree(void)
 #endif      
 #ifdef ADAPTIVE_TREEFORCE_UPDATE
         double dt = GET_PARTICLE_TIMESTEP_IN_PHYSICAL(i);
-        if(!needs_new_treeforce(i)) { // if we don't yet need a new tree pass, just update GravAccel according to the jerk term, increment the counter, and go to the next particle           
+        if(!NeedsNewTreeforce[i]) { // if we don't yet need a new tree pass, just update GravAccel according to the jerk term, increment the counter, and go to the next particle
             for(j=0; j<3; j++) {P[i].GravAccel[j] += dt * P[i].GravJerk[j] * All.cf_a2inv;} // a^-1 from converting velocity term in the jerk to physical; a^-3 from the 1/r^3; a^2 from converting the physical dt * j increment to GravAccel back to the units for GravAccel; result is a^-2; note that Ewald and PMGRID terms are neglected from the jerk at present
             P[i].time_since_last_treeforce += dt;
             continue;
@@ -629,6 +645,9 @@ void gravity_tree(void)
 
     } /* end of loop over active particles*/
 
+#ifdef ADAPTIVE_TREEFORCE_UPDATE
+    myfree(NeedsNewTreeforce);
+#endif
 
 #endif /* end SELFGRAVITY operations (check if SELFGRAVITY_OFF not enabled) */
 
@@ -711,7 +730,7 @@ void *gravity_primary_loop(void *p)
         if(HermiteOnlyFlag && !eligible_for_hermite(i)) {ProcessedFlag[i]=1; continue;}
 #endif
 #ifdef ADAPTIVE_TREEFORCE_UPDATE
-        if(!needs_new_treeforce(i)) {ProcessedFlag[i]=1; continue;}
+        if(!NeedsNewTreeforce[i]) {ProcessedFlag[i]=1; continue;}
 #endif                
 
 #if defined(BOX_PERIODIC) && !defined(GRAVITY_NOT_PERIODIC) && !defined(PMGRID)

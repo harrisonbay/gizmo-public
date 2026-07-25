@@ -1,0 +1,51 @@
+name: Correctness scaffold
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Python audit validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate registry, fixtures, and regressions
+        run: |
+          python -m unittest discover -s validation/tests -v
+          python -m unittest discover -s validation/regressions -v
+
+  rust:
+    name: Rust formatting and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust workspace
+        id: rust
+        run: test -f rust/Cargo.toml && echo "present=true" >> "$GITHUB_OUTPUT" || true
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.rust.outputs.present == 'true'
+        with:
+          components: rustfmt
+      - name: Check formatting
+        if: steps.rust.outputs.present == 'true'
+        working-directory: rust
+        run: cargo fmt --all --check
+      - name: Check all targets
+        if: steps.rust.outputs.present == 'true'
+        working-directory: rust
+        run: cargo check --all-targets
+      - name: Run tests
+        if: steps.rust.outputs.present == 'true'
+        working-directory: rust
+        run: cargo test
