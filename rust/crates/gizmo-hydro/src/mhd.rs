@@ -304,16 +304,32 @@ pub struct DednerOptions {
 impl Default for DednerOptions {
     fn default() -> Self {
         Self {
-            implicit_limiter: 0.5,
+            // reimann.h uses 0.75 unless MHD_CONSTRAINED_GRADIENT is enabled.
+            // The public linear-wave profile does not enable that option.
+            implicit_limiter: 0.75,
         }
     }
 }
 
 /// Configuration for the HLLD solve.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HlldOptions {
     pub frame: FluxFrame1d,
     pub dedner: Option<DednerOptions>,
+    /// Pair-level reconstruction guard. Values above this total pressure
+    /// trigger the legacy Roe/symmetric wave-speed retries.
+    pub maximum_star_total_pressure: Option<f64>,
+}
+
+impl Default for HlldOptions {
+    fn default() -> Self {
+        Self {
+            frame: FluxFrame1d::Eulerian,
+            // GIZMO enables Dedner cleaning automatically under MAGNETIC.
+            dedner: Some(DednerOptions::default()),
+            maximum_star_total_pressure: None,
+        }
+    }
 }
 
 /// Solver branch used for the returned flux.
@@ -360,6 +376,10 @@ pub enum MhdError {
         value: f64,
     },
     InvalidConservedState,
+    /// HLLD could not construct a physical contact fan. A fixed-mass MFM
+    /// caller must retry reconstruction; accepting HLLE here would transport
+    /// mass through a face whose particles keep fixed masses.
+    NoAdmissibleContactFlux,
     InvalidDednerParameter {
         field: &'static str,
         value: f64,
@@ -375,6 +395,9 @@ impl fmt::Display for MhdError {
                 write!(formatter, "invalid MHD {side} {field}={value}")
             }
             Self::InvalidConservedState => write!(formatter, "invalid conservative MHD state"),
+            Self::NoAdmissibleContactFlux => {
+                write!(formatter, "HLLD has no admissible fixed-mass contact flux")
+            }
             Self::InvalidDednerParameter { field, value } => {
                 write!(formatter, "invalid Dedner parameter {field}={value}")
             }
@@ -499,6 +522,8 @@ pub fn dedner_hyperbolic_source(
 ///
 /// This uses the legacy local decay rate
 /// `1/tau = 0.5 * sigma * signal_speed / length`.
+/// `signal_speed` is GIZMO's two-sided `MaxSignalVel` (approximately
+/// `c_fast,left + c_fast,right`), not a one-sided physical wave speed.
 ///
 /// # Errors
 ///
@@ -539,6 +564,7 @@ pub fn dedner_parabolic_source(
 /// # Errors
 ///
 /// Returns an error for invalid input states or non-finite final arithmetic.
+#[allow(clippy::too_many_lines)]
 pub fn hlld_riemann(
     mut left: IdealMhdPrimitive1d,
     mut right: IdealMhdPrimitive1d,
@@ -548,6 +574,15 @@ pub fn hlld_riemann(
     validate_gamma(gamma)?;
     validate_primitive("left", left)?;
     validate_primitive("right", right)?;
+    if let Some(limit) = options.maximum_star_total_pressure
+        && (!limit.is_finite() || limit <= 0.0)
+    {
+        return Err(MhdError::InvalidPrimitiveState {
+            side: "interface",
+            field: "maximum_star_total_pressure",
+            value: limit,
+        });
+    }
 
     let (normal_b, phi_mean, phi_db, initial_fast_left, initial_fast_right) =
         if let Some(dedner) = options.dedner {
@@ -587,17 +622,45 @@ pub fn hlld_riemann(
     }
 
     let maximum_fast = fast_left.max(fast_right);
-    let wave_left = left.velocity.x.min(right.velocity.x) - maximum_fast;
-    let wave_right = left.velocity.x.max(right.velocity.x) + maximum_fast;
-    let weighted_left = left.density * (wave_left - left.velocity.x);
-    let weighted_right = right.density * (wave_right - right.velocity.x);
-    let denominator = weighted_left - weighted_right;
-    let contact_speed = ((right.total_pressure() - left.total_pressure())
-        + weighted_left * left.velocity.x
-        - weighted_right * right.velocity.x)
-        / denominator;
-    let star_total_pressure =
-        left.total_pressure() + weighted_left * (contact_speed - left.velocity.x);
+    let mut wave_left = left.velocity.x.min(right.velocity.x) - maximum_fast;
+    let mut wave_right = left.velocity.x.max(right.velocity.x) + maximum_fast;
+    let solve_contact = |speed_left: f64, speed_right: f64| {
+        let weighted_left = left.density * (speed_left - left.velocity.x);
+        let weighted_right = right.density * (speed_right - right.velocity.x);
+        let denominator = weighted_left - weighted_right;
+        let contact = ((right.total_pressure() - left.total_pressure())
+            + weighted_left * left.velocity.x
+            - weighted_right * right.velocity.x)
+            / denominator;
+        let pressure = left.total_pressure() + weighted_left * (contact - left.velocity.x);
+        (denominator, contact, pressure)
+    };
+    let pressure_is_bad = |pressure: f64| {
+        !pressure.is_finite()
+            || pressure <= 0.0
+            || options
+                .maximum_star_total_pressure
+                .is_some_and(|limit| pressure > limit)
+    };
+    let (mut denominator, mut contact_speed, mut star_total_pressure) =
+        solve_contact(wave_left, wave_right);
+    if pressure_is_bad(star_total_pressure) {
+        let sqrt_left = left.density.sqrt();
+        let sqrt_right = right.density.sqrt();
+        let inverse_sum = (sqrt_left + sqrt_right).recip();
+        let roe_velocity =
+            (sqrt_left * left.velocity.x + sqrt_right * right.velocity.x) * inverse_sum;
+        let roe_fast = (sqrt_left * fast_left + sqrt_right * fast_right) * inverse_sum;
+        wave_right = (right.velocity.x + fast_right).max(roe_velocity + roe_fast);
+        wave_left = (left.velocity.x - fast_left).min(roe_velocity - roe_fast);
+        (denominator, contact_speed, star_total_pressure) = solve_contact(wave_left, wave_right);
+    }
+    if pressure_is_bad(star_total_pressure) {
+        let symmetric = left.velocity.x.abs().max(right.velocity.x.abs()) + maximum_fast;
+        wave_left = -symmetric;
+        wave_right = symmetric;
+        (denominator, contact_speed, star_total_pressure) = solve_contact(wave_left, wave_right);
+    }
     let fallback_contact_speed = if contact_speed.is_finite() {
         contact_speed.clamp(wave_left, wave_right)
     } else {
@@ -625,16 +688,19 @@ pub fn hlld_riemann(
     if !denominator.is_finite()
         || denominator.abs() <= f64::MIN_POSITIVE
         || !contact_speed.is_finite()
-        || !star_total_pressure.is_finite()
-        || star_total_pressure <= 0.0
+        || pressure_is_bad(star_total_pressure)
         || contact_speed <= wave_left
         || contact_speed >= wave_right
     {
+        if options.frame == FluxFrame1d::Contact {
+            return Err(MhdError::NoAdmissibleContactFlux);
+        }
         return hlle_result(left, right, gamma, wave_left, wave_right, common);
     }
 
     match build_hlld_fan(left, right, gamma, wave_left, wave_right, common) {
         Some(result) if result.flux.is_finite() => Ok(result),
+        _ if options.frame == FluxFrame1d::Contact => Err(MhdError::NoAdmissibleContactFlux),
         _ => hlle_result(left, right, gamma, wave_left, wave_right, common),
     }
 }
@@ -686,6 +752,48 @@ fn build_hlld_fan(
         common.star_total_pressure,
         common.corrected_normal_b,
     )?;
+    if !star_is_physical(star_left, gamma) || !star_is_physical(star_right, gamma) {
+        return None;
+    }
+    // When the normal field is dynamically negligible, the Alfvén and
+    // contact waves coalesce and the star-star state is just the ordinary
+    // star state. Constructing it anyway introduces irrelevant divisions and
+    // can spuriously reject the hydrodynamic/HLLC limit. This is the
+    // reimann.h SMALL_NUMBER branch.
+    if 0.5 * common.corrected_normal_b * common.corrected_normal_b
+        < DEGENERACY_TOLERANCE * common.star_total_pressure
+    {
+        let flux_star_left =
+            flux_left + IdealMhdFlux1d::from_conserved(star_left - conserved_left) * wave_left;
+        let flux_star_right =
+            flux_right + IdealMhdFlux1d::from_conserved(star_right - conserved_right) * wave_right;
+        let sampled = if common.face_velocity <= common.contact_speed {
+            SampledState {
+                conserved: star_left,
+                flux: flux_star_left,
+            }
+        } else {
+            SampledState {
+                conserved: star_right,
+                flux: flux_star_right,
+            }
+        };
+        let moving_flux =
+            sampled.flux - IdealMhdFlux1d::from_conserved(sampled.conserved) * common.face_velocity;
+        return Some(HlldResult {
+            flux: moving_flux,
+            method: MhdRiemannMethod::Hlld,
+            contact_speed: common.contact_speed,
+            face_velocity: common.face_velocity,
+            star_total_pressure: common.star_total_pressure,
+            corrected_normal_b: common.corrected_normal_b,
+            face_magnetic: sampled.conserved.magnetic,
+            fast_speed_left: common.fast_speed_left,
+            fast_speed_right: common.fast_speed_right,
+            phi_mean: common.phi_mean,
+            phi_db: common.phi_db,
+        });
+    }
     let sqrt_density_left = star_left.density.sqrt();
     let sqrt_density_right = star_right.density.sqrt();
     if !sqrt_density_left.is_finite()
@@ -713,11 +821,7 @@ fn build_hlld_fan(
         common.contact_speed,
         common.corrected_normal_b,
     )?;
-    if !star_is_physical(star_left, gamma)
-        || !star_is_physical(star_right, gamma)
-        || !star_is_physical(double_left, gamma)
-        || !star_is_physical(double_right, gamma)
-    {
+    if !star_is_physical(double_left, gamma) || !star_is_physical(double_right, gamma) {
         return None;
     }
 
@@ -1146,6 +1250,7 @@ mod tests {
             HlldOptions {
                 frame: FluxFrame1d::Contact,
                 dedner: None,
+                maximum_star_total_pressure: None,
             },
         )
         .unwrap();
@@ -1185,6 +1290,7 @@ mod tests {
             HlldOptions {
                 frame: FluxFrame1d::Contact,
                 dedner: None,
+                maximum_star_total_pressure: None,
             },
         )
         .unwrap();
@@ -1256,6 +1362,7 @@ mod tests {
         let options = HlldOptions {
             frame: FluxFrame1d::Eulerian,
             dedner: Some(DednerOptions::default()),
+            maximum_star_total_pressure: None,
         };
         let original = hlld_riemann(left, right, GAMMA, options).unwrap();
         let flipped = hlld_riemann(flip(left), flip(right), GAMMA, options).unwrap();
@@ -1278,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_and_degenerate_states_always_return_finite_fluxes() {
+    fn strong_and_degenerate_eulerian_states_return_finite_fluxes() {
         let cases = [
             (
                 IdealMhdPrimitive1d {
@@ -1327,23 +1434,73 @@ mod tests {
             ),
         ];
         for (left, right) in cases {
-            for frame in [FluxFrame1d::Eulerian, FluxFrame1d::Contact] {
-                let result = hlld_riemann(
-                    left,
-                    right,
-                    GAMMA,
-                    HlldOptions {
-                        frame,
-                        dedner: None,
-                    },
-                )
-                .unwrap();
-                assert!(result.flux.is_finite());
-                assert!(result.face_magnetic.is_finite());
-                assert!(result.contact_speed.is_finite());
-                assert!(result.star_total_pressure.is_finite());
-            }
+            let result = hlld_riemann(
+                left,
+                right,
+                GAMMA,
+                HlldOptions {
+                    frame: FluxFrame1d::Eulerian,
+                    dedner: None,
+                    maximum_star_total_pressure: None,
+                },
+            )
+            .unwrap();
+            assert!(result.flux.is_finite());
+            assert!(result.face_magnetic.is_finite());
+            assert!(result.contact_speed.is_finite());
+            assert!(result.star_total_pressure.is_finite());
         }
+    }
+
+    #[test]
+    fn contact_frame_rejects_hlle_mass_transport() {
+        let left = IdealMhdPrimitive1d {
+            density: 1.0e-5,
+            velocity: Vector3::new(-20.0, 4.0, 0.0),
+            gas_pressure: 1.0e-8,
+            magnetic: Vector3::ZERO,
+            cleaning_scalar: 0.0,
+        };
+        let right = IdealMhdPrimitive1d {
+            density: 20.0,
+            velocity: Vector3::new(15.0, -3.0, 1.0),
+            gas_pressure: 100.0,
+            magnetic: Vector3::ZERO,
+            cleaning_scalar: 0.0,
+        };
+        assert!(matches!(
+            hlld_riemann(
+                left,
+                right,
+                GAMMA,
+                HlldOptions {
+                    frame: FluxFrame1d::Contact,
+                    dedner: None,
+                    maximum_star_total_pressure: None,
+                },
+            ),
+            Err(MhdError::NoAdmissibleContactFlux)
+        ));
+        let eulerian = hlld_riemann(left, right, GAMMA, HlldOptions::default()).unwrap();
+        assert_eq!(eulerian.method, MhdRiemannMethod::Hlle);
+        assert!(eulerian.flux.is_finite());
+    }
+
+    #[test]
+    fn star_pressure_guard_rejects_reconstruction_overshoot() {
+        assert!(matches!(
+            hlld_riemann(
+                fixture(),
+                fixture(),
+                GAMMA,
+                HlldOptions {
+                    frame: FluxFrame1d::Contact,
+                    dedner: Some(DednerOptions::default()),
+                    maximum_star_total_pressure: Some(1.0e-6),
+                },
+            ),
+            Err(MhdError::NoAdmissibleContactFlux)
+        ));
     }
 
     #[test]

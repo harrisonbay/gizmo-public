@@ -2,9 +2,7 @@
 
 use std::f64::consts::{SQRT_2, TAU};
 
-use gizmo_hydro::mhd::{
-    IdealMhdPrimitive1d, Vector3, fast_magnetosonic_speed,
-};
+use gizmo_hydro::mhd::{IdealMhdPrimitive1d, Vector3, fast_magnetosonic_speed};
 use gizmo_io::read_mhd_wave;
 
 const GAMMA: f64 = 5.0 / 3.0;
@@ -71,23 +69,22 @@ fn public_fixture_pins_units_sorting_and_fast_eigenvector() {
         .map(|magnetic| magnetic[1])
         .collect();
     assert!((density_amplitude - NORMALIZED_AMPLITUDE).abs() < 2.0e-15);
+    assert!((sine_amplitude(&velocity_x, &x, 0.0) + 2.0 * NORMALIZED_AMPLITUDE).abs() < 2.0e-15);
     assert!(
-        (sine_amplitude(&velocity_x, &x, 0.0) + 2.0 * NORMALIZED_AMPLITUDE).abs()
-            < 2.0e-15
-    );
-    assert!(
-        (sine_amplitude(&magnetic_y, &x, SQRT_2)
-            - 4.0 * SQRT_2 * NORMALIZED_AMPLITUDE / 3.0)
-            .abs()
+        (sine_amplitude(&magnetic_y, &x, SQRT_2) - 4.0 * SQRT_2 * NORMALIZED_AMPLITUDE / 3.0).abs()
             < 2.0e-15
     );
 
     // Restart-0 C initialization discards these diagnostic IC columns and
     // starts the Dedner state at zero. Keeping them distinct in I/O prevents a
     // caller from accidentally treating stored divB roundoff as Phi.
-    assert!(snapshot.gas.cleaning_phi.as_ref().is_some_and(|phi| {
-        phi.iter().all(|&value| value == 0.0)
-    }));
+    assert!(
+        snapshot
+            .gas
+            .cleaning_phi
+            .as_ref()
+            .is_some_and(|phi| { phi.iter().all(|&value| value == 0.0) })
+    );
     assert!(
         snapshot
             .gas

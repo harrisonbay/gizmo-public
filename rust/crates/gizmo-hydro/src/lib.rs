@@ -2,6 +2,7 @@
 
 pub mod grain;
 pub mod mhd;
+pub mod mhd_evolution;
 
 use std::collections::BTreeMap;
 use std::error::Error;
