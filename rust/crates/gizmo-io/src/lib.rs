@@ -6,6 +6,10 @@ use std::path::Path;
 
 const PARTICLE_TYPES: usize = 6;
 const VECTOR_COMPONENTS: usize = 3;
+const GIZMO_RUST_PORT_VERSION: i32 = 1;
+const NON_UPSTREAM_GIZMO_VERSION: i32 = -1;
+const LEGACY_KERNEL_FUNCTION_ID: i32 = 3;
+const LEGACY_GRAVITATIONAL_CONSTANT: f64 = 6.672e-8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotHeader {
@@ -13,6 +17,7 @@ pub struct SnapshotHeader {
     pub box_size: f64,
     pub num_part_total: [u64; PARTICLE_TYPES],
     pub double_precision: bool,
+    pub effective_kernel_neighbors: Option<f64>,
 }
 
 impl SnapshotHeader {
@@ -32,6 +37,14 @@ impl SnapshotHeader {
             return Err(ValidationError::InvalidHeaderScalar {
                 field: "BoxSize",
                 value: self.box_size,
+            });
+        }
+        if let Some(value) = self.effective_kernel_neighbors
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(ValidationError::InvalidHeaderScalar {
+                field: "Effective_Kernel_NeighborNumber",
+                value,
             });
         }
         Ok(())
@@ -238,6 +251,10 @@ pub fn read_soundwave(path: impl AsRef<Path>) -> Result<SoundWaveSnapshot, Input
         box_size: header_group.attr("BoxSize")?.read_scalar()?,
         num_part_total,
         double_precision,
+        effective_kernel_neighbors: read_optional_scalar_attribute(
+            &header_group,
+            "Effective_Kernel_NeighborNumber",
+        )?,
     };
 
     let gas_group = file.group("PartType0")?;
@@ -294,6 +311,32 @@ pub fn write_soundwave(
         .num_part_total
         .map(legacy_particle_count_high_word);
     let mass_table = [0.0_f64; PARTICLE_TYPES];
+    let fixed_force_softening = [0.0_f64; PARTICLE_TYPES];
+    let minimum_mass_for_merge = 0.49
+        * snapshot
+            .masses
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+    let maximum_mass_for_split = 3.01
+        * snapshot
+            .masses
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+    let legacy_ids: Vec<u32> = snapshot
+        .ids
+        .iter()
+        .copied()
+        .map(|id| u32::try_from(id).map_err(|_| ValidationError::LegacyParticleIdOverflow(id)))
+        .collect::<Result<_, _>>()?;
+    let effective_kernel_neighbors =
+        snapshot
+            .header
+            .effective_kernel_neighbors
+            .ok_or(ValidationError::MissingRequiredField(
+                "Effective_Kernel_NeighborNumber",
+            ))?;
 
     let file = hdf5::File::create(path)?;
     let header = file.create_group("Header")?;
@@ -306,15 +349,83 @@ pub fn write_soundwave(
     write_scalar_attribute(&header, "NumFilesPerSnapshot", &1_i32)?;
     let precision_flag = i32::from(snapshot.header.double_precision);
     write_scalar_attribute(&header, "Flag_DoublePrecision", &precision_flag)?;
+    write_legacy_compatibility_attributes(
+        &header,
+        effective_kernel_neighbors,
+        minimum_mass_for_merge,
+        maximum_mass_for_split,
+        &fixed_force_softening,
+    )?;
 
     let gas = file.create_group("PartType0")?;
     write_vectors(&gas, "Coordinates", snapshot.coordinates)?;
     write_vectors(&gas, "Velocities", snapshot.velocities)?;
-    write_scalars(&gas, "ParticleIDs", snapshot.ids)?;
+    write_scalars(&gas, "ParticleIDs", &legacy_ids)?;
     write_scalars(&gas, "Masses", snapshot.masses)?;
     write_scalars(&gas, "InternalEnergy", snapshot.internal_energy)?;
     write_scalars(&gas, "Density", snapshot.density)?;
     write_scalars(&gas, "SmoothingLength", snapshot.smoothing_length)?;
+    Ok(())
+}
+
+fn write_legacy_compatibility_attributes(
+    header: &hdf5::Group,
+    effective_kernel_neighbors: f64,
+    minimum_mass_for_merge: f64,
+    maximum_mass_for_split: f64,
+    fixed_force_softening: &[f64; PARTICLE_TYPES],
+) -> Result<(), hdf5::Error> {
+    write_scalar_attribute(header, "ComovingIntegrationOn", &0_i32)?;
+    write_scalar_attribute(
+        header,
+        "Effective_Kernel_NeighborNumber",
+        &effective_kernel_neighbors,
+    )?;
+    write_array_attribute(
+        header,
+        "Fixed_ForceSoftening_Keplerian_Kernel_Extent",
+        fixed_force_softening,
+    )?;
+    for name in [
+        "Flag_Cooling",
+        "Flag_Feedback",
+        "Flag_IC_Info",
+        "Flag_Metals",
+        "Flag_Sfr",
+        "Flag_StellarAge",
+    ] {
+        write_scalar_attribute(header, name, &0_i32)?;
+    }
+    // Do not claim that a Rust-port snapshot was produced by upstream GIZMO
+    // 2022. The legacy-typed sentinel keeps readers that require this attribute
+    // working, while the explicit port schema version records true provenance.
+    write_scalar_attribute(header, "GIZMO_version", &NON_UPSTREAM_GIZMO_VERSION)?;
+    write_scalar_attribute(header, "GIZMO_RustPort_version", &GIZMO_RUST_PORT_VERSION)?;
+    write_scalar_attribute(
+        header,
+        "Gravitational_Constant_In_Code_Inits",
+        &LEGACY_GRAVITATIONAL_CONSTANT,
+    )?;
+    write_scalar_attribute(header, "HubbleParam", &1.0_f64)?;
+    write_scalar_attribute(header, "Kernel_Function_ID", &LEGACY_KERNEL_FUNCTION_ID)?;
+    write_scalar_attribute(
+        header,
+        "Maximum_Mass_For_Cell_Split",
+        &maximum_mass_for_split,
+    )?;
+    write_scalar_attribute(
+        header,
+        "Minimum_Mass_For_Cell_Merge",
+        &minimum_mass_for_merge,
+    )?;
+    write_scalar_attribute(header, "Redshift", &0.0_f64)?;
+    for name in [
+        "UnitLength_In_CGS",
+        "UnitMass_In_CGS",
+        "UnitVelocity_In_CGS",
+    ] {
+        write_scalar_attribute(header, name, &1.0_f64)?;
+    }
     Ok(())
 }
 
@@ -491,6 +602,24 @@ fn read_optional_scalars(
     }
 }
 
+fn read_optional_scalar_attribute<T>(
+    group: &hdf5::Group,
+    name: &str,
+) -> Result<Option<T>, hdf5::Error>
+where
+    T: hdf5::H5Type,
+{
+    if group
+        .attr_names()?
+        .iter()
+        .any(|candidate| candidate == name)
+    {
+        group.attr(name)?.read_scalar().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn reshape_vectors(
     values: &[f64],
     shape: &[usize],
@@ -585,6 +714,7 @@ pub enum ValidationError {
     },
     ParticleCountOverflow(u64),
     LegacyFileParticleCountOverflow(usize),
+    LegacyParticleIdOverflow(u64),
     ParticleCountMismatch {
         header: usize,
         dataset: usize,
@@ -646,6 +776,12 @@ impl fmt::Display for ValidationError {
                 formatter,
                 "gas particle count {count} does not fit in GIZMO's per-file header count"
             ),
+            Self::LegacyParticleIdOverflow(id) => {
+                write!(
+                    formatter,
+                    "particle ID {id} does not fit in GIZMO's public u32 ID field"
+                )
+            }
             Self::ParticleCountMismatch { header, dataset } => write!(
                 formatter,
                 "header declares {header} gas particles, datasets contain {dataset}"
@@ -779,6 +915,7 @@ mod tests {
                 box_size: 1.0,
                 num_part_total: [3, 0, 0, 0, 0, 0],
                 double_precision: true,
+                effective_kernel_neighbors: Some(4.0),
             },
             gas: GasParticles {
                 coordinates: vec![[0.3, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0]],
@@ -913,6 +1050,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn soundwave_writer_roundtrips_complete_state_exactly() {
         let mut expected = valid_snapshot();
         expected.validate_and_sort().unwrap();
@@ -929,6 +1067,41 @@ mod tests {
 
         let file = hdf5::File::open(&path).unwrap();
         let header = file.group("Header").unwrap();
+        let mut attribute_names = header.attr_names().unwrap();
+        attribute_names.sort();
+        assert_eq!(
+            attribute_names,
+            [
+                "BoxSize",
+                "ComovingIntegrationOn",
+                "Effective_Kernel_NeighborNumber",
+                "Fixed_ForceSoftening_Keplerian_Kernel_Extent",
+                "Flag_Cooling",
+                "Flag_DoublePrecision",
+                "Flag_Feedback",
+                "Flag_IC_Info",
+                "Flag_Metals",
+                "Flag_Sfr",
+                "Flag_StellarAge",
+                "GIZMO_RustPort_version",
+                "GIZMO_version",
+                "Gravitational_Constant_In_Code_Inits",
+                "HubbleParam",
+                "Kernel_Function_ID",
+                "MassTable",
+                "Maximum_Mass_For_Cell_Split",
+                "Minimum_Mass_For_Cell_Merge",
+                "NumFilesPerSnapshot",
+                "NumPart_ThisFile",
+                "NumPart_Total",
+                "NumPart_Total_HighWord",
+                "Redshift",
+                "Time",
+                "UnitLength_In_CGS",
+                "UnitMass_In_CGS",
+                "UnitVelocity_In_CGS",
+            ]
+        );
         assert_eq!(
             header
                 .attr("Flag_DoublePrecision")
@@ -971,6 +1144,9 @@ mod tests {
             vec![0.0; PARTICLE_TYPES]
         );
         let gas = file.group("PartType0").unwrap();
+        let ids = gas.dataset("ParticleIDs").unwrap();
+        assert!(ids.dtype().unwrap().is::<u32>());
+        assert_eq!(ids.read_raw::<u32>().unwrap(), [1, 2, 3]);
         assert_eq!(
             gas.dataset("Coordinates").unwrap().shape(),
             [expected.gas.len(), VECTOR_COMPONENTS]
@@ -978,6 +1154,51 @@ mod tests {
         assert_eq!(
             gas.dataset("Velocities").unwrap().shape(),
             [expected.gas.len(), VECTOR_COMPONENTS]
+        );
+        for (name, expected_value) in [
+            ("ComovingIntegrationOn", 0),
+            ("Flag_Cooling", 0),
+            ("Flag_Feedback", 0),
+            ("Flag_IC_Info", 0),
+            ("Flag_Metals", 0),
+            ("Flag_Sfr", 0),
+            ("Flag_StellarAge", 0),
+            ("GIZMO_version", NON_UPSTREAM_GIZMO_VERSION),
+            ("GIZMO_RustPort_version", GIZMO_RUST_PORT_VERSION),
+            ("Kernel_Function_ID", LEGACY_KERNEL_FUNCTION_ID),
+        ] {
+            let attribute = header.attr(name).unwrap();
+            assert!(attribute.dtype().unwrap().is::<i32>());
+            assert_eq!(attribute.read_scalar::<i32>().unwrap(), expected_value);
+        }
+        for (name, expected_value) in [
+            ("Effective_Kernel_NeighborNumber", 4.0),
+            (
+                "Gravitational_Constant_In_Code_Inits",
+                LEGACY_GRAVITATIONAL_CONSTANT,
+            ),
+            ("HubbleParam", 1.0),
+            ("Maximum_Mass_For_Cell_Split", 3.01 * 3.0),
+            ("Minimum_Mass_For_Cell_Merge", 0.49),
+            ("Redshift", 0.0),
+            ("UnitLength_In_CGS", 1.0),
+            ("UnitMass_In_CGS", 1.0),
+            ("UnitVelocity_In_CGS", 1.0),
+        ] {
+            let attribute = header.attr(name).unwrap();
+            assert!(attribute.dtype().unwrap().is::<f64>());
+            assert_eq!(
+                attribute.read_scalar::<f64>().unwrap().to_bits(),
+                expected_value.to_bits()
+            );
+        }
+        let softening = header
+            .attr("Fixed_ForceSoftening_Keplerian_Kernel_Extent")
+            .unwrap();
+        assert!(softening.dtype().unwrap().is::<f64>());
+        assert_eq!(
+            softening.read_raw::<f64>().unwrap(),
+            vec![0.0; PARTICLE_TYPES]
         );
         drop(file);
         std::fs::remove_file(path).unwrap();
@@ -1002,6 +1223,31 @@ mod tests {
                 field: "SmoothingLength",
                 ..
             }))
+        ));
+        assert!(!path.exists());
+
+        let path = temporary_hdf5_path("missing-header-metadata");
+        let mut missing_metadata = valid_snapshot();
+        missing_metadata.header.effective_kernel_neighbors = None;
+        assert!(matches!(
+            write_soundwave(
+                &path,
+                SoundWaveWriteView::try_from(&missing_metadata).unwrap()
+            ),
+            Err(OutputError::Validation(
+                ValidationError::MissingRequiredField("Effective_Kernel_NeighborNumber")
+            ))
+        ));
+        assert!(!path.exists());
+
+        let path = temporary_hdf5_path("wide-id");
+        let mut wide_id = valid_snapshot();
+        wide_id.gas.ids[0] = u64::from(u32::MAX) + 1;
+        assert!(matches!(
+            write_soundwave(&path, SoundWaveWriteView::try_from(&wide_id).unwrap()),
+            Err(OutputError::Validation(
+                ValidationError::LegacyParticleIdOverflow(_)
+            ))
         ));
         assert!(!path.exists());
     }

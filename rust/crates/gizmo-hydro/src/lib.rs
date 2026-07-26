@@ -2244,13 +2244,15 @@ impl SynchronizedTimeline1d {
             });
         }
         let bounded = desired_timestep.min(maximum_timestep);
-        let raw_ticks = (bounded / self.tick_duration()).floor();
-        if !raw_ticks.is_finite() || raw_ticks < 2.0 || raw_ticks >= LEGACY_TIMEBASE_TICKS as f64 {
+        let requested_ticks = (bounded / self.tick_duration()).floor();
+        if !requested_ticks.is_finite() || requested_ticks < 2.0 {
             return Err(HydroError::InvalidRiemannParameter {
                 field: "timeline_ticks",
-                value: raw_ticks,
+                value: requested_ticks,
             });
         }
+        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
+        let raw_ticks = requested_ticks.min(remaining as f64);
         let integer_ticks = raw_ticks as u64;
         let next_power = integer_ticks.next_power_of_two();
         let mut ticks = if next_power > integer_ticks {
@@ -2261,7 +2263,6 @@ impl SynchronizedTimeline1d {
         while self.current_tick % ticks != 0 {
             ticks >>= 1;
         }
-        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
         while ticks > remaining {
             ticks >>= 1;
         }
@@ -5143,6 +5144,18 @@ mod tests {
         ending.advance(final_step).unwrap();
         assert!(ending.is_finished());
         assert_close(ending.current_time(), 1.5);
+    }
+
+    #[test]
+    fn synchronized_timeline_clamps_a_large_bound_to_its_full_remaining_span() {
+        let time_max = 0.000_610_351_562_5;
+        let mut timeline = SynchronizedTimeline1d::new(0.0, time_max).unwrap();
+        let full_span = timeline.select_step(0.001, 0.001).unwrap();
+        assert_eq!(full_span.ticks, LEGACY_TIMEBASE_TICKS);
+        assert_eq!(full_span.duration.to_bits(), time_max.to_bits());
+        timeline.advance(full_span).unwrap();
+        assert!(timeline.is_finished());
+        assert_eq!(timeline.current_time().to_bits(), time_max.to_bits());
     }
 
     #[test]

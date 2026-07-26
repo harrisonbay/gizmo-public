@@ -636,6 +636,7 @@ fn write_snapshot_columns(
         box_size: initialized.state.box_size,
         num_part_total: [gas_count, 0, 0, 0, 0, 0],
         double_precision: true,
+        effective_kernel_neighbors: Some(initialized.parameters.desired_num_neighbors),
     };
     write_soundwave(
         path,
