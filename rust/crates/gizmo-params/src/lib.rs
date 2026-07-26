@@ -10,6 +10,7 @@ const SUPPORTED_TAGS: &[&str] = &[
     "InitCondFile",
     "OutputDir",
     "TimeMax",
+    "MaxSizeTimestep",
     "BoxSize",
     "TimeBetSnapshot",
     "DesNumNgb",
@@ -35,6 +36,7 @@ pub struct SoundwaveParameters {
     pub init_cond_file: String,
     pub output_dir: String,
     pub time_max: f64,
+    pub max_timestep: f64,
     pub box_size: f64,
     pub time_between_snapshots: f64,
     pub desired_num_neighbors: f64,
@@ -127,6 +129,13 @@ impl SoundwaveParameters {
             init_cond_file,
             output_dir,
             time_max,
+            // This is the legacy non-cosmological default assigned in
+            // begrun.c when MaxSizeTimestep is absent.
+            max_timestep: optional_f64(
+                &entries,
+                "MaxSizeTimestep",
+                (1.0e-3 * time_max).min(1.0e-2 * time_between_snapshots),
+            )?,
             box_size,
             time_between_snapshots,
             desired_num_neighbors,
@@ -168,6 +177,7 @@ impl SoundwaveParameters {
 
     fn validate(&self, entries: &BTreeMap<String, Entry>) -> Result<(), ParameterError> {
         positive(entries, "TimeMax", self.time_max)?;
+        positive(entries, "MaxSizeTimestep", self.max_timestep)?;
         positive(entries, "BoxSize", self.box_size)?;
         positive(entries, "TimeBetSnapshot", self.time_between_snapshots)?;
         positive(entries, "DesNumNgb", self.desired_num_neighbors)?;
@@ -510,6 +520,7 @@ DesNumNgb 4
         assert_eq!(parameters.init_cond_file, "soundwave_ics");
         assert_eq!(parameters.output_dir, "output");
         assert_float_eq(parameters.time_max, 1.5);
+        assert_float_eq(parameters.max_timestep, 0.001);
         assert_float_eq(parameters.box_size, 1.0);
         assert_float_eq(parameters.time_between_snapshots, 0.1);
         assert_float_eq(parameters.desired_num_neighbors, 4.0);
@@ -524,6 +535,7 @@ DesNumNgb 4
     fn parses_the_unmodified_upstream_public_parameters() {
         let parameters = SoundwaveParameters::parse(UPSTREAM_PUBLIC).unwrap();
         assert_float_eq(parameters.time_max, 1.5);
+        assert_float_eq(parameters.max_timestep, 0.001);
         assert_float_eq(parameters.desired_num_neighbors, 4.0);
         assert_eq!(parameters.max_memory_mb, None);
     }
@@ -541,6 +553,7 @@ DesNumNgb 4
     fn uses_only_deterministic_legacy_defaults() {
         let parameters = SoundwaveParameters::parse(REQUIRED).unwrap();
         assert_float_eq(parameters.integration_accuracy, 0.02);
+        assert_float_eq(parameters.max_timestep, 0.001);
         assert_float_eq(parameters.courant_factor, 0.4);
         assert_float_eq(parameters.max_rms_displacement_factor, 0.25);
         assert_float_eq(parameters.force_accuracy, 0.0025);
@@ -559,6 +572,26 @@ DesNumNgb 4
             error.kind,
             ErrorKind::UnsupportedTag("CoolingOn".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_an_explicit_maximum_timestep() {
+        let parameters =
+            SoundwaveParameters::parse(&format!("{REQUIRED}MaxSizeTimestep 2.5e-4\n")).unwrap();
+        assert_float_eq(parameters.max_timestep, 2.5e-4);
+    }
+
+    #[test]
+    fn default_maximum_timestep_uses_the_smaller_legacy_bound() {
+        let time_max_bound =
+            SoundwaveParameters::parse(&REQUIRED.replace("TimeMax 1.5", "TimeMax 0.25")).unwrap();
+        assert_float_eq(time_max_bound.max_timestep, 2.5e-4);
+
+        let snapshot_bound = SoundwaveParameters::parse(
+            &REQUIRED.replace("TimeBetSnapshot 0.1", "TimeBetSnapshot 0.025"),
+        )
+        .unwrap();
+        assert_float_eq(snapshot_bound.max_timestep, 2.5e-4);
     }
 
     #[test]
@@ -618,6 +651,9 @@ DesNumNgb 4
         }
 
         for extra in [
+            "MaxSizeTimestep 0",
+            "MaxSizeTimestep -1e-3",
+            "MaxSizeTimestep inf",
             "MaxMemSize 0",
             "ErrTolIntAccuracy 0.0501",
             "CourantFac 0.5001",
