@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "dustybox_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/dustybox_ics.hdf5",
+      "size_bytes": 16616,
+      "sha256": "c9fa9407cfcf880d9af4cdafa4268ade4e9db9e3cc23270559d3b09e59aadd46"
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/dustyboxwave.params",
+      "size_bytes": 1012,
+      "sha256": "fdffcff71eba2b6aeaa38ceeafeda6aefb49c7c9933b43385f934bc06662d8f2"
+    }
+  ]
+}

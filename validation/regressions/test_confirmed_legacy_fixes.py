@@ -9,6 +9,7 @@ RT_INJECTION = (ROOT / "radiation" / "rt_source_injection.c").read_text()
 HYDRO_EVALUATE = (ROOT / "hydro" / "hydro_evaluate.h").read_text()
 RIEMANN = (ROOT / "hydro" / "reimann.h").read_text()
 FORCETREE = (ROOT / "gravity" / "forcetree.c").read_text()
+RUN = (ROOT / "run.c").read_text()
 
 
 class AdaptiveTreeforceRegression(unittest.TestCase):
@@ -239,6 +240,44 @@ class ForceTreeCapacityRegression(unittest.TestCase):
 
         self.assertIn("if((*nodecount) >= MaxNodes)", create_empty_nodes)
         self.assertNotIn("(*nodecount) >= MaxTopNodes", create_empty_nodes)
+
+
+class TerminalOutputTimeRegression(unittest.TestCase):
+    def test_near_terminal_output_maps_to_the_exact_final_tick(self):
+        start = RUN.index("static integertime output_time_to_integer_tick")
+        end = RUN.index("integertime find_next_outputtime", start)
+        conversion = RUN[start:end]
+
+        self.assertIn("64.0 * DBL_EPSILON", conversion)
+        self.assertIn("fabs(time - All.TimeMax)", conversion)
+        self.assertIn("return TIMEBASE;", conversion)
+        self.assertIn("output_time_is_not_after_terminal(time)", RUN)
+        self.assertIn("regular_output_time_with_terminal_snap(time, iter)", RUN)
+
+    def test_public_dustybox_accumulation_is_within_snap_tolerance(self):
+        time = 0.0
+        for _ in range(250):
+            time += 0.01
+
+        tolerance = 64.0 * 2.220446049250313e-16 * 2.5
+        self.assertEqual(time, 2.4999999999999907)
+        self.assertLess(abs(time - 2.5), tolerance)
+
+    def test_indexed_terminal_detection_survives_long_output_schedules(self):
+        for interval, count in ((1.0e-4, 10_000), (1.0e-6, 1_000_000)):
+            accumulated = 0.0
+            for _ in range(count):
+                accumulated += interval
+            self.assertNotEqual(accumulated, 1.0)
+            indexed = count * interval
+            tolerance = 64.0 * 2.220446049250313e-16
+            self.assertLessEqual(abs(indexed - 1.0), tolerance)
+
+        start = RUN.index("static double regular_output_time_with_terminal_snap")
+        end = RUN.index("integertime find_next_outputtime", start)
+        indexed_schedule = RUN[start:end]
+        self.assertIn("fma((double) output_index", indexed_schedule)
+        self.assertIn("pow(All.TimeBetSnapshot", indexed_schedule)
 
 
 if __name__ == "__main__":

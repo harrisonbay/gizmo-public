@@ -6,19 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gizmo_io::{DustyWaveSnapshot, read_dustywave};
 
 #[test]
-#[ignore = "requires pinned dusty-wave assets; run via validation oracle script"]
-fn strict_dustywave_cli_matches_corrected_c_and_public_reference() {
-    let fixture = required_path("GIZMO_DUSTYWAVE_IC");
-    let config = required_path("GIZMO_DUSTYWAVE_CONFIG");
-    let parameters = required_path("GIZMO_DUSTYWAVE_PARAMS");
+#[ignore = "requires pinned dusty-box assets; run via validation oracle script"]
+fn strict_dustybox_cli_matches_corrected_c_and_analytic_solution() {
+    let fixture = required_path("GIZMO_DUSTYBOX_IC");
+    let config = required_path("GIZMO_DUSTYBOX_CONFIG");
+    let parameters = required_path("GIZMO_DUSTYBOX_PARAMS");
     let expected = [
-        read_evolution_table(&required_path("GIZMO_DUSTYWAVE_C_T0")),
-        read_evolution_table(&required_path("GIZMO_DUSTYWAVE_C_T1_2")),
-        read_evolution_table(&required_path("GIZMO_DUSTYWAVE_C_T2_5")),
+        read_evolution_table(&required_path("GIZMO_DUSTYBOX_C_T0")),
+        read_evolution_table(&required_path("GIZMO_DUSTYBOX_C_T1_25")),
+        read_evolution_table(&required_path("GIZMO_DUSTYBOX_C_T2_5")),
     ];
     let temporary = TemporaryDirectory::new();
-    std::fs::copy(&fixture, temporary.path.join("dustywave_ics.hdf5"))
-        .expect("dusty-wave IC must copy into isolated CLI directory");
+    std::fs::copy(&fixture, temporary.path.join("dustybox_ics.hdf5"))
+        .expect("dusty-box IC must copy into isolated CLI directory");
     let result = Command::new(env!("CARGO_BIN_EXE_gizmo"))
         .current_dir(&temporary.path)
         .arg("--config")
@@ -26,7 +26,7 @@ fn strict_dustywave_cli_matches_corrected_c_and_public_reference() {
         .arg(parameters)
         .arg("0")
         .output()
-        .expect("strict dusty-wave CLI must launch");
+        .expect("strict dusty-box CLI must launch");
     assert!(
         result.status.success(),
         "CLI failed\nstdout:\n{}\nstderr:\n{}",
@@ -34,7 +34,7 @@ fn strict_dustywave_cli_matches_corrected_c_and_public_reference() {
         String::from_utf8_lossy(&result.stderr)
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("completed 32768 synchronized dusty-wave steps"));
+    assert!(stderr.contains("completed 32768 synchronized dusty-box steps"));
     assert!(stderr.contains("maximum drag momentum residual="));
 
     let output = temporary.path.join("output");
@@ -56,20 +56,20 @@ fn strict_dustywave_cli_matches_corrected_c_and_public_reference() {
     }
     for (snapshot_index, expected_index, expected_time) in [
         (0, 0, 0.0_f64),
-        (120, 1, 1.200_000_000_000_000_8),
+        (125, 1, 1.250_000_000_000_000_9),
         (250, 2, 2.5),
     ] {
         let snapshot = read_dustywave(&snapshots[snapshot_index])
-            .expect("Rust dusty-wave output must be readable");
+            .expect("Rust dusty-box output must be readable");
         assert_eq!(snapshot.header.num_part_total, [64, 0, 0, 64, 0, 0]);
         assert!(snapshot.header.double_precision);
         assert_eq!(snapshot.header.time.to_bits(), expected_time.to_bits());
         assert_state_matches(&snapshot, &expected[expected_index]);
     }
-    assert_public_reference(
-        &read_dustywave(&snapshots[120]).expect("reference-time snapshot must read"),
-        &required_path("GIZMO_DUSTYWAVE_EXACT"),
-    );
+    for path in &snapshots {
+        let snapshot = read_dustywave(path).expect("Rust dusty-box output must be readable");
+        assert_analytic_solution(&snapshot, snapshot.header.time);
+    }
 }
 
 fn assert_state_matches(snapshot: &DustyWaveSnapshot, expected: &BTreeMap<u64, EvolutionRow>) {
@@ -166,72 +166,59 @@ fn assert_state_matches(snapshot: &DustyWaveSnapshot, expected: &BTreeMap<u64, E
     }
 }
 
+fn assert_analytic_solution(snapshot: &DustyWaveSnapshot, time: f64) {
+    let alpha = 15.0 * std::f64::consts::PI / 128.0;
+    let psi = (-2.0 * time).exp() / (1.0 + (1.0 + alpha).sqrt());
+    let relative_velocity = 2.0 * psi / (1.0 - alpha * psi * psi);
+    let expected = [
+        0.5 * (1.0 - relative_velocity),
+        0.5 * (1.0 + relative_velocity),
+    ];
+    let rms = |velocities: &[[f64; 3]], expected: f64| {
+        #[allow(clippy::cast_precision_loss)]
+        let count = velocities.len() as f64;
+        velocities
+            .iter()
+            .map(|velocity| (velocity[0] - expected).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / count.sqrt()
+    };
+    let gas_rms = rms(&snapshot.gas.velocities, expected[0]);
+    let grain_rms = rms(&snapshot.grains.velocities, expected[1]);
+    assert!(
+        gas_rms <= 6.0e-5,
+        "gas analytic RMS {gas_rms:.17e} exceeds corrected-C envelope"
+    );
+    assert!(
+        grain_rms <= 6.0e-5,
+        "grain analytic RMS {grain_rms:.17e} exceeds corrected-C envelope"
+    );
+    let momentum: f64 = snapshot
+        .gas
+        .masses
+        .iter()
+        .zip(&snapshot.gas.velocities)
+        .chain(
+            snapshot
+                .grains
+                .masses
+                .iter()
+                .zip(&snapshot.grains.velocities),
+        )
+        .map(|(mass, velocity)| mass * velocity[0])
+        .sum();
+    assert!(
+        (momentum - 1.0).abs() <= 2.0e-14,
+        "total momentum {momentum:.17e} moved outside corrected-C envelope"
+    );
+}
+
 fn assert_close(id: u64, field: &str, actual: f64, expected: f64, tolerance: f64) {
     assert!(
         (actual - expected).abs() <= tolerance,
         "particle {id} {field}: {actual:.17e} != {expected:.17e} (limit {tolerance:.3e})"
     );
-}
-
-fn assert_public_reference(snapshot: &DustyWaveSnapshot, path: &Path) {
-    let mut reference: Vec<[f64; 3]> = std::fs::read_to_string(path)
-        .expect("public dusty-wave reference must be readable")
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .map(|line| {
-            let values: Vec<f64> = line
-                .split_whitespace()
-                .map(|value| value.parse().expect("numeric reference value"))
-                .collect();
-            [values[0], values[1] * 1.0e-4, values[2] * 1.0e-4]
-        })
-        .collect();
-    reference.sort_by(|left, right| left[0].total_cmp(&right[0]));
-    let rms = |positions: &[[f64; 3]], velocities: &[[f64; 3]], column: usize| {
-        let square_sum: f64 = positions
-            .iter()
-            .zip(velocities)
-            .map(|(position, velocity)| {
-                let expected = periodic_interpolate(&reference, position[0], column);
-                (velocity[0] - expected).powi(2)
-            })
-            .sum();
-        #[allow(clippy::cast_precision_loss)]
-        let count = positions.len() as f64;
-        square_sum.sqrt() / count.sqrt()
-    };
-    let actual = [
-        rms(&snapshot.grains.coordinates, &snapshot.grains.velocities, 1),
-        rms(&snapshot.gas.coordinates, &snapshot.gas.velocities, 2),
-    ];
-    let corrected_c = [2.822_548_887_959_355_2e-8, 4.468_233_561_692_998_3e-7];
-    for (species, (actual, baseline)) in ["grain", "gas"]
-        .into_iter()
-        .zip(actual.into_iter().zip(corrected_c))
-    {
-        assert!(
-            (actual - baseline).abs() <= baseline * 1.0e-3,
-            "{species} reference RMS moved outside the 0.1% corrected-C band: \
-             actual={actual:.17e}, baseline={baseline:.17e}"
-        );
-    }
-}
-
-fn periodic_interpolate(reference: &[[f64; 3]], position: f64, column: usize) -> f64 {
-    let right = reference.partition_point(|row| row[0] < position);
-    let left = (right + reference.len() - 1) % reference.len();
-    let right = right % reference.len();
-    let x_left = reference[left][0];
-    let mut x_right = reference[right][0];
-    let mut x = position;
-    if right == 0 {
-        x_right += 1.0;
-    }
-    if x < x_left {
-        x += 1.0;
-    }
-    let fraction = (x - x_left) / (x_right - x_left);
-    reference[left][column] + fraction * (reference[right][column] - reference[left][column])
 }
 
 #[derive(Debug)]
@@ -294,10 +281,8 @@ impl TemporaryDirectory {
             .duration_since(UNIX_EPOCH)
             .expect("system clock must follow Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "gizmo-dustywave-cli-{}-{nonce}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("gizmo-dustybox-cli-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&path).expect("isolated CLI directory must be created");
         Self { path }
     }

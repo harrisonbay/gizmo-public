@@ -9,7 +9,6 @@ trap 'rm -rf "$oracle_tmp"' EXIT HUP INT TERM
 gzip -dc "$oracle_dir/evolution_t0.csv.gz" > "$oracle_tmp/evolution_t0.csv"
 gzip -dc "$oracle_dir/evolution_t1.2.csv.gz" > "$oracle_tmp/evolution_t1.2.csv"
 gzip -dc "$oracle_dir/evolution_t2.5.csv.gz" > "$oracle_tmp/evolution_t2.5.csv"
-gzip -dc "$oracle_dir/evolution_tfinal.csv.gz" > "$oracle_tmp/evolution_tfinal.csv"
 
 python3 "$repo_root/validation/oracles/fetch_assets.py" dustywave
 PYTHONPATH="$repo_root" \
@@ -24,7 +23,6 @@ GIZMO_DUSTYWAVE_PARAMS="$oracle_dir/legacy.params" \
 GIZMO_DUSTYWAVE_C_T0="$oracle_tmp/evolution_t0.csv" \
 GIZMO_DUSTYWAVE_C_T1_2="$oracle_tmp/evolution_t1.2.csv" \
 GIZMO_DUSTYWAVE_C_T2_5="$oracle_tmp/evolution_t2.5.csv" \
-GIZMO_DUSTYWAVE_C_TFINAL="$oracle_tmp/evolution_tfinal.csv" \
 GIZMO_DUSTYWAVE_EXACT="$oracle_dir/dustwave_exact.txt" \
   cargo test \
   --release \

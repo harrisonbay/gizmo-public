@@ -25,3 +25,9 @@ With that prompt, the corrected-C profile completes 32,768 synchronized
 initial, reference-time, and scheduled terminal state tables. At `t=1.2`, the
 corrected-C peak-normalized velocity RMS errors are `0.00075099` for grains and
 `0.0119618` for gas. The public materials publish no acceptance tolerance.
+
+The historical corrected-C run also exposed GZ-0012: accumulated output-time
+roundoff caused a duplicate endpoint snapshot in a staggered, nonconservative
+velocity phase. The Rust gate therefore compares the scheduled terminal drift,
+not that duplicate final table, and requires exactly 251 outputs ending at
+`t=2.5`.

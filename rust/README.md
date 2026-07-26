@@ -3,7 +3,7 @@
 This workspace is the correctness-oriented Rust replacement for GIZMO. It
 currently ports the public one-dimensional MFM sound-wave, both equal- and
 differential-mass Sod shock-tube paths, and the Woodward-Colella interacting
-blastwave, plus the two-fluid dusty-wave grain-drag problem: strict
+blastwave, plus the two-fluid dusty-box and dusty-wave grain-drag problems: strict
 configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
@@ -18,6 +18,7 @@ snapshots. Other physics/configuration profiles fail closed.
 validation/oracles/run_rust_soundwave_init.sh
 validation/oracles/run_rust_shocktube.sh
 validation/oracles/run_rust_interactblast.sh
+validation/oracles/run_rust_dustybox.sh
 validation/oracles/run_rust_dustywave.sh
 ```
 
@@ -60,6 +61,16 @@ At the public reference time, Rust and corrected C differ by only
 `1.54e-10` gas-velocity RMS and `1.48e-11` grain-velocity RMS. Both are also
 gated against the supplied 512-point solution, and every drag batch checks
 total momentum.
+
+The dusty-box fixture independently exercises the same coupling at an initial
+relative velocity of one rather than `~1e-4`. Its public analytic Epstein
+solution gates the entire 251-output decay curve, while corrected-C tables pin
+per-particle initial, midpoint, and terminal states. The run exposed and fixed
+GZ-0012: accumulated output-time roundoff previously created a duplicate final
+snapshot whose staggered grain/gas phases violated total momentum by
+`2.37e-7`. Rust and corrected C now emit one terminal drift at exact `t=2.5`;
+their gas and grain velocities agree to below `7e-14`, and the corrected-C
+trajectory stays within `5.31e-5` of the analytic solution.
 
 Initialization-only mode validates either supported profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive

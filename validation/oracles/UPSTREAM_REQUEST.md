@@ -51,6 +51,15 @@ synchronization points the run has advanced only
 Please also provide the generator/analyzer for `dustwave_exact.txt` and the
 intended gas/dust velocity norms and tolerances.
 
+For `dustybox`, please provide the initial-condition generator and the exact
+acceptance norm used for the published analytic comparison. Please also clarify
+the intended terminal-output phase. With `TimeBetSnapshot 0.01` and
+`TimeMax 2.5`, repeated floating-point addition places the scheduled terminal
+output just below the final integer tick; the uncorrected code then writes a
+second endpoint file after gas backreaction but before the matching grain
+half-kick. Those two files differ in total gas-plus-dust momentum by
+`2.36915e-7` for the hosted IC.
+
 For `square`, please clarify which problem is authoritative. The prose
 describes `64^2` particles and boost `(142.3,-31.4)`, while the hosted IC has
 `128^2` particles and boost `(1243,-358)` with differently normalized density

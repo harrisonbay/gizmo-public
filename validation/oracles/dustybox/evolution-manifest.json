@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "source_commit": "31a215192a06122944437b8437d9e49d6cb1c167",
+  "corrected_c_findings": [
+    "GZ-0011",
+    "GZ-0012"
+  ],
+  "corrected_run_c_sha256": "cc345bc2781da3620b1ab837bb50a856641073e22c1d851c98726ebf7f649898",
+  "profile": {
+    "name": "public 1-D periodic MFM dusty box with Epstein drag and grain backreaction",
+    "gas_particle_count": 64,
+    "grain_particle_count": 64,
+    "initial_gas_velocity_x": 0.0,
+    "initial_grain_velocity_x": 1.0,
+    "gas_density": 1.0,
+    "grain_density": 1.0,
+    "gamma": 1.6666666666666667,
+    "eos_enforce_adiabat": 0.6,
+    "box_size": 1.0,
+    "boundary": "periodic",
+    "grain_internal_density": 1.0,
+    "grain_size": 1.23608,
+    "grain_softening_prompt": 0.001
+  },
+  "inputs": {
+    "config": {
+      "path": "legacy-config.sh",
+      "sha256": "60b07ec9a401f440180b45665bade9327d340d0c4d58a344609aafc5f8f734fb"
+    },
+    "parameters": {
+      "path": "legacy.params",
+      "sha256": "bdb046beef210eb902f751eeb50f4b9b12aa76fb324b43da8b73823cb23ce8d7"
+    },
+    "resolved_parameters": {
+      "path": "parameters-usedvalues",
+      "sha256": "05565da792c88b8ef723cf85f6650fc9553f90d21ddb15e9811455489ae4e7ff"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 2.5,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 35184372088832,
+    "physical_step": 0.0000762939453125,
+    "steps": 32768,
+    "scheduled_outputs": 251,
+    "output_interval": 0.01
+  },
+  "analytic_solution": {
+    "description": "equal-density Epstein dusty-box solution documented in scripts/gizmo_documentation.md",
+    "alpha": 0.36815538909255385,
+    "psi": "exp(-2*t)/(1+sqrt(1+alpha))",
+    "relative_velocity": "2*psi/(1-alpha*psi^2)",
+    "gas_velocity_x": "(1-relative_velocity)/2",
+    "grain_velocity_x": "(1+relative_velocity)/2",
+    "public_acceptance_tolerance": null
+  },
+  "evolution_curve": {
+    "table": "evolution_curve.csv.gz",
+    "table_sha256": "f659b45443039f59b77a95817f967674ac01f9fab11f3314d6ea9402e403ee7c",
+    "snapshot_count": 251,
+    "maximum_analytic_velocity_rms": 5.300140372226092e-5,
+    "maximum_analytic_velocity_rms_snapshot": 13,
+    "maximum_analytic_velocity_rms_time": 0.12999999999999998,
+    "maximum_total_momentum_error": 1.4099832412739488e-14
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "phase": "initial scheduled drift after first half-kick",
+      "raw_sha256": "351d3bd0d906575bade113f107f56931d5580798e06cc34076e32b5ca7aae886",
+      "table": "evolution_t0.csv.gz",
+      "table_sha256": "690e195365ef8017c804ebea2f41ae869040e1447ce4f985565f586c920771da",
+      "analytic_metrics": {
+        "gas_absolute_rms": 6.776263578034403e-20,
+        "gas_analytic_velocity_x": 0.0,
+        "gas_mean_velocity_x": 0.0,
+        "gas_spatial_stddev": 6.776263578034403e-20,
+        "grain_absolute_rms": 0.0,
+        "grain_analytic_velocity_x": 1.0,
+        "grain_mean_velocity_x": 1.0,
+        "grain_spatial_stddev": 0.0,
+        "total_momentum_x": 1.0
+      }
+    },
+    {
+      "time": 1.2500000000000009,
+      "phase": "scheduled midpoint output drift",
+      "raw_sha256": "5cd0e7781bdde0d9c9f58f213b7bbca128e65fb45bdce75dddd3f79716fb5362",
+      "table": "evolution_t1.25.csv.gz",
+      "table_sha256": "ae973822286ee12b4a5e60275908993f73c55e5a1eb7dbda81bcc26000d369b8",
+      "analytic_metrics": {
+        "gas_absolute_rms": 3.814564833679382e-6,
+        "gas_analytic_velocity_x": 0.46214731678346,
+        "gas_mean_velocity_x": 0.46215113134829366,
+        "gas_spatial_stddev": 1.4187002578950144e-14,
+        "grain_absolute_rms": 3.814564830090239e-6,
+        "grain_analytic_velocity_x": 0.53785268321654,
+        "grain_mean_velocity_x": 0.5378488686517099,
+        "grain_spatial_stddev": 4.878195403307322e-15,
+        "total_momentum_x": 1.0000000000000036
+      }
+    },
+    {
+      "time": 2.5,
+      "phase": "scheduled terminal drift before the endpoint force evaluation",
+      "raw_sha256": "52a2b53f40408099b70d94c26230e648e1b563c4d8d90cd5728a15db2e578ebc",
+      "table": "evolution_t2.5.csv.gz",
+      "table_sha256": "a8b5d513275b52a8d9cc086abb0629fea70972abab1a75f39310b84799568c81",
+      "analytic_metrics": {
+        "gas_absolute_rms": 1.2336714271411154e-7,
+        "gas_analytic_velocity_x": 0.4968944888198195,
+        "gas_mean_velocity_x": 0.49689461218696224,
+        "gas_spatial_stddev": 1.5299266608349646e-14,
+        "grain_absolute_rms": 1.23367155938775e-7,
+        "grain_analytic_velocity_x": 0.5031055111801805,
+        "grain_mean_velocity_x": 0.5031053878130246,
+        "grain_spatial_stddev": 2.0873964420257315e-15,
+        "total_momentum_x": 0.9999999999999868
+      }
+    }
+  ],
+  "observations": {
+    "all_particles_shared_one_timebin": true,
+    "terminal_tick_was_snapped_exactly_to_time_max": true,
+    "drag_heating_deposited_in_gas": false,
+    "maximum_corrected_c_analytic_velocity_rms": 5.300140372226092e-5,
+    "maximum_corrected_c_total_momentum_error": 1.4099832412739488e-14
+  }
+}

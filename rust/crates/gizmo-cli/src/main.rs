@@ -674,9 +674,13 @@ fn read_profile_parameters(
                 )));
             }
         }
-        if parameters.init_cond_file != "dustywave_ics" {
+        if !matches!(
+            parameters.init_cond_file.as_str(),
+            "dustywave_ics" | "dustybox_ics"
+        ) {
             return Err(ApplicationError::UnsupportedParameters(format!(
-                "dusty wave requires `InitCondFile dustywave_ics`, found `{}`",
+                "dusty gas-grain profile requires `InitCondFile dustywave_ics` or \
+                 `InitCondFile dustybox_ics`, found `{}`",
                 parameters.init_cond_file
             )));
         }
@@ -893,6 +897,7 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
     )
     .map_err(ApplicationError::Hydro)?;
     let mut next_output_time = 0.0_f64;
+    let mut next_output_index = 0_u64;
     let mut next_output_tick = Some(0_u64);
     let mut snapshot_number = 0_u32;
     let mut last_output_tick = None;
@@ -954,7 +959,16 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
                 ApplicationError::StateMismatch("snapshot number overflow".to_owned())
             })?;
 
-            next_output_time += initialized.parameters.time_between_snapshots;
+            next_output_index = next_output_index.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("output schedule index overflow".to_owned())
+            })?;
+            next_output_time = regular_output_time_with_terminal_snap(
+                next_output_time + initialized.parameters.time_between_snapshots,
+                0.0,
+                initialized.parameters.time_between_snapshots,
+                next_output_index,
+                initialized.parameters.time_max,
+            );
             next_output_tick = (next_output_time <= initialized.parameters.time_max)
                 .then(|| legacy_output_tick(next_output_time, tick_duration));
             if next_output_tick.is_some_and(|tick| tick <= output_tick) {
@@ -1001,6 +1015,11 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
 fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
     const MOMENTUM_RESIDUAL_LIMIT: f64 = 1.0e-18;
 
+    let problem_name = if initialized.parameters.init_cond_file == "dustybox_ics" {
+        "dusty-box"
+    } else {
+        "dusty-wave"
+    };
     let output_dir = PathBuf::from(&initialized.parameters.output_dir);
     fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
     let mut grains = initialized.grains.take().ok_or_else(|| {
@@ -1021,6 +1040,7 @@ fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), Applica
             .expect("strict dusty-wave parameters"),
     };
     let mut next_output_time = 0.0_f64;
+    let mut next_output_index = 0_u64;
     let mut next_output_tick = Some(0_u64);
     let mut snapshot_number = 0_u32;
     let mut last_output_tick = None;
@@ -1077,9 +1097,27 @@ fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), Applica
             snapshot_number = snapshot_number.checked_add(1).ok_or_else(|| {
                 ApplicationError::StateMismatch("snapshot number overflow".to_owned())
             })?;
-            next_output_time += initialized.parameters.time_between_snapshots;
-            next_output_tick = (next_output_time <= initialized.parameters.time_max)
-                .then(|| legacy_output_tick(next_output_time, tick_duration));
+            next_output_index = next_output_index.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("output schedule index overflow".to_owned())
+            })?;
+            next_output_time = regular_output_time_with_terminal_snap(
+                next_output_time + initialized.parameters.time_between_snapshots,
+                0.0,
+                initialized.parameters.time_between_snapshots,
+                next_output_index,
+                initialized.parameters.time_max,
+            );
+            let terminal_tolerance =
+                64.0 * f64::EPSILON * initialized.parameters.time_max.abs().max(1.0);
+            next_output_tick = (next_output_time
+                <= initialized.parameters.time_max + terminal_tolerance)
+                .then(|| {
+                    terminal_snapped_output_tick(
+                        next_output_time,
+                        tick_duration,
+                        initialized.parameters.time_max,
+                    )
+                });
         }
 
         let gas_drift = prepared
@@ -1216,7 +1254,7 @@ fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), Applica
         snapshot_number += 1;
     }
     eprintln!(
-        "completed {step_count} synchronized dusty-wave steps to t={:.17e}; \
+        "completed {step_count} synchronized {problem_name} steps to t={:.17e}; \
          wrote {snapshot_number} snapshots; maximum drag momentum residual={maximum_momentum_residual:.3e}",
         timeline.current_time()
     );
@@ -1230,6 +1268,32 @@ fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), Applica
 )]
 fn legacy_output_tick(output_time: f64, tick_duration: f64) -> u64 {
     (output_time / tick_duration) as u64
+}
+
+fn terminal_snapped_output_tick(output_time: f64, tick_duration: f64, terminal_time: f64) -> u64 {
+    let tolerance = 64.0 * f64::EPSILON * terminal_time.abs().max(1.0);
+    if (output_time - terminal_time).abs() <= tolerance {
+        LEGACY_TIMEBASE_TICKS
+    } else {
+        legacy_output_tick(output_time, tick_duration)
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn regular_output_time_with_terminal_snap(
+    accumulated_time: f64,
+    first_output_time: f64,
+    output_interval: f64,
+    output_index: u64,
+    terminal_time: f64,
+) -> f64 {
+    let indexed_time = (output_index as f64).mul_add(output_interval, first_output_time);
+    let tolerance = 64.0 * f64::EPSILON * terminal_time.abs().max(1.0);
+    if (indexed_time - terminal_time).abs() <= tolerance {
+        terminal_time
+    } else {
+        accumulated_time
+    }
 }
 
 fn write_drift_snapshot(
@@ -1834,6 +1898,18 @@ ResubmitCommand none
     }
 
     #[test]
+    fn dustybox_uses_the_same_strict_grain_profile() {
+        let path =
+            std::env::temp_dir().join(format!("gizmo-dustybox-params-{}.txt", std::process::id()));
+        let parameters = include_str!("../../../../validation/oracles/dustywave/legacy.params")
+            .replace("dustywave_ics", "dustybox_ics");
+        fs::write(&path, parameters).unwrap();
+        let parsed = read_profile_parameters(&path, StrictProfile::Dustywave).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(parsed.init_cond_file, "dustybox_ics");
+    }
+
+    #[test]
     fn interacting_blast_requires_the_public_fixed_timestep() {
         let path = std::env::temp_dir().join(format!(
             "gizmo-interactblast-params-{}.txt",
@@ -1908,5 +1984,48 @@ ResubmitCommand none
         assert_eq!(ticks[0], 0);
         assert!(ticks[14] < LEGACY_TIMEBASE_TICKS);
         assert!(time > 1.5);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn terminal_output_time_roundoff_snaps_to_the_final_tick() {
+        let terminal_time = 2.5;
+        let tick_duration = terminal_time / LEGACY_TIMEBASE_TICKS as f64;
+        let accumulated_terminal = 2.499_999_999_999_990_7;
+        assert!(legacy_output_tick(accumulated_terminal, tick_duration) < LEGACY_TIMEBASE_TICKS);
+        assert_eq!(
+            terminal_snapped_output_tick(accumulated_terminal, tick_duration, terminal_time),
+            LEGACY_TIMEBASE_TICKS
+        );
+        assert_eq!(
+            terminal_snapped_output_tick(1.2, tick_duration, terminal_time),
+            legacy_output_tick(1.2, tick_duration)
+        );
+    }
+
+    #[test]
+    fn indexed_schedule_detection_survives_large_accumulation_error() {
+        assert_eq!(
+            regular_output_time_with_terminal_snap(
+                0.999_999_999_999_906_2,
+                0.0,
+                1.0e-4,
+                10_000,
+                1.0,
+            )
+            .to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            regular_output_time_with_terminal_snap(
+                1.000_000_000_007_918,
+                0.0,
+                1.0e-6,
+                1_000_000,
+                1.0,
+            )
+            .to_bits(),
+            1.0_f64.to_bits()
+        );
     }
 }

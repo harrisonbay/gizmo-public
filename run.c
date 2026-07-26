@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <unistd.h>
 #include <ctype.h>
 
@@ -504,6 +505,35 @@ void make_list_of_active_particles(void)
 /*! this function returns the next output time that is equal or larger to
  *  ti_curr
  */
+static integertime output_time_to_integer_tick(double time)
+{
+  double terminal_tolerance = 64.0 * DBL_EPSILON * DMAX(1.0, fabs(All.TimeMax));
+  if(fabs(time - All.TimeMax) <= terminal_tolerance)
+    return TIMEBASE;
+  if(All.ComovingIntegrationOn)
+    return (integertime) (log(time / All.TimeBegin) / All.Timebase_interval);
+  return (integertime) ((time - All.TimeBegin) / All.Timebase_interval);
+}
+
+static int output_time_is_not_after_terminal(double time)
+{
+  double terminal_tolerance = 64.0 * DBL_EPSILON * DMAX(1.0, fabs(All.TimeMax));
+  return time <= All.TimeMax + terminal_tolerance;
+}
+
+static double regular_output_time_with_terminal_snap(double accumulated_time, long long output_index)
+{
+  double indexed_time;
+  if(All.ComovingIntegrationOn)
+    indexed_time = All.TimeOfFirstSnapshot * pow(All.TimeBetSnapshot, (double) output_index);
+  else
+    indexed_time = fma((double) output_index, All.TimeBetSnapshot, All.TimeOfFirstSnapshot);
+
+  if(fabs(indexed_time - All.TimeMax) <= 64.0 * DBL_EPSILON * DMAX(1.0, fabs(All.TimeMax)))
+    return All.TimeMax;
+  return accumulated_time;
+}
+
 integertime find_next_outputtime(integertime ti_curr)
 {
   long long i, iter = 0;
@@ -520,10 +550,9 @@ integertime find_next_outputtime(integertime ti_curr)
 	{
 	  time = All.OutputListTimes[i];
 
-	  if(time >= All.TimeBegin && time <= All.TimeMax)
+	  if(time >= All.TimeBegin && output_time_is_not_after_terminal(time))
 	    {
-	      if(All.ComovingIntegrationOn) {ti = (integertime) (log(time / All.TimeBegin) / All.Timebase_interval);}
-          else {ti = (integertime) ((time - All.TimeBegin) / All.Timebase_interval);}
+	      ti = output_time_to_integer_tick(time);
 
 	      if(ti >= ti_curr)
 		{
@@ -574,6 +603,7 @@ integertime find_next_outputtime(integertime ti_curr)
 	    time += All.TimeBetSnapshot;
 
 	  iter++;
+	  time = regular_output_time_with_terminal_snap(time, iter);
 
 	  if(iter > 10000000000)
 	    {
@@ -581,10 +611,9 @@ integertime find_next_outputtime(integertime ti_curr)
 	      endrun(110);
 	    }
 	}
-      while(time <= All.TimeMax)
+      while(output_time_is_not_after_terminal(time))
 	{
-	  if(All.ComovingIntegrationOn) {ti = (integertime) (log(time / All.TimeBegin) / All.Timebase_interval);}
-        else {ti = (integertime) ((time - All.TimeBegin) / All.Timebase_interval);}
+	  ti = output_time_to_integer_tick(time);
 
 	  if(ti >= ti_curr)
 	    {
@@ -598,6 +627,7 @@ integertime find_next_outputtime(integertime ti_curr)
 	    time += All.TimeBetSnapshot;
 
 	  iter++;
+	  time = regular_output_time_with_terminal_snap(time, iter);
 
 	  if(iter > 10000000000)
 	    {

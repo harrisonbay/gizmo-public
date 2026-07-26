@@ -427,6 +427,41 @@
         }
       ],
       "dossier": "audit/findings/GZ-0011.md"
+    },
+    {
+      "id": "GZ-0012",
+      "title": "Accumulated output time creates a nonconservative terminal dust snapshot",
+      "status": "fixed",
+      "confidence": "high",
+      "affected_flags": [
+        "REGULARLY_SPACED_OUTPUTS",
+        "GRAIN_FLUID",
+        "GRAIN_BACKREACTION"
+      ],
+      "summary": "Repeated floating-point addition put the mathematically terminal dustybox output several thousand integer ticks below TimeMax. GIZMO then emitted a second final snapshot after endpoint grain backreaction had directly advanced gas velocity but before the leapfrog representation supplied the matching grain half-step.",
+      "impact": "The duplicate final snapshot violates total dust-plus-gas momentum and can be mistaken for the physical state at TimeMax. The public strong-drag dustybox case shifts mean(v_g)+mean(v_d) by 2.36915e-7 between the scheduled and duplicate terminal files.",
+      "reproduction": "Run the byte-pinned public dustybox IC with TimeMax=2.5 and TimeBetSnapshot=0.01. The uncorrected run writes snapshot_250 at 2.4999999999999907 with mean velocity sum 0.9999999999999869, then snapshot_251 at 2.5 with sum 1.0000002369145602.",
+      "falsification": "Show that the duplicate final file is explicitly documented and consumed as a staggered nonphysical predictor state, or demonstrate exact total momentum across both terminal files for the public dustybox profile.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The public IC gives equal unit gas and dust masses, so mean(v_g)+mean(v_d)=1 is an exact momentum invariant; the published Epstein formula independently fixes both velocity means."
+      },
+      "sources": [
+        {
+          "path": "run.c",
+          "line_start": 505,
+          "line_end": 607,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/run.c#L505-L607"
+        },
+        {
+          "path": "solids/grain_physics.c",
+          "line_start": 155,
+          "line_end": 172,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/solids/grain_physics.c#L155-L172"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0012.md"
     }
   ]
 }
