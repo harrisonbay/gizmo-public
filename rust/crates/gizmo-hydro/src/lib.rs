@@ -5,6 +5,8 @@ use std::fmt;
 
 /// Normalization of GIZMO's default cubic spline in one dimension.
 pub const CUBIC_1D_NORMALIZATION: f64 = 4.0 / 3.0;
+/// Core-radius factor of GIZMO's default cubic spline kernel.
+pub const CUBIC_KERNEL_CORE_SIZE: f64 = 0.5;
 const EPSILON_ENTROPIC_BIG: f64 = 0.5;
 const EPSILON_ENTROPIC_SMALL: f64 = 1.0e-3;
 const CONDITION_NUMBER_DANGER_SQUARED: f64 = 1.0e6;
@@ -1356,6 +1358,225 @@ pub fn global_courant_timestep_1d(
         });
     }
     Ok(timestep)
+}
+
+/// Provenance for the bound selected by [`select_public_soundwave_timestep_1d`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimestepBound1d {
+    MaximumSize,
+    Courant { particle_index: usize },
+    Acceleration { particle_index: usize },
+    GasDivergence { particle_index: usize },
+}
+
+/// A continuous timestep and the bound that selected it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimestepSelection1d {
+    pub duration: f64,
+    pub bound: TimestepBound1d,
+}
+
+fn validate_public_soundwave_timestep_inputs(
+    state: MfmState1d<'_>,
+    rates: &MfmRates1d,
+    maximum_timestep: f64,
+    courant_factor: f64,
+    integration_accuracy: f64,
+) -> Result<(), HydroError> {
+    for (field, value) in [
+        ("maximum_timestep", maximum_timestep),
+        ("integration_accuracy", integration_accuracy),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(HydroError::InvalidRiemannParameter { field, value });
+        }
+    }
+    if !courant_factor.is_finite() || courant_factor <= 0.0 || courant_factor > 0.5 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "courant_factor",
+            value: courant_factor,
+        });
+    }
+    if !state.gamma.is_finite() || state.gamma <= 1.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "gamma",
+            value: state.gamma,
+        });
+    }
+
+    let particle_count = state.positions.len();
+    for (field, actual) in [
+        ("masses", state.masses.len()),
+        ("velocities", state.velocities.len()),
+        (
+            "specific_internal_energy",
+            state.specific_internal_energy.len(),
+        ),
+        ("smoothing_lengths", state.smoothing_lengths.len()),
+        ("maximum_signal_speed", rates.maximum_signal_speed.len()),
+        ("acceleration", rates.acceleration.len()),
+        ("particle_divergence", rates.particle_divergence.len()),
+    ] {
+        if actual != particle_count {
+            return Err(HydroError::MismatchedLength {
+                field,
+                expected: particle_count,
+                actual,
+            });
+        }
+    }
+    for (index, (&velocity, &internal_energy)) in state
+        .velocities
+        .iter()
+        .zip(state.specific_internal_energy)
+        .enumerate()
+    {
+        if !velocity.is_finite() {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "velocity",
+                value: velocity,
+            });
+        }
+        if !internal_energy.is_finite() || internal_energy <= 0.0 {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "specific_internal_energy",
+                value: internal_energy,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Select the strict non-cosmological timestep bound for the public 1-D
+/// sound-wave configuration.
+///
+/// This specializes `get_timestep` in `timestep.c` to the enabled public
+/// sound-wave physics. The result is the minimum of `MaxSizeTimestep`, the gas
+/// Courant bound, the acceleration bound
+/// `sqrt(2 ErrTolIntAccuracy KERNEL_CORE_SIZE Hsml / |a|)`, and the gas
+/// divergence bound `1.5 / |Particle_DivVel|`. The public configuration uses
+/// the cubic kernel, hence [`CUBIC_KERNEL_CORE_SIZE`] is one half.
+///
+/// Zero acceleration and divergence impose no bound. Exact ties retain the
+/// earlier criterion in the order documented above, matching the C code's
+/// strict `candidate < dt` comparisons.
+///
+/// # Errors
+///
+/// Returns an error for invalid state/rate columns, selector parameters, or a
+/// non-finite/non-positive candidate.
+pub fn select_public_soundwave_timestep_1d(
+    state: MfmState1d<'_>,
+    rates: &MfmRates1d,
+    maximum_timestep: f64,
+    courant_factor: f64,
+    integration_accuracy: f64,
+) -> Result<TimestepSelection1d, HydroError> {
+    validate_public_soundwave_timestep_inputs(
+        state,
+        rates,
+        maximum_timestep,
+        courant_factor,
+        integration_accuracy,
+    )?;
+
+    let density = density_at_hsml_1d(
+        state.positions,
+        state.masses,
+        state.smoothing_lengths,
+        state.box_size,
+    )?;
+    let mut selection = TimestepSelection1d {
+        duration: maximum_timestep,
+        bound: TimestepBound1d::MaximumSize,
+    };
+
+    for (index, estimate) in density.iter().enumerate() {
+        let signal_speed = rates.maximum_signal_speed[index];
+        let particle_size = 2.0 * state.smoothing_lengths[index] / estimate.effective_neighbors;
+        let courant = courant_factor * particle_size / (0.5 * signal_speed);
+        if !particle_size.is_finite()
+            || particle_size <= 0.0
+            || !signal_speed.is_finite()
+            || signal_speed <= 0.0
+            || !courant.is_finite()
+            || courant <= 0.0
+        {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "courant_timestep",
+                value: courant,
+            });
+        }
+        if courant < selection.duration {
+            selection = TimestepSelection1d {
+                duration: courant,
+                bound: TimestepBound1d::Courant {
+                    particle_index: index,
+                },
+            };
+        }
+
+        let acceleration = rates.acceleration[index];
+        if !acceleration.is_finite() {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "acceleration",
+                value: acceleration,
+            });
+        }
+        if acceleration != 0.0 {
+            let acceleration_bound = (2.0
+                * integration_accuracy
+                * CUBIC_KERNEL_CORE_SIZE
+                * state.smoothing_lengths[index]
+                / acceleration.abs())
+            .sqrt();
+            if !acceleration_bound.is_finite() || acceleration_bound <= 0.0 {
+                return Err(HydroError::NonFiniteRiemannResult {
+                    field: "acceleration_timestep",
+                    value: acceleration_bound,
+                });
+            }
+            if acceleration_bound < selection.duration {
+                selection = TimestepSelection1d {
+                    duration: acceleration_bound,
+                    bound: TimestepBound1d::Acceleration {
+                        particle_index: index,
+                    },
+                };
+            }
+        }
+
+        let divergence = rates.particle_divergence[index];
+        if !divergence.is_finite() {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "particle_divergence",
+                value: divergence,
+            });
+        }
+        if divergence != 0.0 {
+            let divergence_bound = 1.5 / divergence.abs();
+            if !divergence_bound.is_finite() || divergence_bound <= 0.0 {
+                return Err(HydroError::NonFiniteRiemannResult {
+                    field: "divergence_timestep",
+                    value: divergence_bound,
+                });
+            }
+            if divergence_bound < selection.duration {
+                selection = TimestepSelection1d {
+                    duration: divergence_bound,
+                    bound: TimestepBound1d::GasDivergence {
+                        particle_index: index,
+                    },
+                };
+            }
+        }
+    }
+
+    Ok(selection)
 }
 
 pub const LEGACY_TIMEBASE_TICKS: u64 = 1_u64 << 29;
@@ -2779,6 +3000,31 @@ mod tests {
         );
     }
 
+    fn single_particle_rates(signal_speed: f64, acceleration: f64, divergence: f64) -> MfmRates1d {
+        MfmRates1d {
+            momentum: vec![acceleration],
+            total_energy: vec![0.0],
+            acceleration: vec![acceleration],
+            specific_internal_energy: vec![0.0],
+            pair_count: 0,
+            entropic_pair_count: 0,
+            maximum_signal_speed: vec![signal_speed],
+            particle_divergence: vec![divergence],
+        }
+    }
+
+    fn single_particle_state() -> MfmState1d<'static> {
+        MfmState1d {
+            positions: &[0.5],
+            masses: &[1.0],
+            velocities: &[0.0],
+            specific_internal_energy: &[0.9],
+            smoothing_lengths: &[0.2],
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        }
+    }
+
     #[test]
     fn cubic_kernel_matches_piecewise_boundaries() {
         let at_zero = cubic_kernel_1d(0.0, 2.0).unwrap();
@@ -3720,6 +3966,106 @@ mod tests {
             assert!(new_rates.acceleration[index].abs() < 1.0e-14);
             assert!(new_rates.specific_internal_energy[index].abs() < 1.0e-14);
         }
+    }
+
+    #[test]
+    fn public_soundwave_timestep_reports_each_limiting_bound() {
+        let state = single_particle_state();
+
+        let maximum = select_public_soundwave_timestep_1d(
+            state,
+            &single_particle_rates(1.0, 0.0, 0.0),
+            0.01,
+            0.1,
+            0.01,
+        )
+        .unwrap();
+        assert_close(maximum.duration, 0.01);
+        assert_eq!(maximum.bound, TimestepBound1d::MaximumSize);
+
+        let courant = select_public_soundwave_timestep_1d(
+            state,
+            &single_particle_rates(1.0, 0.0, 0.0),
+            1.0,
+            0.1,
+            0.01,
+        )
+        .unwrap();
+        assert_close(courant.duration, 0.03);
+        assert_eq!(
+            courant.bound,
+            TimestepBound1d::Courant { particle_index: 0 }
+        );
+
+        let acceleration = select_public_soundwave_timestep_1d(
+            state,
+            &single_particle_rates(1.0, -5.0, 0.0),
+            1.0,
+            0.1,
+            0.01,
+        )
+        .unwrap();
+        assert_close(acceleration.duration, 0.02);
+        assert_eq!(
+            acceleration.bound,
+            TimestepBound1d::Acceleration { particle_index: 0 }
+        );
+
+        let divergence = select_public_soundwave_timestep_1d(
+            state,
+            &single_particle_rates(1.0, -5.0, -100.0),
+            1.0,
+            0.1,
+            0.01,
+        )
+        .unwrap();
+        assert_close(divergence.duration, 0.015);
+        assert_eq!(
+            divergence.bound,
+            TimestepBound1d::GasDivergence { particle_index: 0 }
+        );
+    }
+
+    #[test]
+    fn public_soundwave_timestep_matches_c_formula_and_strict_tie_order() {
+        let state = single_particle_state();
+        let rates = single_particle_rates(1.0, 5.0, 75.0);
+        let expected = (2.0_f64 * 0.01 * CUBIC_KERNEL_CORE_SIZE * 0.2 / 5.0).sqrt();
+        assert_close(expected, 0.02);
+        assert_close(1.5 / 75.0, expected);
+
+        let selection = select_public_soundwave_timestep_1d(state, &rates, 1.0, 0.1, 0.01).unwrap();
+        assert_close(selection.duration, expected);
+        assert_eq!(
+            selection.bound,
+            TimestepBound1d::Acceleration { particle_index: 0 }
+        );
+
+        let capped =
+            select_public_soundwave_timestep_1d(state, &rates, expected, 0.1, 0.01).unwrap();
+        assert_close(capped.duration, expected);
+        assert_eq!(capped.bound, TimestepBound1d::MaximumSize);
+    }
+
+    #[test]
+    fn public_soundwave_timestep_rejects_incomplete_or_nonfinite_inputs() {
+        let state = single_particle_state();
+        let mut rates = single_particle_rates(1.0, 0.0, 0.0);
+        rates.particle_divergence.clear();
+        assert!(select_public_soundwave_timestep_1d(state, &rates, 1.0, 0.1, 0.01).is_err());
+
+        let nonfinite = single_particle_rates(1.0, f64::NAN, 0.0);
+        assert!(select_public_soundwave_timestep_1d(state, &nonfinite, 1.0, 0.1, 0.01).is_err());
+        assert!(
+            select_public_soundwave_timestep_1d(
+                state,
+                &single_particle_rates(1.0, 0.0, 0.0),
+                1.0,
+                0.1,
+                0.0,
+            )
+            .is_err()
+        );
     }
 
     #[test]
