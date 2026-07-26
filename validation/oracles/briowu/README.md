@@ -52,10 +52,12 @@ used for the published figures. Those missing upstream files are requested in
 
 The Rust path now owns the full 50,176-particle planar state: rectangular
 periodic cell lists, the normalized 2-D cubic kernel, MFM density, conditioned
-2-D MLS moments, vector face geometry, limited gradients, arbitrary-normal
-HLLD, Powell/Dedner terms, public-C adaptive smoothing lengths, and
-synchronized KDK evolution. The strict CLI accepts this profile without a
-one-dimensional projection and writes `t=0`, `0.1`, and `0.2` snapshots.
+2-D MLS moments, batched limited gradients, vector face geometry,
+arbitrary-normal HLLD, the MFM entropic/PdV energy correction, Powell/Dedner
+terms and safety limiters, the density-loop `Particle_DivVel` estimator,
+public-C adaptive smoothing lengths, and synchronized primitive KDK evolution.
+The strict CLI accepts this profile without a one-dimensional projection and
+writes `t=0`, `0.1`, and `0.2` snapshots.
 
 Run the pinned initialization, three-pass adaptive-H, and full production
 two-dimensional RHS gate with:
@@ -71,11 +73,14 @@ limiters, CFL length, adaptive-H drift, and the C retry ladder.
 
 This is not yet a terminal trajectory claim. Rust currently advances every
 particle on a synchronized global step, whereas the C baseline uses
-hierarchical individual-particle time bins. Its `snapshot_000` is the
-pre-kick initialized state; the C file with that name is post-first-half-kick
-as explained above. A Rust `t=0.2` profile must not be promoted to the 5% gate
-until the full run is reduced and compared, and performance work is still
-needed before that run is practical in debug builds.
+hierarchical individual-particle time bins. The corrected-C logs establish the
+global synchronization cadence, but do not prove that every particle occupies
+the same bin. Rust also still serializes the wrong leapfrog phase: its
+`snapshot_000` is pre-kick and later snapshots are post-second-kick, while C
+writes the mixed predictor/actual view during drift. The synchronized public
+step currently discards that predictor view between calls, so multi-step
+trajectory parity requires a persistent dual actual/predicted state before a
+Rust `t=0.2` profile can be promoted to the 5% gate.
 
 ## Approximate published-figure reference
 

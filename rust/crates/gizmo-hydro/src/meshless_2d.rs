@@ -595,6 +595,79 @@ pub fn density_at_hsml_2d(
     Ok(output)
 }
 
+/// Evaluate the public density-loop particle velocity-divergence estimator.
+///
+/// This is distinct from the trace of the MLS velocity gradient. It controls
+/// smoothing-length prediction and the public divergence timestep bound.
+///
+/// # Errors
+///
+/// Returns an error for invalid columns, geometry, or non-finite arithmetic.
+pub fn particle_divergence_at_hsml_2d(
+    positions: &[Vector2],
+    velocities: &[Vector2],
+    smoothing_lengths: &[f64],
+    dhsml_factors: &[f64],
+    domain: Box2d,
+) -> Result<Vec<f64>, GeometryError> {
+    validate_geometry_columns(positions, smoothing_lengths, domain)?;
+    if velocities.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "velocities",
+            expected: positions.len(),
+            actual: velocities.len(),
+        });
+    }
+    if dhsml_factors.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "dhsml_factors",
+            expected: positions.len(),
+            actual: dhsml_factors.len(),
+        });
+    }
+    for (index, velocity) in velocities.iter().enumerate() {
+        if !velocity.is_finite() {
+            return Err(GeometryError::NonFiniteResult {
+                index,
+                field: "velocity",
+                value: f64::NAN,
+            });
+        }
+    }
+    let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
+    let neighbors = CellList2d::new(positions, domain, maximum_support)?;
+    let mut output = Vec::with_capacity(positions.len());
+    for (particle, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        let mut kernel_sum = 0.0;
+        let mut divergence_sum = 0.0;
+        for neighbor in neighbors.neighbors_within(position, hsml)? {
+            let displacement = domain.displacement(position, positions[neighbor])?;
+            let radius = displacement.norm();
+            let kernel = cubic_kernel_2d(radius, hsml)?;
+            kernel_sum += kernel.weight;
+            if radius > 0.0 {
+                let velocity_difference = velocities[particle] - velocities[neighbor];
+                divergence_sum -=
+                    kernel.radial_derivative * displacement.dot(velocity_difference) / radius;
+            }
+        }
+        let divergence = if kernel_sum > 0.0 {
+            divergence_sum / kernel_sum * dhsml_factors[particle]
+        } else {
+            0.0
+        };
+        if !divergence.is_finite() {
+            return Err(GeometryError::NonFiniteResult {
+                index: particle,
+                field: "particle velocity divergence",
+                value: divergence,
+            });
+        }
+        output.push(divergence);
+    }
+    Ok(output)
+}
+
 /// Run one public-C two-dimensional density/smoothing-length pass.
 ///
 /// This is the `NUMDIMS == 2` specialization of the bracketed Newton-like
@@ -1046,6 +1119,74 @@ pub fn scalar_gradients_at_hsml_2d(
         }
     })
     .collect()
+}
+
+/// Evaluate several scalar MLS gradients in one target-neighbor traversal
+/// while reusing caller-supplied inverse moments.
+///
+/// # Errors
+///
+/// Returns an error for mismatched/non-finite fields, moments, or geometry.
+pub fn scalar_gradients_batch_with_moments_2d(
+    positions: &[Vector2],
+    fields: &[&[f64]],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+) -> Result<Vec<Vec<Vector2>>, GeometryError> {
+    validate_geometry_columns(positions, smoothing_lengths, domain)?;
+    if moments.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "inverse_moments",
+            expected: positions.len(),
+            actual: moments.len(),
+        });
+    }
+    for field in fields {
+        validate_values(field, positions.len(), "scalar_values")?;
+    }
+    if positions.is_empty() {
+        return Ok(vec![Vec::new(); fields.len()]);
+    }
+    let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
+    let index = CellList2d::new(positions, domain, maximum_support)?;
+    let mut numerators = vec![vec![Vector2::ZERO; positions.len()]; fields.len()];
+    for (center, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        for neighbor in index.neighbors_within(position, hsml)? {
+            if neighbor == center {
+                continue;
+            }
+            let displacement = domain.displacement(position, positions[neighbor])?;
+            let weight = cubic_kernel_2d(displacement.norm(), hsml)?.weight;
+            for (field_index, values) in fields.iter().enumerate() {
+                let delta = values[neighbor] - values[center];
+                numerators[field_index][center].x -= weight * displacement.x * delta;
+                numerators[field_index][center].y -= weight * displacement.y * delta;
+            }
+        }
+    }
+    numerators
+        .into_iter()
+        .map(|field| {
+            field
+                .into_iter()
+                .zip(moments)
+                .enumerate()
+                .map(|(index, (numerator, moment))| {
+                    let gradient = moment.matrix.mul_vector(numerator);
+                    if gradient.is_finite() {
+                        Ok(gradient)
+                    } else {
+                        Err(GeometryError::NonFiniteResult {
+                            index,
+                            field: "scalar gradient",
+                            value: f64::NAN,
+                        })
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Unlimited vector MLS gradients.
@@ -1812,6 +1953,17 @@ mod tests {
             .collect();
         let scalar_gradient =
             scalar_gradients_at_hsml_2d(&positions, &scalar, &hsml, domain).unwrap();
+        let second_scalar: Vec<_> = positions.iter().map(|p| -p.x + 4.0 * p.y).collect();
+        let moments = inverse_moments_2d(&positions, &hsml, domain).unwrap();
+        let batch = scalar_gradients_batch_with_moments_2d(
+            &positions,
+            &[&scalar, &second_scalar],
+            &hsml,
+            domain,
+            &moments,
+        )
+        .unwrap();
+        assert_eq!(batch[0], scalar_gradient);
         let vector_gradient =
             vector_gradients_at_hsml_2d(&positions, &vector, &hsml, domain).unwrap();
         for gradient in scalar_gradient {
@@ -1823,6 +1975,10 @@ mod tests {
             assert!((gradient.xy + 2.0).abs() < 2.0e-13, "{gradient:?}");
             assert!((gradient.yx + 1.0).abs() < 2.0e-13, "{gradient:?}");
             assert!((gradient.yy - 4.0).abs() < 2.0e-13, "{gradient:?}");
+        }
+        for gradient in &batch[1] {
+            assert!((gradient.x + 1.0).abs() < 2.0e-13, "{gradient:?}");
+            assert!((gradient.y - 4.0).abs() < 2.0e-13, "{gradient:?}");
         }
     }
 
@@ -1840,6 +1996,46 @@ mod tests {
                 && moment.condition_number < MOMENT_CONDITION_LIMIT
                 && moment.matrix.is_finite()
         }));
+    }
+
+    #[test]
+    fn particle_divergence_matches_literal_density_loop_sum() {
+        let domain = Box2d::new(2.0, 2.0).unwrap();
+        let positions = vec![
+            Vector2::new(0.8, 0.9),
+            Vector2::new(1.1, 0.82),
+            Vector2::new(0.93, 1.18),
+            Vector2::new(1.24, 1.13),
+        ];
+        let velocities = vec![
+            Vector2::new(-0.2, 0.4),
+            Vector2::new(0.7, -0.1),
+            Vector2::new(0.15, 0.9),
+            Vector2::new(-0.6, 0.2),
+        ];
+        let hsml = vec![0.72, 0.64, 0.68, 0.75];
+        let dhsml = vec![0.83, 1.07, 0.91, 1.14];
+        let measured =
+            particle_divergence_at_hsml_2d(&positions, &velocities, &hsml, &dhsml, domain).unwrap();
+        for i in 0..positions.len() {
+            let mut kernel_sum = 0.0;
+            let mut numerator = 0.0;
+            for j in 0..positions.len() {
+                let displacement = domain.displacement(positions[i], positions[j]).unwrap();
+                let radius = displacement.norm();
+                if radius < hsml[i] {
+                    let kernel = cubic_kernel_2d(radius, hsml[i]).unwrap();
+                    kernel_sum += kernel.weight;
+                    if radius > 0.0 {
+                        numerator -= kernel.radial_derivative
+                            * displacement.dot(velocities[i] - velocities[j])
+                            / radius;
+                    }
+                }
+            }
+            let expected = numerator / kernel_sum * dhsml[i];
+            assert!((measured[i] - expected).abs() < 2.0e-15);
+        }
     }
 
     #[test]

@@ -11,18 +11,25 @@ use std::error::Error;
 use std::fmt;
 
 use crate::meshless_2d::{
-    Box2d, GeometryError, InteractionPair2d, MeshlessPoint2d, Vector2, density_at_hsml_2d,
+    Box2d, FaceClosure2d, GeometryError, InteractionPair2d, InverseMoment2d, MeshlessFace2d,
+    MeshlessPoint2d, Vector2, cubic_kernel_2d, density_at_hsml_2d, face_closure_diagnostics_2d,
     interacting_pairs_2d, inverse_moments_2d, meshless_face_geometry_2d,
-    scalar_gradients_at_hsml_2d, solve_public_c_smoothing_lengths_from_seeds_2d,
+    particle_divergence_at_hsml_2d, scalar_gradients_batch_with_moments_2d,
+    solve_public_c_smoothing_lengths_from_seeds_2d,
 };
 use crate::mhd::{
     DednerOptions, FluxFrame1d, HlldOptions, IdealMhdPrimitive1d, MhdError, MhdRiemannMethod,
-    Vector3, dedner_hyperbolic_source, dedner_parabolic_source, fast_magnetosonic_speed,
+    Vector3, dedner_hyperbolic_source, fast_magnetosonic_speed,
 };
 use crate::mhd_2d::{HlldResult2d, Mhd2dError, hlld_riemann_2d};
 
 const LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION: f64 = 0.25;
 const MIN_REAL_NUMBER: f64 = 1.0e-56;
+const EPSILON_ENTROPIC_BIG: f64 = 0.5;
+const EPSILON_ENTROPIC_SMALL: f64 = 1.0e-3;
+// allvars.h raises CONDITION_NUMBER_DANGER to 1e7 for the non-cooling MHD
+// build used by Brio-Wu.
+const CONDITION_NUMBER_DANGER_SQUARED: f64 = 1.0e14;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DivergenceControl2d {
@@ -65,6 +72,7 @@ pub struct MhdMfmState2d {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MhdPrimitiveColumns2d {
     pub density: Vec<f64>,
+    pub dhsml_factor: Vec<f64>,
     pub pressure: Vec<f64>,
     pub magnetic: Vec<Vector3>,
     pub cleaning_scalar: Vec<f64>,
@@ -76,12 +84,31 @@ pub struct MhdMfmRates2d {
     pub total_energy: Vec<f64>,
     pub magnetic_volume: Vec<Vector3>,
     pub cleaning_mass: Vec<f64>,
+    /// Exponential Dedner damping inverse time retained for kick/drift
+    /// operator splitting.
+    pub cleaning_damping_rate: Vec<f64>,
     pub acceleration: Vec<Vector3>,
     pub specific_internal_energy: Vec<f64>,
     pub maximum_signal_speed: Vec<f64>,
+    pub global_fastest_wave_speed: f64,
     pub velocity_divergence: Vec<f64>,
     pub magnetic_divergence: Vec<f64>,
+    /// Integrated, clipped `divB` retained by the public force loop and used
+    /// to relax the magnetic slope limiter on the next force call.
+    pub stored_magnetic_divergence: Vec<f64>,
     pub pair_count: usize,
+    pub entropic_pair_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MhdRateContext2d<'a> {
+    /// Stored integrated divergence from the preceding force evaluation.
+    /// `None` is the restart-zero initialization state.
+    pub previous_stored_magnetic_divergence: Option<&'a [f64]>,
+    /// Physical step used by `Get_DtB_FaceArea_Limiter`.
+    pub timestep: Option<f64>,
+    /// Courant factor paired with `timestep`.
+    pub courant_factor: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,12 +257,20 @@ impl MhdMfmState2d {
     /// Returns an error when density reconstruction or primitive validation fails.
     pub fn primitive_columns(&self) -> Result<MhdPrimitiveColumns2d, MhdEvolution2dError> {
         self.validate()?;
-        let density = density_values(
+        let density_estimates = density_at_hsml_2d(
             &self.positions,
             &self.masses,
             &self.smoothing_lengths,
             self.domain,
         )?;
+        let density: Vec<f64> = density_estimates
+            .iter()
+            .map(|estimate| estimate.density)
+            .collect();
+        let dhsml_factor = density_estimates
+            .iter()
+            .map(|estimate| estimate.dhsml_factor)
+            .collect();
         let mut pressure = Vec::with_capacity(self.positions.len());
         let mut magnetic = Vec::with_capacity(self.positions.len());
         let mut cleaning_scalar = Vec::with_capacity(self.positions.len());
@@ -258,6 +293,7 @@ impl MhdMfmState2d {
         }
         Ok(MhdPrimitiveColumns2d {
             density,
+            dhsml_factor,
             pressure,
             magnetic,
             cleaning_scalar,
@@ -346,7 +382,7 @@ struct Gradients2d {
 struct GradientLimiterGeometry2d {
     pairs: Vec<InteractionPair2d>,
     maximum_neighbor_distance: Vec<f64>,
-    condition_number: Vec<f64>,
+    moments: Vec<InverseMoment2d>,
 }
 
 #[derive(Clone, Copy)]
@@ -379,18 +415,59 @@ pub fn mhd_mfm_spatial_rates_2d(
     state: &MhdMfmState2d,
     controls: DivergenceControl2d,
 ) -> Result<MhdMfmRates2d, MhdEvolution2dError> {
+    mhd_mfm_spatial_rates_with_context_2d(state, controls, MhdRateContext2d::default())
+}
+
+/// Evaluate the 2-D MFM operator with the force-history and current-step
+/// inputs used by the public magnetic limiters.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, history, timestep, geometry, or
+/// Riemann arithmetic.
+#[allow(clippy::too_many_lines)]
+pub fn mhd_mfm_spatial_rates_with_context_2d(
+    state: &MhdMfmState2d,
+    controls: DivergenceControl2d,
+    context: MhdRateContext2d<'_>,
+) -> Result<MhdMfmRates2d, MhdEvolution2dError> {
     state.validate()?;
     validate_controls(controls)?;
+    validate_rate_context(state.positions.len(), context)?;
     let primitive = state.primitive_columns()?;
-    let gradients = primitive_gradients(state, &primitive)?;
+    let gradients = primitive_gradients(
+        state,
+        &primitive,
+        context.previous_stored_magnetic_divergence,
+    )?;
+    let planar_velocities: Vec<_> = state
+        .velocities
+        .iter()
+        .map(|velocity| Vector2::new(velocity.x, velocity.y))
+        .collect();
+    let velocity_divergence = particle_divergence_at_hsml_2d(
+        &state.positions,
+        &planar_velocities,
+        &state.smoothing_lengths,
+        &primitive.dhsml_factor,
+        state.domain,
+    )?;
     let moments = inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
+    let face_closure = face_closure_diagnostics_2d(
+        &state.positions,
+        &state.masses,
+        &state.smoothing_lengths,
+        state.domain,
+    )?;
     let count = state.positions.len();
     let mut momentum = vec![Vector3::ZERO; count];
     let mut total_energy = vec![0.0; count];
     let mut magnetic_volume = vec![Vector3::ZERO; count];
     let mut cleaning_mass = vec![0.0; count];
+    let mut cleaning_damping_rate = vec![0.0; count];
     let mut magnetic_divergence_volume = vec![0.0; count];
     let mut dedner_jump = vec![Vector3::ZERO; count];
+    let mut entropic_pair_count = 0_usize;
     let mut maximum_signal_speed = (0..count)
         .map(|i| fast_magnetosonic_speed(primitive_at(state, &primitive, i), state.gamma))
         .collect::<Result<Vec<_>, _>>()?;
@@ -465,7 +542,19 @@ pub fn mhd_mfm_spatial_rates_2d(
             return Err(MhdError::NoAdmissibleContactFlux.into());
         }
         let pair_momentum = result.flux.momentum * face.area;
-        let pair_energy = result.flux.total_energy * face.area;
+        let (pair_energy, selected_entropic) = apply_entropic_pdv_energy_2d(
+            result.flux.total_energy * face.area,
+            result,
+            face,
+            displacement,
+            state,
+            &primitive,
+            &moments,
+            &face_closure,
+            pair.i,
+            pair.j,
+        )?;
+        entropic_pair_count += usize::from(selected_entropic);
         let mut pair_magnetic = result.flux.magnetic * face.area;
         let normal3 = Vector3::new(n.x, n.y, 0.0);
         if controls.dedner {
@@ -505,12 +594,12 @@ pub fn mhd_mfm_spatial_rates_2d(
             .sqrt();
         maximum.max(isotropic_fast.max(0.5 * maximum_signal_speed[i]))
     });
-    let velocity_divergence = velocity_divergence(state)?;
     let magnetic_divergence: Vec<f64> = magnetic_divergence_volume
         .iter()
         .enumerate()
         .map(|(i, &integrated)| integrated / (state.masses[i] / primitive.density[i]))
         .collect();
+    let mut stored_magnetic_divergence = magnetic_divergence_volume.clone();
     for i in 0..count {
         let volume = state.masses[i] / primitive.density[i];
         let particle_size = volume.sqrt();
@@ -521,6 +610,14 @@ pub fn mhd_mfm_spatial_rates_2d(
             total_energy[i] += scale * state.velocities[i].dot(primitive.magnetic[i]);
             magnetic_volume[i] = magnetic_volume[i] + state.velocities[i] * scale;
         }
+        let magnetic_rate_scale = magnetic_face_closure_rate_scale(
+            state,
+            &primitive,
+            &face_closure,
+            i,
+            magnetic_volume[i],
+            context,
+        );
         if controls.dedner {
             let uncorrected_fourth = dedner_uncorrected_fourth(
                 magnetic_volume[i],
@@ -540,23 +637,25 @@ pub fn mhd_mfm_spatial_rates_2d(
             let correction = dedner_jump[i] * scale;
             magnetic_volume[i] = magnetic_volume[i] + correction;
             total_energy[i] += primitive.magnetic[i].dot(correction);
-            let phi = primitive.cleaning_scalar[i];
             let clipped_divergence = clip_normalized_magnetic_divergence(
                 magnetic_divergence[i],
                 primitive.magnetic[i],
                 state.smoothing_lengths[i],
             );
+            stored_magnetic_divergence[i] = volume * clipped_divergence;
             cleaning_mass[i] += state.masses[i]
-                * (dedner_hyperbolic_source(
+                * dedner_hyperbolic_source(
                     clipped_divergence,
                     0.5 * cleaning_speed,
                     controls.hyperbolic_sigma,
-                )? + dedner_parabolic_source(
-                    phi,
-                    2.0 * global_fastest_wave_speed,
-                    particle_size,
-                    controls.parabolic_sigma,
-                )?);
+                )?;
+            cleaning_damping_rate[i] =
+                controls.parabolic_sigma * global_fastest_wave_speed / particle_size;
+        }
+        if magnetic_rate_scale < 1.0 {
+            total_energy[i] +=
+                primitive.magnetic[i].dot(magnetic_volume[i] * (magnetic_rate_scale - 1.0));
+            magnetic_volume[i] = magnetic_volume[i] * magnetic_rate_scale;
         }
     }
     let mut acceleration = Vec::with_capacity(count);
@@ -581,12 +680,16 @@ pub fn mhd_mfm_spatial_rates_2d(
         total_energy,
         magnetic_volume,
         cleaning_mass,
+        cleaning_damping_rate,
         acceleration,
         specific_internal_energy,
         maximum_signal_speed,
+        global_fastest_wave_speed,
         velocity_divergence,
         magnetic_divergence,
+        stored_magnetic_divergence,
         pair_count: pairs.len(),
+        entropic_pair_count,
     })
 }
 
@@ -642,6 +745,166 @@ fn solve_hlld_with_public_retries_2d(
     }
 }
 
+#[allow(
+    clippy::float_cmp,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn apply_entropic_pdv_energy_2d(
+    raw_energy: f64,
+    result: HlldResult2d,
+    face: MeshlessFace2d,
+    displacement: Vector2,
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    moments: &[InverseMoment2d],
+    closure: &[FaceClosure2d],
+    i: usize,
+    j: usize,
+) -> Result<(f64, bool), MhdEvolution2dError> {
+    let face_velocity_i = state.velocities[i].x.mul_add(
+        face.unit_normal.x,
+        state.velocities[i].y * face.unit_normal.y,
+    );
+    let face_velocity_j = state.velocities[j].x.mul_add(
+        face.unit_normal.x,
+        state.velocities[j].y * face.unit_normal.y,
+    );
+    let face_velocity = 0.5 * (face_velocity_i + face_velocity_j);
+    // The Rust HLLD boundary receives lab-frame states.  The C solver first
+    // removes the midpoint frame, so its S_M is this relative contact speed.
+    let contact_speed_in_face_frame = result.contact_speed - face_velocity;
+    let sound_i = (state.gamma * primitive.pressure[i] / primitive.density[i]).sqrt();
+    let sound_j = (state.gamma * primitive.pressure[j] / primitive.density[j]).sqrt();
+    let speed_ratio = contact_speed_in_face_frame.abs() / sound_i.min(sound_j);
+    let closure_leak =
+        0.5 * (closure[i].legacy_dimensionless_leak + closure[j].legacy_dimensionless_leak);
+    if speed_ratio >= EPSILON_ENTROPIC_BIG && closure_leak <= 1.0 {
+        return Ok((raw_energy, false));
+    }
+
+    let star_gas_pressure = result.star_total_pressure - 0.5 * result.face_magnetic.squared_norm();
+    if !star_gas_pressure.is_finite() {
+        return Err(invalid(Some(i), "star_gas_pressure", star_gas_pressure));
+    }
+    let distance = displacement.norm();
+    let radial = displacement / distance;
+    let relative_radial_velocity = (state.velocities[i] - state.velocities[j]).x.mul_add(
+        radial.x,
+        (state.velocities[i].y - state.velocities[j].y) * radial.y,
+    );
+    let kernel_i = cubic_kernel_2d(distance, state.smoothing_lengths[i])?;
+    let kernel_j = cubic_kernel_2d(distance, state.smoothing_lengths[j])?;
+    let volume_i = state.masses[i] / primitive.density[i];
+    let volume_j = state.masses[j] / primitive.density[j];
+    let pressure_area = star_gas_pressure * face.area;
+    let pdv_factor = star_gas_pressure * relative_radial_velocity;
+    let pdv_i =
+        kernel_i.radial_derivative * volume_i * volume_i * primitive.dhsml_factor[i] * pdv_factor;
+    let pdv_j =
+        kernel_j.radial_derivative * volume_j * volume_j * primitive.dhsml_factor[j] * pdv_factor;
+    let old_energy = pressure_area * (contact_speed_in_face_frame + face_velocity);
+    let new_energy = 0.5 * (pdv_i - pdv_j + pressure_area * (face_velocity_i + face_velocity_j));
+
+    let condition_i_squared = moments[i].condition_number.powi(2);
+    let condition_j_squared = moments[j].condition_number.powi(2);
+    let condition_threshold = CONDITION_NUMBER_DANGER_SQUARED - condition_i_squared;
+    let mut use_entropic_energy = true;
+    if speed_ratio > EPSILON_ENTROPIC_SMALL
+        && condition_j_squared < condition_threshold
+        && primitive.pressure[i] / primitive.density[i]
+            != primitive.pressure[j] / primitive.density[j]
+    {
+        if primitive.pressure[i] / primitive.density[i]
+            > primitive.pressure[j] / primitive.density[j]
+        {
+            let thermal_change_j = -old_energy + pressure_area * face_velocity_j;
+            if thermal_change_j > 0.0
+                || (thermal_change_j < 0.0
+                    && thermal_change_j > -new_energy + pressure_area * face_velocity_j)
+            {
+                use_entropic_energy = false;
+            }
+        } else {
+            let thermal_change_i = old_energy - pressure_area * face_velocity_i;
+            if thermal_change_i > 0.0
+                || (thermal_change_i < 0.0
+                    && thermal_change_i > new_energy - pressure_area * face_velocity_i)
+            {
+                use_entropic_energy = false;
+            }
+        }
+    }
+    if condition_j_squared >= condition_threshold {
+        use_entropic_energy = true;
+    }
+    let energy = if use_entropic_energy {
+        raw_energy + new_energy - old_energy
+    } else {
+        raw_energy
+    };
+    if !energy.is_finite() {
+        return Err(invalid(Some(i), "entropic_pair_energy", energy));
+    }
+    Ok((energy, use_entropic_energy))
+}
+
+fn magnetic_face_closure_rate_scale(
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    closure: &[FaceClosure2d],
+    i: usize,
+    pre_dedner_jump_rate: Vector3,
+    context: MhdRateContext2d<'_>,
+) -> f64 {
+    let (Some(timestep), Some(courant_factor)) = (context.timestep, context.courant_factor) else {
+        return 1.0;
+    };
+    let area_sum = closure[i].net_area_vector.x.abs() + closure[i].net_area_vector.y.abs();
+    let expected_area = 2.0 * std::f64::consts::PI * state.smoothing_lengths[i];
+    if area_sum / expected_area <= 0.001 {
+        return 1.0;
+    }
+    let volume = state.masses[i] / primitive.density[i];
+    let magnetic_volume_norm = state.magnetic_volume[i].squared_norm().sqrt();
+    let pressure_allowance = (2.0 * primitive.pressure[i]).sqrt() * volume;
+    magnetic_face_closure_scale(
+        area_sum,
+        expected_area,
+        magnetic_volume_norm,
+        pressure_allowance,
+        pre_dedner_jump_rate.squared_norm().sqrt(),
+        timestep,
+        courant_factor,
+    )
+}
+
+fn magnetic_face_closure_scale(
+    area_sum: f64,
+    expected_area: f64,
+    magnetic_volume_norm: f64,
+    pressure_allowance: f64,
+    pre_dedner_jump_rate_norm: f64,
+    timestep: f64,
+    courant_factor: f64,
+) -> f64 {
+    if area_sum / expected_area <= 0.001 {
+        return 1.0;
+    }
+    let maximum_magnetic_volume =
+        magnetic_volume_norm.max(pressure_allowance.min(10.0 * magnetic_volume_norm));
+    let tolerance = (courant_factor / 0.2)
+        * 0.01_f64.max(expected_area / (200.0 * area_sum))
+        * maximum_magnetic_volume;
+    let predicted_change = pre_dedner_jump_rate_norm * timestep;
+    if predicted_change > tolerance {
+        tolerance / predicted_change
+    } else {
+        1.0
+    }
+}
+
 fn dedner_uncorrected_fourth(
     raw_magnetic_rate: Vector3,
     extensive_magnetic: Vector3,
@@ -687,6 +950,67 @@ pub fn global_mhd_courant_timestep_2d(
         let candidate = courant_factor * particle_size / (0.5 * rates.maximum_signal_speed[i]);
         if !candidate.is_finite() || candidate <= 0.0 {
             return Err(invalid(Some(i), "courant_timestep", candidate));
+        }
+        timestep = timestep.min(candidate);
+    }
+    Ok(timestep)
+}
+
+/// Return the minimum non-cosmological timestep bound enabled by the public
+/// Brio-Wu build before integer power-of-two quantization.
+///
+/// This combines the hydro-acceleration, standard MHD Courant, Dedner
+/// isotropic-wave, and velocity-divergence bounds. With `SELFGRAVITY_OFF`, the
+/// public force-softening radius used by the acceleration criterion is the
+/// adaptive gas smoothing length.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, rates, Courant factor, or integration
+/// accuracy.
+pub fn global_public_mhd_timestep_bound_2d(
+    state: &MhdMfmState2d,
+    rates: &MhdMfmRates2d,
+    courant_factor: f64,
+    integration_accuracy: f64,
+) -> Result<f64, MhdEvolution2dError> {
+    state.validate()?;
+    validate_rate_lengths(rates, state.positions.len())?;
+    if !courant_factor.is_finite() || courant_factor <= 0.0 || courant_factor > 0.5 {
+        return Err(invalid(None, "courant_factor", courant_factor));
+    }
+    if !integration_accuracy.is_finite() || integration_accuracy <= 0.0 {
+        return Err(invalid(None, "integration_accuracy", integration_accuracy));
+    }
+    let primitive = state.primitive_columns()?;
+    let mut timestep = f64::INFINITY;
+    for i in 0..state.positions.len() {
+        let acceleration = rates.acceleration[i].squared_norm().sqrt().max(1.0e-30);
+        // 2 * ErrTolIntAccuracy * KERNEL_CORE_SIZE with the cubic kernel's
+        // KERNEL_CORE_SIZE=1/2 reduces to ErrTolIntAccuracy.
+        let acceleration_bound =
+            (integration_accuracy * state.smoothing_lengths[i] / acceleration).sqrt();
+        let particle_size = (state.masses[i] / primitive.density[i]).sqrt();
+        let courant_bound = courant_factor * particle_size / (0.5 * rates.maximum_signal_speed[i]);
+        let sound_squared = state.gamma * primitive.pressure[i] / primitive.density[i];
+        let phi_over_signal =
+            primitive.cleaning_scalar[i] / rates.maximum_signal_speed[i].max(MIN_REAL_NUMBER);
+        let dedner_speed = (sound_squared
+            + (primitive.magnetic[i].squared_norm() + phi_over_signal * phi_over_signal)
+                / primitive.density[i])
+            .sqrt();
+        let dedner_bound = 0.8 * courant_factor * particle_size / dedner_speed;
+        let divergence_bound = if rates.velocity_divergence[i] == 0.0 {
+            f64::INFINITY
+        } else {
+            1.5 / rates.velocity_divergence[i].abs()
+        };
+        let candidate = acceleration_bound
+            .min(courant_bound)
+            .min(dedner_bound)
+            .min(divergence_bound);
+        if !candidate.is_finite() || candidate <= 0.0 {
+            return Err(invalid(Some(i), "public_mhd_timestep", candidate));
         }
         timestep = timestep.min(candidate);
     }
@@ -783,6 +1107,240 @@ pub fn advance_mhd_kdk_adaptive_2d(
     desired_neighbors: f64,
     neighbor_tolerance: f64,
 ) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
+    advance_mhd_kdk_adaptive_impl_2d(
+        state,
+        old_rates,
+        timestep,
+        minimum_specific_internal_energy,
+        controls,
+        desired_neighbors,
+        neighbor_tolerance,
+        None,
+    )
+}
+
+/// Advance the adaptive synchronized KDK path while carrying the public
+/// force-history and timestep-dependent magnetic limiters into the endpoint
+/// force evaluation.
+///
+/// # Errors
+///
+/// Returns the same errors as [`advance_mhd_kdk_adaptive_2d`], plus invalid
+/// Courant context.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_public_mhd_kdk_adaptive_2d(
+    state: &MhdMfmState2d,
+    old_rates: &MhdMfmRates2d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    controls: DivergenceControl2d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    courant_factor: f64,
+) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
+    advance_public_mhd_kdk_primitive_2d(
+        state,
+        old_rates,
+        timestep,
+        minimum_specific_internal_energy,
+        controls,
+        desired_neighbors,
+        neighbor_tolerance,
+        courant_factor,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn advance_public_mhd_kdk_primitive_2d(
+    state: &MhdMfmState2d,
+    old_rates: &MhdMfmRates2d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    controls: DivergenceControl2d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    courant_factor: f64,
+) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
+    state.validate()?;
+    validate_rate_lengths(old_rates, state.positions.len())?;
+    validate_rate_context(
+        state.positions.len(),
+        MhdRateContext2d {
+            previous_stored_magnetic_divergence: Some(&old_rates.stored_magnetic_divergence),
+            timestep: Some(timestep),
+            courant_factor: Some(courant_factor),
+        },
+    )?;
+    if !minimum_specific_internal_energy.is_finite() || minimum_specific_internal_energy < 0.0 {
+        return Err(invalid(
+            None,
+            "minimum_specific_internal_energy",
+            minimum_specific_internal_energy,
+        ));
+    }
+    let primitive = state.primitive_columns()?;
+    let half_timestep = 0.5 * timestep;
+    let count = state.positions.len();
+    let mut half_velocity = Vec::with_capacity(count);
+    let mut half_internal = Vec::with_capacity(count);
+    let mut half_magnetic = Vec::with_capacity(count);
+    let mut half_cleaning = Vec::with_capacity(count);
+    let mut predicted_velocity = Vec::with_capacity(count);
+    let mut predicted_internal = Vec::with_capacity(count);
+    let mut predicted_magnetic = Vec::with_capacity(count);
+    let mut predicted_cleaning = Vec::with_capacity(count);
+    let mut predicted_hsml = Vec::with_capacity(count);
+    for i in 0..count {
+        half_velocity.push(state.velocities[i] + old_rates.acceleration[i] * half_timestep);
+        half_internal.push(limited_internal_energy_update_2d(
+            state.specific_internal_energy[i],
+            old_rates.specific_internal_energy[i],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?);
+        half_magnetic.push(state.magnetic_volume[i] + old_rates.magnetic_volume[i] * half_timestep);
+        let cleaning_kick = kick_cleaning_mass_public_2d(
+            state.cleaning_mass[i],
+            state.cleaning_mass[i],
+            old_rates.cleaning_mass[i],
+            old_rates.cleaning_damping_rate[i],
+            half_timestep,
+            state.masses[i],
+            primitive.density[i],
+            primitive.pressure[i],
+            primitive.magnetic[i],
+            state.gamma,
+            old_rates.maximum_signal_speed[i],
+            old_rates.global_fastest_wave_speed,
+        );
+        half_cleaning.push(cleaning_kick.value);
+        predicted_velocity.push(state.velocities[i] + old_rates.acceleration[i] * timestep);
+        predicted_internal.push(limited_internal_energy_update_2d(
+            state.specific_internal_energy[i],
+            old_rates.specific_internal_energy[i],
+            timestep,
+            minimum_specific_internal_energy,
+        )?);
+        predicted_magnetic.push(state.magnetic_volume[i] + old_rates.magnetic_volume[i] * timestep);
+        predicted_cleaning.push(predict_cleaning_mass_2d(
+            if cleaning_kick.reset_predicted {
+                0.0
+            } else {
+                state.cleaning_mass[i]
+            },
+            cleaning_kick.effective_rate,
+            old_rates.cleaning_damping_rate[i],
+            timestep,
+        ));
+        let divergence_increment = (old_rates.velocity_divergence[i] * timestep).clamp(-0.3, 0.3);
+        predicted_hsml.push(state.smoothing_lengths[i] * (0.5 * divergence_increment).exp());
+    }
+    let positions = state
+        .positions
+        .iter()
+        .zip(&half_velocity)
+        .map(|(&position, &velocity)| {
+            state
+                .domain
+                .wrap(position + Vector2::new(velocity.x, velocity.y) * timestep)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let smoothing_lengths: Vec<f64> = solve_public_c_smoothing_lengths_from_seeds_2d(
+        &positions,
+        &state.masses,
+        &predicted_hsml,
+        state.domain,
+        desired_neighbors,
+        neighbor_tolerance,
+    )?
+    .into_iter()
+    .map(|particle| particle.smoothing_length)
+    .collect();
+    let predicted_state = MhdMfmState2d {
+        positions: positions.clone(),
+        masses: state.masses.clone(),
+        velocities: predicted_velocity,
+        specific_internal_energy: predicted_internal,
+        smoothing_lengths: smoothing_lengths.clone(),
+        magnetic_volume: predicted_magnetic,
+        cleaning_mass: predicted_cleaning,
+        domain: state.domain,
+        gamma: state.gamma,
+    };
+    predicted_state.validate()?;
+    let mut rates = mhd_mfm_spatial_rates_with_context_2d(
+        &predicted_state,
+        controls,
+        MhdRateContext2d {
+            previous_stored_magnetic_divergence: Some(&old_rates.stored_magnetic_divergence),
+            timestep: Some(timestep),
+            courant_factor: Some(courant_factor),
+        },
+    )?;
+    let predicted_primitive = predicted_state.primitive_columns()?;
+    let mut final_velocity = Vec::with_capacity(count);
+    let mut final_internal = Vec::with_capacity(count);
+    let mut final_magnetic = Vec::with_capacity(count);
+    let mut final_cleaning = Vec::with_capacity(count);
+    for i in 0..count {
+        final_velocity.push(half_velocity[i] + rates.acceleration[i] * half_timestep);
+        final_internal.push(limited_internal_energy_update_2d(
+            half_internal[i],
+            rates.specific_internal_energy[i],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?);
+        final_magnetic.push(half_magnetic[i] + rates.magnetic_volume[i] * half_timestep);
+        let endpoint_particle_size = (state.masses[i] / predicted_primitive.density[i]).sqrt();
+        let endpoint_damping_rate =
+            controls.parabolic_sigma * old_rates.global_fastest_wave_speed / endpoint_particle_size;
+        let cleaning_kick = kick_cleaning_mass_public_2d(
+            half_cleaning[i],
+            predicted_state.cleaning_mass[i],
+            rates.cleaning_mass[i],
+            endpoint_damping_rate,
+            half_timestep,
+            state.masses[i],
+            predicted_primitive.density[i],
+            predicted_primitive.pressure[i],
+            predicted_primitive.magnetic[i],
+            state.gamma,
+            rates.maximum_signal_speed[i],
+            old_rates.global_fastest_wave_speed,
+        );
+        final_cleaning.push(cleaning_kick.value);
+        rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+        rates.cleaning_damping_rate[i] = endpoint_damping_rate;
+    }
+    let final_state = MhdMfmState2d {
+        positions,
+        masses: state.masses.clone(),
+        velocities: final_velocity,
+        specific_internal_energy: final_internal,
+        smoothing_lengths,
+        magnetic_volume: final_magnetic,
+        cleaning_mass: final_cleaning,
+        domain: state.domain,
+        gamma: state.gamma,
+    };
+    final_state.validate()?;
+    Ok(MhdKdkResult2d {
+        state: final_state,
+        rates,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_mhd_kdk_adaptive_impl_2d(
+    state: &MhdMfmState2d,
+    old_rates: &MhdMfmRates2d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    controls: DivergenceControl2d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    courant_factor: Option<f64>,
+) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
     state.validate()?;
     validate_rate_lengths(old_rates, state.positions.len())?;
     if !timestep.is_finite() || timestep <= 0.0 {
@@ -834,7 +1392,15 @@ pub fn advance_mhd_kdk_adaptive_2d(
         &half,
         minimum_specific_internal_energy,
     )?;
-    let rates = mhd_mfm_spatial_rates_2d(&half_state, controls)?;
+    let rates = mhd_mfm_spatial_rates_with_context_2d(
+        &half_state,
+        controls,
+        MhdRateContext2d {
+            previous_stored_magnetic_divergence: Some(&old_rates.stored_magnetic_divergence),
+            timestep: courant_factor.map(|_| timestep),
+            courant_factor,
+        },
+    )?;
     let final_conserved = kick_extensive(&half, &rates, 0.5 * timestep);
     let final_state = recover_state(
         half_state.positions,
@@ -912,6 +1478,93 @@ fn kick_extensive(
     }
 }
 
+fn limited_internal_energy_update_2d(
+    previous: f64,
+    rate: f64,
+    timestep: f64,
+    floor: f64,
+) -> Result<f64, MhdEvolution2dError> {
+    let candidate = previous + timestep * rate;
+    if !previous.is_finite()
+        || previous <= 0.0
+        || !rate.is_finite()
+        || !timestep.is_finite()
+        || timestep < 0.0
+        || !floor.is_finite()
+        || floor < 0.0
+        || !candidate.is_finite()
+    {
+        return Err(invalid(None, "internal_energy_update", candidate));
+    }
+    Ok(if candidate < 0.5 * previous {
+        0.5 * previous
+    } else {
+        candidate
+    }
+    .max(floor))
+}
+
+fn predict_cleaning_mass_2d(current: f64, rate: f64, damping_rate: f64, timestep: f64) -> f64 {
+    (current + timestep * rate) * (-timestep * damping_rate).exp()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CleaningKick2d {
+    value: f64,
+    effective_rate: f64,
+    reset_predicted: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kick_cleaning_mass_public_2d(
+    current: f64,
+    predicted_for_guard: f64,
+    rate: f64,
+    damping_rate: f64,
+    timestep: f64,
+    mass: f64,
+    density: f64,
+    pressure: f64,
+    magnetic: Vector3,
+    gamma: f64,
+    maximum_signal_speed: f64,
+    global_fastest_wave_speed: f64,
+) -> CleaningKick2d {
+    let phi_abs = (predicted_for_guard / mass).abs();
+    let magnetic_norm = magnetic.squared_norm().sqrt();
+    let local_wave_speed = (gamma * pressure / density + magnetic.squared_norm() / density).sqrt();
+    let fastest = local_wave_speed
+        .max(0.5 * maximum_signal_speed.abs())
+        .max(global_fastest_wave_speed);
+    let magnetic_wave_scale = fastest * magnetic_norm;
+    let mut updated = current;
+    let mut effective_rate = rate;
+    let mut reset_predicted = false;
+    if phi_abs > 0.0 && magnetic_wave_scale > 0.0 {
+        if phi_abs > 10_000.0 * magnetic_wave_scale {
+            updated = 0.0;
+            effective_rate = 0.0;
+            reset_predicted = true;
+        } else if phi_abs > 10.0 * magnetic_wave_scale {
+            effective_rate = if current > 0.0 {
+                rate.min(0.0)
+            } else {
+                rate.max(0.0)
+            };
+            if current != 0.0 {
+                updated *= (-((timestep * effective_rate).abs() / current.abs())).exp();
+            }
+        } else {
+            updated += timestep * rate;
+        }
+    }
+    CleaningKick2d {
+        value: updated * (-timestep * damping_rate).exp(),
+        effective_rate,
+        reset_predicted,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recover_state(
     positions: Vec<Vector2>,
@@ -958,43 +1611,135 @@ fn recover_state(
     Ok(state)
 }
 
+#[allow(clippy::too_many_lines)]
 fn primitive_gradients(
     state: &MhdMfmState2d,
     primitive: &MhdPrimitiveColumns2d,
+    previous_stored_magnetic_divergence: Option<&[f64]>,
 ) -> Result<Gradients2d, MhdEvolution2dError> {
     let velocity = vector_columns(&state.velocities);
     let magnetic = vector_columns(&primitive.magnetic);
     let limiter = gradient_limiter_geometry(state)?;
-    Ok(Gradients2d {
-        density: gradient(
+    let fields: [&[f64]; 9] = [
+        &primitive.density,
+        &primitive.pressure,
+        &velocity[0],
+        &velocity[1],
+        &velocity[2],
+        &magnetic[0],
+        &magnetic[1],
+        &magnetic[2],
+        &primitive.cleaning_scalar,
+    ];
+    let mut raw = scalar_gradients_batch_with_moments_2d(
+        &state.positions,
+        &fields,
+        &state.smoothing_lengths,
+        state.domain,
+        &limiter.moments,
+    )?;
+    let magnetic_distance_fraction: Vec<f64> = (0..state.positions.len())
+        .map(|i| {
+            let base = base_gradient_limiter_fraction(limiter.moments[i].condition_number);
+            let integrated_divergence =
+                previous_stored_magnetic_divergence.map_or(0.0, |values| values[i]);
+            let volume = state.masses[i] / primitive.density[i];
+            let normalization = (1.0e-37
+                + 2.0 * primitive.pressure[i] * volume * volume
+                + state.magnetic_volume[i].squared_norm())
+            .sqrt();
+            let q = integrated_divergence.abs() * state.smoothing_lengths[i] / normalization;
+            relaxed_magnetic_gradient_fraction(base, q)
+        })
+        .collect();
+    let cleaning = raw.pop().expect("nine gradient fields");
+    let magnetic_z = raw.pop().expect("nine gradient fields");
+    let magnetic_y = raw.pop().expect("nine gradient fields");
+    let magnetic_x = raw.pop().expect("nine gradient fields");
+    let velocity_z = raw.pop().expect("nine gradient fields");
+    let velocity_y = raw.pop().expect("nine gradient fields");
+    let velocity_x = raw.pop().expect("nine gradient fields");
+    let pressure = raw.pop().expect("nine gradient fields");
+    let density = raw.pop().expect("nine gradient fields");
+    let gradients = Gradients2d {
+        density: limit_precomputed_gradient(
             state,
             &primitive.density,
             &limiter,
             GradientConstraint2d::Positive,
-        )?,
-        pressure: gradient(
+            density,
+            None,
+        ),
+        pressure: limit_precomputed_gradient(
             state,
             &primitive.pressure,
             &limiter,
             GradientConstraint2d::Positive,
-        )?,
+            pressure,
+            None,
+        ),
         velocity: [
-            gradient(state, &velocity[0], &limiter, GradientConstraint2d::Signed)?,
-            gradient(state, &velocity[1], &limiter, GradientConstraint2d::Signed)?,
-            gradient(state, &velocity[2], &limiter, GradientConstraint2d::Signed)?,
+            limit_precomputed_gradient(
+                state,
+                &velocity[0],
+                &limiter,
+                GradientConstraint2d::Signed,
+                velocity_x,
+                None,
+            ),
+            limit_precomputed_gradient(
+                state,
+                &velocity[1],
+                &limiter,
+                GradientConstraint2d::Signed,
+                velocity_y,
+                None,
+            ),
+            limit_precomputed_gradient(
+                state,
+                &velocity[2],
+                &limiter,
+                GradientConstraint2d::Signed,
+                velocity_z,
+                None,
+            ),
         ],
         magnetic: [
-            gradient(state, &magnetic[0], &limiter, GradientConstraint2d::Signed)?,
-            gradient(state, &magnetic[1], &limiter, GradientConstraint2d::Signed)?,
-            gradient(state, &magnetic[2], &limiter, GradientConstraint2d::Signed)?,
+            limit_precomputed_gradient(
+                state,
+                &magnetic[0],
+                &limiter,
+                GradientConstraint2d::Signed,
+                magnetic_x,
+                Some(&magnetic_distance_fraction),
+            ),
+            limit_precomputed_gradient(
+                state,
+                &magnetic[1],
+                &limiter,
+                GradientConstraint2d::Signed,
+                magnetic_y,
+                Some(&magnetic_distance_fraction),
+            ),
+            limit_precomputed_gradient(
+                state,
+                &magnetic[2],
+                &limiter,
+                GradientConstraint2d::Signed,
+                magnetic_z,
+                Some(&magnetic_distance_fraction),
+            ),
         ],
-        cleaning: gradient(
+        cleaning: limit_precomputed_gradient(
             state,
             &primitive.cleaning_scalar,
             &limiter,
             GradientConstraint2d::Signed,
-        )?,
-    })
+            cleaning,
+            None,
+        ),
+    };
+    Ok(gradients)
 }
 
 fn gradient_limiter_geometry(
@@ -1006,30 +1751,22 @@ fn gradient_limiter_geometry(
         maximum_neighbor_distance[pair.i] = maximum_neighbor_distance[pair.i].max(pair.distance);
         maximum_neighbor_distance[pair.j] = maximum_neighbor_distance[pair.j].max(pair.distance);
     }
-    let condition_number =
-        inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?
-            .into_iter()
-            .map(|moment| moment.condition_number)
-            .collect();
+    let moments = inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
     Ok(GradientLimiterGeometry2d {
         pairs,
         maximum_neighbor_distance,
-        condition_number,
+        moments,
     })
 }
 
-fn gradient(
+fn limit_precomputed_gradient(
     state: &MhdMfmState2d,
     values: &[f64],
     limiter: &GradientLimiterGeometry2d,
     constraint: GradientConstraint2d,
-) -> Result<Vec<Vector2>, MhdEvolution2dError> {
-    let mut gradients = scalar_gradients_at_hsml_2d(
-        &state.positions,
-        values,
-        &state.smoothing_lengths,
-        state.domain,
-    )?;
+    mut gradients: Vec<Vector2>,
+    distance_fractions: Option<&[f64]>,
+) -> Vec<Vector2> {
     let mut minima = vec![0.0_f64; state.positions.len()];
     let mut maxima = vec![0.0_f64; state.positions.len()];
     for pair in &limiter.pairs {
@@ -1040,12 +1777,10 @@ fn gradient(
         maxima[pair.j] = maxima[pair.j].max(-delta);
     }
     for i in 0..gradients.len() {
-        let condition = limiter.condition_number[i];
-        let distance_fraction = if condition > 100.0 {
-            (LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION + 0.25 * (condition - 100.0) / 100.0).min(0.5)
-        } else {
-            LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION
-        };
+        let distance_fraction = distance_fractions.map_or_else(
+            || base_gradient_limiter_fraction(limiter.moments[i].condition_number),
+            |values| values[i],
+        );
         let maximum_distance = state.smoothing_lengths[i].max(limiter.maximum_neighbor_distance[i]);
         gradients[i] = local_slope_limiter(
             gradients[i],
@@ -1059,7 +1794,20 @@ fn gradient(
             values[i],
         );
     }
-    Ok(gradients)
+    gradients
+}
+
+fn base_gradient_limiter_fraction(condition_number: f64) -> f64 {
+    if condition_number > 100.0 {
+        (LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION + 0.25 * (condition_number - 100.0) / 100.0)
+            .min(0.5)
+    } else {
+        LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION
+    }
+}
+
+fn relaxed_magnetic_gradient_fraction(base: f64, normalized_divergence: f64) -> f64 {
+    (base * normalized_divergence.mul_add(normalized_divergence, 1.0)).min(0.5)
 }
 
 // `hydro/gradients.c::local_slopelimiter`, specialized to two dimensions and
@@ -1252,23 +2000,6 @@ fn reconstruct_face_states(
     (face_i, face_j)
 }
 
-fn velocity_divergence(state: &MhdMfmState2d) -> Result<Vec<f64>, MhdEvolution2dError> {
-    let velocity = vector_columns(&state.velocities);
-    let grad_x = scalar_gradients_at_hsml_2d(
-        &state.positions,
-        &velocity[0],
-        &state.smoothing_lengths,
-        state.domain,
-    )?;
-    let grad_y = scalar_gradients_at_hsml_2d(
-        &state.positions,
-        &velocity[1],
-        &state.smoothing_lengths,
-        state.domain,
-    )?;
-    Ok(grad_x.iter().zip(&grad_y).map(|(x, y)| x.x + y.y).collect())
-}
-
 fn primitive_at(
     state: &MhdMfmState2d,
     primitive: &MhdPrimitiveColumns2d,
@@ -1331,6 +2062,42 @@ fn validate_controls(controls: DivergenceControl2d) -> Result<(), MhdEvolution2d
     Ok(())
 }
 
+fn validate_rate_context(
+    particle_count: usize,
+    context: MhdRateContext2d<'_>,
+) -> Result<(), MhdEvolution2dError> {
+    if let Some(previous) = context.previous_stored_magnetic_divergence {
+        validate_lengths(
+            particle_count,
+            &[("previous_stored_magnetic_divergence", previous.len())],
+        )?;
+        if previous.iter().any(|value| !value.is_finite()) {
+            return Err(invalid(
+                None,
+                "previous_stored_magnetic_divergence",
+                f64::NAN,
+            ));
+        }
+    }
+    match (context.timestep, context.courant_factor) {
+        (None, None) => Ok(()),
+        (Some(timestep), Some(courant_factor))
+            if timestep.is_finite()
+                && timestep > 0.0
+                && courant_factor.is_finite()
+                && courant_factor > 0.0
+                && courant_factor <= 0.5 =>
+        {
+            Ok(())
+        }
+        (timestep, courant_factor) => Err(invalid(
+            None,
+            "magnetic_limiter_context",
+            timestep.or(courant_factor).unwrap_or(f64::NAN),
+        )),
+    }
+}
+
 fn validate_lengths(
     expected: usize,
     columns: &[(&'static str, usize)],
@@ -1358,6 +2125,7 @@ fn validate_rate_lengths(
             ("total_energy_rates", rates.total_energy.len()),
             ("magnetic_volume_rates", rates.magnetic_volume.len()),
             ("cleaning_mass_rates", rates.cleaning_mass.len()),
+            ("cleaning_damping_rate", rates.cleaning_damping_rate.len()),
             ("acceleration", rates.acceleration.len()),
             (
                 "specific_internal_energy_rates",
@@ -1366,6 +2134,10 @@ fn validate_rate_lengths(
             ("maximum_signal_speed", rates.maximum_signal_speed.len()),
             ("velocity_divergence", rates.velocity_divergence.len()),
             ("magnetic_divergence", rates.magnetic_divergence.len()),
+            (
+                "stored_magnetic_divergence",
+                rates.stored_magnetic_divergence.len(),
+            ),
         ],
     )
 }
@@ -1452,8 +2224,24 @@ mod tests {
             .map(|position| 2.0 + 0.7 * position.x - 0.4 * position.y)
             .collect();
         let limiter = gradient_limiter_geometry(&state).unwrap();
-        let gradients =
-            gradient(&state, &values, &limiter, GradientConstraint2d::Positive).unwrap();
+        let raw = scalar_gradients_batch_with_moments_2d(
+            &state.positions,
+            &[&values],
+            &state.smoothing_lengths,
+            state.domain,
+            &limiter.moments,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let gradients = limit_precomputed_gradient(
+            &state,
+            &values,
+            &limiter,
+            GradientConstraint2d::Positive,
+            raw,
+            None,
+        );
         let i = 3 + 3 * 8;
         let j = i + 1;
         for index in [i, j] {
@@ -1585,6 +2373,118 @@ mod tests {
         let actual = dedner_uncorrected_fourth(Vector3::ZERO, extensive, 4.0, 0.1);
         let regularized_squared = extensive.squared_norm() * 2.0_f64.powi(2);
         assert!((actual - regularized_squared.powi(2)).abs() < 1.0e-20);
+
+        let predicted = predict_cleaning_mass_2d(1.0, 0.2, 2.0, 0.5);
+        assert!((predicted - 1.1 / std::f64::consts::E).abs() < 1.0e-15);
+        let restart_zero = kick_cleaning_mass_public_2d(
+            0.0,
+            0.0,
+            10.0,
+            2.0,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            Vector3::new(100.0, 0.0, 0.0),
+            2.0,
+            1.0,
+            1.0,
+        );
+        assert!(restart_zero.value.abs() < 1.0e-15);
+        let normal = kick_cleaning_mass_public_2d(
+            0.1,
+            0.1,
+            0.2,
+            2.0,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            Vector3::new(100.0, 0.0, 0.0),
+            2.0,
+            1.0,
+            1.0,
+        );
+        assert!((normal.value - 0.2 / std::f64::consts::E).abs() < 1.0e-15);
+
+        let predicted_guard = kick_cleaning_mass_public_2d(
+            0.0,
+            0.1,
+            0.2,
+            0.0,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            Vector3::new(1.0, 0.0, 0.0),
+            2.0,
+            1.0,
+            1.0,
+        );
+        assert!((predicted_guard.value - 0.1).abs() < 1.0e-15);
+
+        let decay_only = kick_cleaning_mass_public_2d(
+            20.0,
+            20.0,
+            3.0,
+            0.0,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            Vector3::new(1.0, 0.0, 0.0),
+            2.0,
+            1.0,
+            1.0,
+        );
+        assert!(decay_only.effective_rate.abs() < f64::EPSILON);
+        assert!((decay_only.value - 20.0).abs() < f64::EPSILON);
+
+        let catastrophic = kick_cleaning_mass_public_2d(
+            1.0,
+            20_000.0,
+            3.0,
+            0.0,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            Vector3::new(1.0, 0.0, 0.0),
+            2.0,
+            1.0,
+            1.0,
+        );
+        assert!(catastrophic.value.abs() < f64::EPSILON);
+        assert!(catastrophic.effective_rate.abs() < f64::EPSILON);
+        assert!(catastrophic.reset_predicted);
+    }
+
+    #[test]
+    fn magnetic_gradient_limiter_relaxes_with_stored_divergence() {
+        assert!((relaxed_magnetic_gradient_fraction(0.25, 0.0) - 0.25).abs() < 1.0e-15);
+        assert!((relaxed_magnetic_gradient_fraction(0.25, 0.5) - 0.3125).abs() < 1.0e-15);
+        assert!((relaxed_magnetic_gradient_fraction(0.25, 1.0) - 0.5).abs() < 1.0e-15);
+        assert!((relaxed_magnetic_gradient_fraction(0.25, 100.0) - 0.5).abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn face_closure_magnetic_rate_limiter_matches_public_2d_formula() {
+        let expected_area = 2.0 * std::f64::consts::PI;
+        let scale = magnetic_face_closure_scale(0.1, expected_area, 1.0, 0.5, 10.0, 0.1, 0.2);
+        assert!((scale - std::f64::consts::PI / 10.0).abs() < 1.0e-15);
+        assert!(
+            (magnetic_face_closure_scale(
+                0.001 * expected_area,
+                expected_area,
+                1.0,
+                0.5,
+                1.0e6,
+                1.0,
+                0.2,
+            ) - 1.0)
+                .abs()
+                < 1.0e-15
+        );
     }
 
     #[test]
@@ -1600,6 +2500,7 @@ mod tests {
                 .iter()
                 .all(|rate| max_abs(*rate) < 1.0e-10)
         );
+        assert_eq!(rates.entropic_pair_count, rates.pair_count);
     }
 
     #[test]

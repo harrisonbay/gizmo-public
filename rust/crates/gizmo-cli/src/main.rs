@@ -18,8 +18,8 @@ use gizmo_hydro::mhd_evolution::{
     global_mhd_courant_timestep_1d, mhd_mfm_spatial_rates_1d,
 };
 use gizmo_hydro::mhd_evolution_2d::{
-    DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, advance_mhd_kdk_adaptive_2d,
-    global_mhd_courant_timestep_2d, mhd_mfm_spatial_rates_2d,
+    DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, advance_public_mhd_kdk_adaptive_2d,
+    global_public_mhd_timestep_bound_2d, mhd_mfm_spatial_rates_2d,
 };
 use gizmo_hydro::{
     BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
@@ -1877,7 +1877,9 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
     .map_err(ApplicationError::MhdEvolution2d)?;
     let mut rates =
         mhd_mfm_spatial_rates_2d(&state, controls).map_err(ApplicationError::MhdEvolution2d)?;
-    let mut time = 0.0_f64;
+    let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
+        .map_err(ApplicationError::Hydro)?;
+    let mut time = timeline.current_time();
     let mut snapshot_number = 0_u32;
     let mut step_count = 0_u64;
     write_briowu_snapshot(
@@ -1896,16 +1898,28 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
             f64::from(output_index) * initialized.parameters.time_between_snapshots
         };
         while time < output_time {
-            let cfl = global_mhd_courant_timestep_2d(
+            let desired_timestep = global_public_mhd_timestep_bound_2d(
                 &state,
                 &rates,
                 initialized.parameters.courant_factor,
+                initialized.parameters.integration_accuracy,
             )
             .map_err(ApplicationError::MhdEvolution2d)?;
-            let timestep = cfl
-                .min(initialized.parameters.max_timestep)
-                .min(output_time - time);
-            let result = advance_mhd_kdk_adaptive_2d(
+            let synchronized = timeline
+                .select_step(
+                    desired_timestep.min(output_time - time),
+                    initialized.parameters.max_timestep,
+                )
+                .map_err(ApplicationError::Hydro)?;
+            let timestep = synchronized.duration;
+            let expected_synchronized_timestep = initialized.parameters.time_max / 2048.0;
+            if timestep.to_bits() != expected_synchronized_timestep.to_bits() {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "public Brio-Wu global-cadence oracle failed: selected dt={timestep:.17e}, \
+                     expected {expected_synchronized_timestep:.17e}"
+                )));
+            }
+            let result = advance_public_mhd_kdk_adaptive_2d(
                 &state,
                 &rates,
                 timestep,
@@ -1913,11 +1927,15 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
                 controls,
                 initialized.parameters.desired_num_neighbors,
                 initialized.parameters.max_neighbor_deviation,
+                initialized.parameters.courant_factor,
             )
             .map_err(ApplicationError::MhdEvolution2d)?;
             state = result.state;
             rates = result.rates;
-            time += timestep;
+            timeline
+                .advance(synchronized)
+                .map_err(ApplicationError::Hydro)?;
+            time = timeline.current_time();
             let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
             if (time - output_time).abs() <= tolerance {
                 time = output_time;

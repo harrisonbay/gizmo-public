@@ -1,12 +1,17 @@
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
+use gizmo_hydro::SynchronizedTimeline1d;
 use gizmo_hydro::meshless_2d::{
     Box2d, Vector2, density_at_hsml_2d, face_closure_diagnostics_2d, inverse_moments_2d,
     solve_public_c_smoothing_lengths_from_seeds_2d,
 };
 use gizmo_hydro::mhd::Vector3;
-use gizmo_hydro::mhd_evolution_2d::{DivergenceControl2d, MhdMfmState2d, mhd_mfm_spatial_rates_2d};
+use gizmo_hydro::mhd_evolution_2d::{
+    DivergenceControl2d, MhdMfmState2d, MhdRateContext2d, advance_public_mhd_kdk_adaptive_2d,
+    global_public_mhd_timestep_bound_2d, mhd_mfm_spatial_rates_2d,
+    mhd_mfm_spatial_rates_with_context_2d,
+};
 use gizmo_io::read_mhd_wave;
 
 #[test]
@@ -234,14 +239,63 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
                 .all(|value| value.is_finite())
             && rates.magnetic_volume.iter().all(|value| value.is_finite())
     );
+    assert!(rates.entropic_pair_count > 0);
+    let physical_bound = global_public_mhd_timestep_bound_2d(&state, &rates, 0.2, 0.01)
+        .expect("evaluate every enabled public Brio-Wu timestep bound");
+    let first_step = SynchronizedTimeline1d::new(0.0, 0.2)
+        .unwrap()
+        .select_step(physical_bound, 0.04)
+        .unwrap();
+    assert_eq!(first_step.duration.to_bits(), (0.2_f64 / 2048.0).to_bits());
+    if std::env::var_os("GIZMO_BRIOWU_ADVANCE_ONE_STEP").is_some() {
+        let limited_rates = mhd_mfm_spatial_rates_with_context_2d(
+            &state,
+            DivergenceControl2d::default(),
+            MhdRateContext2d {
+                previous_stored_magnetic_divergence: None,
+                timestep: Some(first_step.duration),
+                courant_factor: Some(0.2),
+            },
+        )
+        .expect("evaluate the timestep-dependent initial force");
+        let advanced = advance_public_mhd_kdk_adaptive_2d(
+            &state,
+            &limited_rates,
+            first_step.duration,
+            0.0,
+            DivergenceControl2d::default(),
+            20.0,
+            0.05,
+            0.2,
+        )
+        .expect("advance one phase-aware public Brio-Wu KDK step");
+        assert!(
+            advanced
+                .state
+                .positions
+                .iter()
+                .zip(&state.positions)
+                .any(|(actual, initial)| (*actual - *initial).norm() > 0.0)
+        );
+        assert!(
+            advanced
+                .state
+                .specific_internal_energy
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+    }
     eprintln!(
         "density={:?} neighbors={:?} condition={:?} relative_closure={:?} \
-         legacy_closure={:?} solved_neighbor_error={maximum_neighbor_error} rhs_pairs={}",
+         legacy_closure={:?} solved_neighbor_error={maximum_neighbor_error} rhs_pairs={} \
+         entropic_pairs={} physical_dt={physical_bound} synchronized_dt={}",
         density_range,
         neighbor_range,
         condition_range,
         relative_closure_range,
         legacy_closure_range,
         rates.pair_count,
+        rates.entropic_pair_count,
+        first_step.duration,
     );
 }
