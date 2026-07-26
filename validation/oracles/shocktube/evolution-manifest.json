@@ -3,8 +3,9 @@
   "source_commit": "66e1006e42a23019fa33da6cc7746457dc527bf9",
   "problem": "public one-dimensional equal-mass Sod shock tube",
   "compiler": {
-    "mpi_wrapper_command": "clang",
-    "version": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "driver": "clang",
+    "implementation": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "target": "arm64-apple-darwin",
     "optimization": "-O1 -funroll-loops",
     "mpi_ranks": 1,
     "openmp_threads": 1,
@@ -83,6 +84,13 @@
   "public_reference": {
     "path": "shocktube_exact.txt",
     "sha256": "4a52deb8d19f39b09bcf8c88b9403e03afa8da7e2d2b8157db0e70cffe8f3f57",
-    "description": "high-resolution PPM t=5 table: x, density, pressure, entropy, x velocity"
+    "description": "high-resolution PPM t=5 table: x, density, pressure, entropy, x velocity",
+    "comparison": "periodic linear interpolation at particle positions; L1 weighted by m/rho and normalized by total particle volume",
+    "volume_weighted_l1": {
+      "density": 0.004816710484520634,
+      "pressure": 0.005241033668199458,
+      "entropy": 0.003393203763173442,
+      "velocity_x": 0.008991198440929557
+    }
   }
 }

@@ -1,0 +1,22 @@
+% Pinned differential-mass variant of scripts/test_problems/shocktube.params.
+InitCondFile                       shocktube_ics_diffmass
+OutputDir                          output/
+ICFormat                           3
+SnapFormat                         3
+TimeBegin                          0
+TimeMax                            5
+BoxSize                            80
+TimeBetSnapshot                    0.5
+MaxSizeTimestep                    0.001
+DesNumNgb                          4
+BufferSize                         8
+MaxMemSize                         512
+ErrTolIntAccuracy                  0.0025
+CourantFac                         0.05
+MaxRMSDisplacementFac              0.125
+TimeBetStatistics                  0.5
+ErrTolForceAcc                     0.0025
+ErrTolTheta                        0.5
+MaxNumNgbDeviation                 0.05
+ResubmitOn                         0
+ResubmitCommand                    none

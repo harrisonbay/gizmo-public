@@ -24,6 +24,14 @@ hosted `soundwave_ics.hdf5` has mean pressure `4/15`, sound speed `2/3`, and a
 `1.5` box-crossing time. Its SHA-256 is
 `d13c5f1bb916490037c96f2d3e4fa37b1121e09b352bd6bc15de80bee9f35b35`.
 
+For `shocktube`, please include the actual `Config.sh` and resolved parameters
+used to produce the published comparison. The checked-in parameter file omits
+tags required by a strict developer-mode run. Please also provide a known-good
+reference run for `shocktube_ics_diffmass.hdf5`: the current public source and
+hosted IC deterministically exhaust the force-tree top-node allocation during
+restart-0 under the otherwise equivalent one-rank profile, while the equal-mass
+IC completes.
+
 The most useful delivery is a versioned archive or repository containing the
 generators, configs, analyzers, thresholds, and a checksum manifest. Large raw
 snapshots are optional if compact reference tables preserve the scientific

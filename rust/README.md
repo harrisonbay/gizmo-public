@@ -1,7 +1,8 @@
 # GIZMO Rust port
 
 This workspace is the correctness-oriented Rust replacement for GIZMO. It
-currently ports the one-dimensional MFM sound-wave path: strict
+currently ports the public one-dimensional MFM sound-wave and both equal- and
+differential-mass Sod shock-tube paths: strict
 configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
@@ -14,6 +15,7 @@ snapshots. Other physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
+validation/oracles/run_rust_shocktube.sh
 ```
 
 The complete 65,536-step corrected-C differential is intentionally separate
@@ -23,7 +25,21 @@ from the fast initialization check:
 validation/oracles/run_rust_soundwave_long.sh
 ```
 
-Initialization-only mode validates the sound-wave profile, parses the runtime
+The shock-tube differential covers nonuniform particle spacing, a discontinuous
+state, unequal particle masses, the public C face-closure correction to the
+adaptive neighbor target,
+8,192 synchronized KDK steps, and all 11 scheduled outputs through `t=5`.
+Against the pinned corrected-C terminal drift, its maximum absolute
+position/velocity differences are `4.27e-14`/`1.91e-13`; maximum relative
+density/internal-energy/smoothing-length differences are
+`1.31e-13`/`1.97e-13`/`4.67e-13`.
+For the 512-particle differential-mass case, terminal absolute
+position/velocity errors are `3.56e-14`/`4.16e-13`, with density,
+internal-energy, and smoothing-length absolute errors below `5.04e-13`.
+Both terminal states are also gated against the independent public PPM table
+with volume-weighted L1 norms.
+
+Initialization-only mode validates either supported profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive
 `Hsml`, reconstructs density, velocity, and pressure gradients, validates
 one-dimensional face areas, and prints a deterministic JSON summary. A normal
@@ -40,8 +56,8 @@ configuration parsing:
 - `gizmo-audit`: finding and provenance records used by correctness tooling.
 - `gizmo-params`: strict typed parsing for the legacy runtime parameters used
   by the first vertical slice.
-- `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment and
-  upstream-compatible snapshot output.
+- `gizmo-io`: checked HDF5 gas input with particle-ID alignment and
+  upstream-compatible snapshot output and metadata.
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
   reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact, pair, and
