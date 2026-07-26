@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "shocktube_ics_emass.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/shocktube_ics_emass.hdf5",
+      "sha256": "717bedd6598b071c7a0f1124666d111d1b4ea7cac561777226a193425642a457",
+      "size_bytes": 33424
+    },
+    {
+      "name": "shocktube_ics_diffmass.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/shocktube_ics_diffmass.hdf5",
+      "sha256": "46d8cc58a167ae772b29d2ed3423bad03a3853816fa64af4327b07eb7fad9f72",
+      "size_bytes": 49552
+    },
+    {
+      "name": "shocktube_exact.txt",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/shocktube_exact.txt",
+      "sha256": "4a52deb8d19f39b09bcf8c88b9403e03afa8da7e2d2b8157db0e70cffe8f3f57",
+      "size_bytes": 282010
+    }
+  ]
+}

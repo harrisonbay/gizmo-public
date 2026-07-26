@@ -9,13 +9,12 @@ use std::process::ExitCode;
 use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d, gradients_at_hsml_1d,
-    inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
+    GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d,
+    SynchronizedTimeline1d, begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d,
+    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
     select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d,
-    GradientEstimate, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d, SynchronizedTimeline1d,
-    LEGACY_TIMEBASE_TICKS,
 };
-use gizmo_io::{read_soundwave, write_soundwave, SnapshotHeader, SoundWaveWriteView};
+use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
 use gizmo_params::SoundwaveParameters;
 
 fn main() -> ExitCode {

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "source_commit": "66e1006e42a23019fa33da6cc7746457dc527bf9",
+  "problem": "public one-dimensional equal-mass Sod shock tube",
+  "compiler": {
+    "mpi_wrapper_command": "clang",
+    "version": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "optimization": "-O1 -funroll-loops",
+    "mpi_ranks": 1,
+    "openmp_threads": 1,
+    "hdf5_version": "2.1.1"
+  },
+  "inputs": {
+    "config": {
+      "path": "../../legacy/shocktube.Config.sh",
+      "sha256": "9d3cd8878ff17275f95982accfb5edaebd8e9a7f3ab28a781968d2f4fc3b69a3"
+    },
+    "parameters": {
+      "path": "../../legacy/shocktube.params",
+      "sha256": "04ddf823553d27bc219edc2e33697af6baa3829ec4a044ff02c7b2cd724d73fd"
+    },
+    "first_drift_parameters": {
+      "path": "first-drift.params",
+      "sha256": "3f59dfafbc36c3cbbff0de1155277e0f040713f913aad3b1587b731b6d5fabc8"
+    },
+    "first_drift_output_times": {
+      "path": "first-output-times.txt",
+      "sha256": "ac02897e03455dbeb1705b47f8dedd543a92f938a8a484ee6b804325014a4ad6"
+    },
+    "resolved_parameters": {
+      "path": "parameters-usedvalues",
+      "sha256": "7b6e7ad31078df5282c574e37e65b07b6f22df8543b2df6fe813299b88f23dd3"
+    },
+    "post_kick_observation_patch": {
+      "path": "post-kick-snapshot.patch",
+      "sha256": "d2838661fb403e1e9f552c239bdca19b80ed0fd7b13f51c4fc2ea6b7c8598f89"
+    },
+    "initial_conditions": {
+      "path": "shocktube_ics_emass.hdf5",
+      "sha256": "717bedd6598b071c7a0f1124666d111d1b4ea7cac561777226a193425642a457"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 5.0,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 140737488355328,
+    "shared_step": 0.0006103515625,
+    "steps": 8192,
+    "all_particles_remained_in_timebin": 47,
+    "scheduled_outputs": 11
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "phase": "initial drift after first half-kick",
+      "raw_sha256": "f79123fc2eba0aa5cea0ec39100a944ce6de4da471a33ba4b5b3ddb776757452",
+      "table": "evolution_t0.csv.gz",
+      "table_sha256": "dac2e2c5ad6429646cabc5d8b7ce92da712f63c78f9637ec39f0a7350f8254a0"
+    },
+    {
+      "time": 0.0006103515625,
+      "phase": "first endpoint drift before force and second kick",
+      "raw_sha256": "df250c7f45ef1969a13b82b0753a56f23756f7423d4204ec025aa6d8d140dade",
+      "table": "evolution_step1_drift.csv.gz",
+      "table_sha256": "71877e1764b583c75a365f769860582b540b3bd99f3c2e29d8de9d8491b89728"
+    },
+    {
+      "time": 0.0006103515625,
+      "phase": "first completed endpoint after force and second kick",
+      "raw_sha256": "784e697c206a5ed99945d3a76a763c074e80ccba5b47053f03c1c7dfc3b28bd3",
+      "table": "evolution_step1_postkick.csv.gz",
+      "table_sha256": "78f5b8474fda39b156257c95814aa47e40180c5741face904f635e9744ca06cf"
+    },
+    {
+      "time": 5.0,
+      "phase": "scheduled terminal drift before endpoint force and second kick",
+      "raw_sha256": "e99a6aca12a2f62a147d2c0735eb1d1cb71b16257d2b4264525b3129526c5d9a",
+      "table": "evolution_t5.csv.gz",
+      "table_sha256": "3356c4d40588a0c324f0669bd4c46c7a05ec965a90f4e442ed971cc8f1d8e15e"
+    }
+  ],
+  "public_reference": {
+    "path": "shocktube_exact.txt",
+    "sha256": "4a52deb8d19f39b09bcf8c88b9403e03afa8da7e2d2b8157db0e70cffe8f3f57",
+    "description": "high-resolution PPM t=5 table: x, density, pressure, entropy, x velocity"
+  }
+}

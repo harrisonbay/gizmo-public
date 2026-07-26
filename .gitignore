@@ -15,6 +15,7 @@ __pycache__/
 .pytest_cache/
 validation/artifacts/
 validation/oracles/*/*.hdf5
+validation/oracles/*/*_exact.txt
 
 # Local editor and platform files
 .DS_Store
