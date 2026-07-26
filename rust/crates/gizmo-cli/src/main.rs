@@ -4,11 +4,12 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gizmo_cli::{CliError, Invocation, USAGE};
+use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    GradientEstimate, MeshlessPoint1d, density_at_hsml_1d, gradients_at_hsml_1d,
-    inverse_moments_1d, meshless_face_geometry_1d, solve_smoothing_lengths_1d,
+    GradientEstimate, MeshlessPoint1d, MfmEvolvingState1d, density_at_hsml_1d,
+    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
+    solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 use gizmo_params::SoundwaveParameters;
@@ -32,6 +33,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), ApplicationError> {
     let invocation = Invocation::parse(env::args_os().skip(1)).map_err(ApplicationError::Cli)?;
+    reject_unsupported_restart(invocation.restart)?;
     let manifest =
         ConfigManifest::from_path(&invocation.config_file).map_err(ApplicationError::Config)?;
 
@@ -46,15 +48,38 @@ fn run() -> Result<(), ApplicationError> {
         invocation.restart as u8
     );
 
-    if !invocation.initialize_only {
-        return Err(ApplicationError::NotYetPorted);
-    }
     validate_soundwave_config(&manifest)?;
-    initialize_soundwave(&invocation.parameter_file, &manifest)
+    let initialized = initialize_soundwave(&invocation.parameter_file)?;
+    initialized.validate_owned_state()?;
+    if invocation.initialize_only {
+        initialized.summary.print(&manifest.sha256());
+        Ok(())
+    } else {
+        Err(ApplicationError::NotYetPorted)
+    }
+}
+
+fn reject_unsupported_restart(restart: RestartFlag) -> Result<(), ApplicationError> {
+    if restart == RestartFlag::InitialConditions {
+        Ok(())
+    } else {
+        Err(ApplicationError::UnsupportedRestart(restart))
+    }
 }
 
 fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), ApplicationError> {
-    let allowed = [
+    const REQUIRED_FLAGS: [&str; 7] = [
+        "BOX_PERIODIC",
+        "DEVELOPER_MODE",
+        "FORCE_EQUAL_TIMESTEPS",
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "INPUT_IN_DOUBLEPRECISION",
+        "OUTPUT_IN_DOUBLEPRECISION",
+        "SELFGRAVITY_OFF",
+    ];
+    const REQUIRED_VALUES: [(&str, &str); 2] =
+        [("BOX_SPATIAL_DIMENSION", "1"), ("EOS_GAMMA", "(5.0/3.0)")];
+    const ALLOWED: [&str; 9] = [
         "BOX_PERIODIC",
         "BOX_SPATIAL_DIMENSION",
         "DEVELOPER_MODE",
@@ -66,27 +91,33 @@ fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), Applicatio
         "SELFGRAVITY_OFF",
     ];
     for option in manifest.iter() {
-        if !allowed.contains(&option.name.as_str()) {
+        if !ALLOWED.contains(&option.name.as_str()) {
             return Err(ApplicationError::UnsupportedConfig(format!(
                 "option `{}` is outside the sound-wave initialization profile",
                 option.name
             )));
         }
     }
-    for required in [
-        "BOX_PERIODIC",
-        "HYDRO_MESHLESS_FINITE_MASS",
-        "SELFGRAVITY_OFF",
-    ] {
-        if manifest.get(required).is_none() {
-            return Err(ApplicationError::UnsupportedConfig(format!(
-                "required option `{required}` is missing"
-            )));
-        }
+    for required in REQUIRED_FLAGS {
+        require_config_flag(manifest, required)?;
     }
-    require_config_value(manifest, "BOX_SPATIAL_DIMENSION", "1")?;
-    require_config_value(manifest, "EOS_GAMMA", "(5.0/3.0)")?;
+    for (name, expected) in REQUIRED_VALUES {
+        require_config_value(manifest, name, expected)?;
+    }
     Ok(())
+}
+
+fn require_config_flag(manifest: &ConfigManifest, name: &str) -> Result<(), ApplicationError> {
+    let actual = manifest.get(name).map(|option| option.value.as_deref());
+    match actual {
+        Some(None) => Ok(()),
+        None => Err(ApplicationError::UnsupportedConfig(format!(
+            "required option `{name}` is missing"
+        ))),
+        Some(Some(value)) => Err(ApplicationError::UnsupportedConfig(format!(
+            "`{name}` must be a bare enabled flag, found value `{value}`"
+        ))),
+    }
 }
 
 fn require_config_value(
@@ -106,10 +137,7 @@ fn require_config_value(
     }
 }
 
-fn initialize_soundwave(
-    parameter_file: &Path,
-    manifest: &ConfigManifest,
-) -> Result<(), ApplicationError> {
+fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, ApplicationError> {
     let parameters =
         SoundwaveParameters::from_path(parameter_file).map_err(ApplicationError::Parameters)?;
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
@@ -157,6 +185,63 @@ fn initialize_soundwave(
     )
     .map_err(ApplicationError::Hydro)?;
 
+    let summary = summarize_initialization(
+        &snapshot,
+        &positions,
+        expected_density,
+        legacy_hsml,
+        &at_legacy_hsml,
+        &solved,
+        (particle_count, parameters.desired_num_neighbors),
+    )?;
+    summary.validate()?;
+    let particle_ids = snapshot.gas.ids;
+    let transverse_vectors = snapshot
+        .gas
+        .coordinates
+        .into_iter()
+        .zip(&snapshot.gas.velocities)
+        .map(|(position, velocity)| TransverseVectorShell {
+            position: [position[1], position[2]],
+            velocity: [velocity[1], velocity[2]],
+        })
+        .collect();
+    let state = MfmEvolvingState1d {
+        positions,
+        masses: snapshot.gas.masses,
+        velocities: snapshot
+            .gas
+            .velocities
+            .iter()
+            .map(|velocity| velocity[0])
+            .collect(),
+        specific_internal_energy: snapshot.gas.internal_energy,
+        smoothing_lengths: solved
+            .into_iter()
+            .map(|particle| particle.smoothing_length)
+            .collect(),
+        box_size: snapshot.header.box_size,
+        gamma: 5.0 / 3.0,
+    };
+    Ok(InitializedSoundwave {
+        parameters,
+        particle_ids,
+        transverse_vectors,
+        state,
+        summary,
+    })
+}
+
+fn summarize_initialization(
+    snapshot: &gizmo_io::SoundWaveSnapshot,
+    positions: &[f64],
+    expected_density: &[f64],
+    legacy_hsml: &[f64],
+    at_legacy_hsml: &[gizmo_hydro::DensityEstimate],
+    solved: &[gizmo_hydro::AdaptiveDensityEstimate],
+    neighbor_constraint: (u32, f64),
+) -> Result<InitializationSummary, ApplicationError> {
+    let (particle_count, desired_num_neighbors) = neighbor_constraint;
     let max_density_relative_error = at_legacy_hsml
         .iter()
         .zip(expected_density)
@@ -169,23 +254,21 @@ fn initialize_soundwave(
         .fold(0.0, f64::max);
     let max_neighbor_deviation = solved
         .iter()
-        .map(|particle| {
-            (particle.estimate.effective_neighbors - parameters.desired_num_neighbors).abs()
-        })
+        .map(|particle| (particle.estimate.effective_neighbors - desired_num_neighbors).abs())
         .fold(0.0, f64::max);
     let [
         density_gradient_error,
         velocity_gradient_error,
         pressure_gradient_error,
-    ] = soundwave_gradient_errors(&snapshot, &positions, expected_density, legacy_hsml)?;
+    ] = soundwave_gradient_errors(snapshot, positions, expected_density, legacy_hsml)?;
     let max_face_area_deviation = soundwave_face_area_deviation(
-        &positions,
+        positions,
         &snapshot.gas.masses,
         expected_density,
         legacy_hsml,
         snapshot.header.box_size,
     )?;
-    let summary = InitializationSummary {
+    Ok(InitializationSummary {
         particle_count,
         box_size: snapshot.header.box_size,
         max_density_relative_error,
@@ -195,10 +278,75 @@ fn initialize_soundwave(
         velocity_gradient_error,
         pressure_gradient_error,
         max_face_area_deviation,
-    };
-    summary.validate()?;
-    summary.print(&manifest.sha256());
-    Ok(())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransverseVectorShell {
+    position: [f64; 2],
+    velocity: [f64; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InitializedSoundwave {
+    parameters: SoundwaveParameters,
+    particle_ids: Vec<u64>,
+    transverse_vectors: Vec<TransverseVectorShell>,
+    state: MfmEvolvingState1d,
+    summary: InitializationSummary,
+}
+
+impl InitializedSoundwave {
+    fn validate_owned_state(&self) -> Result<(), ApplicationError> {
+        let particle_count = usize::try_from(self.summary.particle_count)
+            .map_err(|_| ApplicationError::StateMismatch("invalid particle count".to_owned()))?;
+        for (field, actual) in [
+            ("ParticleIDs", self.particle_ids.len()),
+            ("transverse vectors", self.transverse_vectors.len()),
+            ("positions", self.state.positions.len()),
+            ("masses", self.state.masses.len()),
+            ("velocities", self.state.velocities.len()),
+            (
+                "specific internal energy",
+                self.state.specific_internal_energy.len(),
+            ),
+            ("smoothing lengths", self.state.smoothing_lengths.len()),
+        ] {
+            if actual != particle_count {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "{field} has {actual} entries, expected {particle_count}"
+                )));
+            }
+        }
+        if self.particle_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ApplicationError::StateMismatch(
+                "ParticleIDs are not strictly sorted".to_owned(),
+            ));
+        }
+        if self.parameters.box_size.to_bits() != self.state.box_size.to_bits()
+            || self.summary.box_size.to_bits() != self.state.box_size.to_bits()
+        {
+            return Err(ApplicationError::StateMismatch(
+                "runtime bundle has inconsistent box sizes".to_owned(),
+            ));
+        }
+        if self.state.gamma.to_bits() != (5.0_f64 / 3.0).to_bits() {
+            return Err(ApplicationError::StateMismatch(
+                "runtime bundle has inconsistent EOS gamma".to_owned(),
+            ));
+        }
+        if self
+            .transverse_vectors
+            .iter()
+            .flat_map(|shell| shell.position.into_iter().chain(shell.velocity))
+            .any(|component| !component.is_finite())
+        {
+            return Err(ApplicationError::StateMismatch(
+                "runtime bundle has non-finite transverse vectors".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn soundwave_gradient_errors(
@@ -281,7 +429,7 @@ fn soundwave_face_area_deviation(
         })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct InitializationSummary {
     particle_count: u32,
     box_size: f64,
@@ -421,6 +569,7 @@ enum ApplicationError {
     Input(gizmo_io::InputError),
     Hydro(gizmo_hydro::HydroError),
     UnsupportedConfig(String),
+    UnsupportedRestart(RestartFlag),
     MissingDataset(&'static str),
     StateMismatch(String),
     NotYetPorted,
@@ -437,6 +586,11 @@ impl std::fmt::Display for ApplicationError {
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
             }
+            Self::UnsupportedRestart(restart) => write!(
+                formatter,
+                "restart flag {} is not ported; only restart flag 0 can initialize a simulation",
+                *restart as u8
+            ),
             Self::MissingDataset(name) => {
                 write!(formatter, "initial condition is missing required `{name}`")
             }
@@ -452,11 +606,75 @@ impl std::fmt::Display for ApplicationError {
 mod tests {
     use super::*;
 
+    const STRICT_CONFIG: &str = "\
+HYDRO_MESHLESS_FINITE_MASS
+BOX_SPATIAL_DIMENSION=1
+BOX_PERIODIC
+SELFGRAVITY_OFF
+INPUT_IN_DOUBLEPRECISION
+OUTPUT_IN_DOUBLEPRECISION
+EOS_GAMMA=(5.0/3.0)
+FORCE_EQUAL_TIMESTEPS
+DEVELOPER_MODE
+";
+
     #[test]
     fn hdf5_suffix_is_appended_to_legacy_basename_even_when_it_contains_dots() {
         assert_eq!(
             resolve_initial_conditions("run.v1"),
             PathBuf::from("run.v1.hdf5")
         );
+    }
+
+    #[test]
+    fn exact_soundwave_config_profile_is_required() {
+        let manifest = ConfigManifest::parse(STRICT_CONFIG).unwrap();
+        validate_soundwave_config(&manifest).unwrap();
+
+        for required in [
+            "FORCE_EQUAL_TIMESTEPS",
+            "INPUT_IN_DOUBLEPRECISION",
+            "OUTPUT_IN_DOUBLEPRECISION",
+        ] {
+            let incomplete = STRICT_CONFIG
+                .lines()
+                .filter(|line| *line != required)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let manifest = ConfigManifest::parse(&incomplete).unwrap();
+            assert!(
+                matches!(
+                    validate_soundwave_config(&manifest),
+                    Err(ApplicationError::UnsupportedConfig(message))
+                        if message.contains(required) && message.contains("missing")
+                ),
+                "unexpectedly accepted config without {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_flags_must_not_have_values() {
+        let config =
+            STRICT_CONFIG.replace("INPUT_IN_DOUBLEPRECISION\n", "INPUT_IN_DOUBLEPRECISION=1\n");
+        let manifest = ConfigManifest::parse(&config).unwrap();
+        assert!(matches!(
+            validate_soundwave_config(&manifest),
+            Err(ApplicationError::UnsupportedConfig(message))
+                if message.contains("INPUT_IN_DOUBLEPRECISION")
+                    && message.contains("bare enabled flag")
+        ));
+    }
+
+    #[test]
+    fn every_non_initial_restart_mode_is_rejected_explicitly() {
+        reject_unsupported_restart(RestartFlag::InitialConditions).unwrap();
+        for value in 1..=6 {
+            let restart = RestartFlag::try_from(value).unwrap();
+            assert!(matches!(
+                reject_unsupported_restart(restart),
+                Err(ApplicationError::UnsupportedRestart(actual)) if actual == restart
+            ));
+        }
     }
 }
