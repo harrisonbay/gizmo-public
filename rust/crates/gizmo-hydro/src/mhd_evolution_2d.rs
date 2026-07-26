@@ -197,6 +197,7 @@ pub struct PublicMhdInitialHierarchy2d {
     moment_cache: Vec<InverseMoment2d>,
     face_closure_cache: Vec<FaceClosure2d>,
     minimum_specific_internal_energy: f64,
+    awaiting_second_kick: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -214,6 +215,14 @@ pub struct PublicMhdActiveRateResult2d {
     pub rates: MhdMfmRates2d,
     /// Inactive neighbors whose pair signal exceeded the public `WAKEUP=4.1`
     /// threshold relative to their retained maximum signal speed.
+    pub wakeup: Vec<bool>,
+    controls: DivergenceControl2d,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicMhdHierarchyKickResult2d {
+    pub state: MhdMfmState2d,
+    pub rates: MhdMfmRates2d,
     pub wakeup: Vec<bool>,
 }
 
@@ -734,7 +743,7 @@ fn mhd_mfm_spatial_rates_from_precomputed_2d(
     let mut stored_magnetic_divergence = magnetic_divergence_volume.clone();
     for i in 0..count {
         let volume = state.masses[i] / primitive.density[i];
-        let particle_size = volume.sqrt();
+        let particle_size = public_particle_size_2d(state, i, primitive.density[i]);
         let cleaning_speed = maximum_signal_speed[i];
         if controls.powell {
             let scale = -volume * magnetic_divergence[i];
@@ -1087,7 +1096,7 @@ pub fn mhd_mfm_active_target_rates_with_cache_2d(
             continue;
         }
         let volume = state.masses[i] / primitive.density[i];
-        let particle_size = volume.sqrt();
+        let particle_size = public_particle_size_2d(state, i, primitive.density[i]);
         updated.magnetic_divergence[i] = magnetic_divergence_volume[i] / volume;
         updated.stored_magnetic_divergence[i] = magnetic_divergence_volume[i];
         if controls.powell {
@@ -1174,6 +1183,7 @@ pub fn mhd_mfm_active_target_rates_with_cache_2d(
     Ok(PublicMhdActiveRateResult2d {
         rates: updated,
         wakeup,
+        controls,
     })
 }
 
@@ -1542,6 +1552,13 @@ fn clip_normalized_magnetic_divergence(
 ) -> f64 {
     let maximum = 100.0 * magnetic.squared_norm().sqrt() / smoothing_length;
     divergence.clamp(-maximum, maximum)
+}
+
+fn public_particle_size_2d(state: &MhdMfmState2d, index: usize, density: f64) -> f64 {
+    let smoothing_length = state.smoothing_lengths[index];
+    let effective_neighbor_root =
+        (std::f64::consts::PI * smoothing_length.powi(2) * density / state.masses[index]).sqrt();
+    1.77245 * smoothing_length / effective_neighbor_root
 }
 
 /// Return the global fast-wave CFL bound.
@@ -2017,6 +2034,7 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
         moment_cache,
         face_closure_cache,
         minimum_specific_internal_energy,
+        awaiting_second_kick: false,
     })
 }
 
@@ -2043,6 +2061,7 @@ impl PublicMhdInitialHierarchy2d {
                 self.drift_particle_to_current(i)?;
             }
         }
+        self.awaiting_second_kick = true;
         Ok(PublicMhdHierarchySync2d {
             tick: self.timeline.current_tick(),
             time: self.timeline.current_time(),
@@ -2061,6 +2080,347 @@ impl PublicMhdInitialHierarchy2d {
     /// Returns an error for an invalid index or predictor arithmetic.
     pub fn drift_neighbor_to_current(&mut self, index: usize) -> Result<(), MhdEvolution2dError> {
         self.drift_particle_to_current(index)
+    }
+
+    /// Materialize the current predicted particle view after the caller has
+    /// lazily drifted every neighbor needed by its traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained predicted columns are invalid.
+    pub fn predicted_state(&self) -> Result<MhdMfmState2d, MhdEvolution2dError> {
+        let state = MhdMfmState2d {
+            positions: self.drift.positions.clone(),
+            masses: self.start.masses.clone(),
+            velocities: self.drift.predicted_velocities.clone(),
+            specific_internal_energy: self.drift.predicted_specific_internal_energy.clone(),
+            smoothing_lengths: self.drift.predicted_smoothing_lengths.clone(),
+            magnetic_volume: self.drift.predicted_magnetic_volume.clone(),
+            cleaning_mass: self.drift.predicted_cleaning_mass.clone(),
+            domain: self.start.domain,
+            gamma: self.start.gamma,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// Refresh the density/gradient caches of the currently arriving active
+    /// targets. Required inactive neighbors must already have been lazily
+    /// drifted with [`Self::drift_neighbor_to_current`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid predicted geometry or cache arithmetic.
+    pub fn refresh_arriving_active_caches(
+        &mut self,
+        desired_neighbors: f64,
+        neighbor_tolerance: f64,
+    ) -> Result<(), MhdEvolution2dError> {
+        if !self.awaiting_second_kick {
+            return Err(invalid(
+                None,
+                "hierarchy_force_phase",
+                self.timeline.current_time(),
+            ));
+        }
+        let active = self.timeline.active_mask();
+        let mut state = self.predicted_state()?;
+        refresh_mhd_active_target_caches_2d(
+            &mut state,
+            &mut self.primitive_cache,
+            &mut self.gradient_cache,
+            &mut self.moment_cache,
+            &mut self.face_closure_cache,
+            &active,
+            &self.old_rates.stored_magnetic_divergence,
+            desired_neighbors,
+            neighbor_tolerance,
+        )?;
+        for (i, &is_active) in active.iter().enumerate() {
+            if is_active {
+                self.drift.predicted_density[i] = self.primitive_cache.density[i];
+                self.drift.predicted_smoothing_lengths[i] = state.smoothing_lengths[i];
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate the currently arriving active targets against the retained
+    /// mixed-epoch caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid predicted state, caches, or force
+    /// arithmetic.
+    pub fn evaluate_arriving_active_rates(
+        &self,
+        controls: DivergenceControl2d,
+        courant_factor: f64,
+    ) -> Result<PublicMhdActiveRateResult2d, MhdEvolution2dError> {
+        if !self.awaiting_second_kick {
+            return Err(invalid(
+                None,
+                "hierarchy_force_phase",
+                self.timeline.current_time(),
+            ));
+        }
+        let active = self.timeline.active_mask();
+        let particle_timesteps: Vec<_> = self
+            .timeline
+            .step_ticks()
+            .iter()
+            .map(|&ticks| self.timeline.duration_for_ticks(ticks))
+            .collect();
+        mhd_mfm_active_target_rates_with_cache_2d(
+            &self.predicted_state()?,
+            &self.primitive_cache,
+            &self.gradient_cache,
+            &self.moment_cache,
+            &self.face_closure_cache,
+            &self.old_rates,
+            &active,
+            &particle_timesteps,
+            controls,
+            courant_factor,
+        )
+    }
+
+    /// Apply the endpoint second half-kick to arriving active targets and
+    /// reset only their predicted conserved fields to the corrected actual
+    /// values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid endpoint rates or kick arithmetic.
+    pub fn finish_arriving_active_kicks(
+        &mut self,
+        endpoint: PublicMhdActiveRateResult2d,
+    ) -> Result<PublicMhdHierarchyKickResult2d, MhdEvolution2dError> {
+        let mut next = self.clone();
+        let result = next.finish_arriving_active_kicks_in_place(endpoint)?;
+        *self = next;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn finish_arriving_active_kicks_in_place(
+        &mut self,
+        mut endpoint: PublicMhdActiveRateResult2d,
+    ) -> Result<PublicMhdHierarchyKickResult2d, MhdEvolution2dError> {
+        let controls = endpoint.controls;
+        validate_controls(controls)?;
+        if !self.awaiting_second_kick {
+            return Err(invalid(
+                None,
+                "hierarchy_second_kick_phase",
+                self.timeline.current_time(),
+            ));
+        }
+        let count = self.start.positions.len();
+        validate_rate_lengths(&endpoint.rates, count)?;
+        if endpoint.wakeup.len() != count {
+            return Err(MhdEvolution2dError::MismatchedLength {
+                field: "wakeup",
+                expected: count,
+                actual: endpoint.wakeup.len(),
+            });
+        }
+        let active = self.timeline.active_mask();
+        if endpoint.rates.global_fastest_wave_speed.to_bits()
+            != self.old_rates.global_fastest_wave_speed.to_bits()
+        {
+            return Err(invalid(
+                None,
+                "endpoint_retained_global_fastest_wave_speed",
+                endpoint.rates.global_fastest_wave_speed,
+            ));
+        }
+        for (i, &is_active) in active.iter().enumerate() {
+            if !is_active
+                && (endpoint.rates.momentum[i] != self.old_rates.momentum[i]
+                    || endpoint.rates.total_energy[i].to_bits()
+                        != self.old_rates.total_energy[i].to_bits()
+                    || endpoint.rates.magnetic_volume[i] != self.old_rates.magnetic_volume[i]
+                    || endpoint.rates.cleaning_mass[i].to_bits()
+                        != self.old_rates.cleaning_mass[i].to_bits()
+                    || endpoint.rates.cleaning_damping_rate[i].to_bits()
+                        != self.old_rates.cleaning_damping_rate[i].to_bits()
+                    || endpoint.rates.acceleration[i] != self.old_rates.acceleration[i]
+                    || endpoint.rates.specific_internal_energy[i].to_bits()
+                        != self.old_rates.specific_internal_energy[i].to_bits()
+                    || endpoint.rates.maximum_signal_speed[i].to_bits()
+                        != self.old_rates.maximum_signal_speed[i].to_bits()
+                    || endpoint.rates.velocity_divergence[i].to_bits()
+                        != self.old_rates.velocity_divergence[i].to_bits()
+                    || endpoint.rates.magnetic_divergence[i].to_bits()
+                        != self.old_rates.magnetic_divergence[i].to_bits()
+                    || endpoint.rates.stored_magnetic_divergence[i].to_bits()
+                        != self.old_rates.stored_magnetic_divergence[i].to_bits())
+            {
+                return Err(invalid(
+                    Some(i),
+                    "endpoint_inactive_retained_rate",
+                    f64::NAN,
+                ));
+            }
+        }
+        for (i, &is_active) in active.iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let half_timestep = 0.5
+                * self
+                    .timeline
+                    .duration_for_ticks(self.timeline.step_ticks()[i]);
+            self.drift.actual_velocities[i] =
+                self.drift.actual_velocities[i] + endpoint.rates.acceleration[i] * half_timestep;
+            self.half_internal[i] = limited_internal_energy_update_2d(
+                self.half_internal[i],
+                endpoint.rates.specific_internal_energy[i],
+                half_timestep,
+                self.minimum_specific_internal_energy,
+            )?;
+            self.half_magnetic[i] =
+                self.half_magnetic[i] + endpoint.rates.magnetic_volume[i] * half_timestep;
+            let cleaning_kick = kick_cleaning_mass_public_2d(
+                self.half_cleaning[i],
+                self.drift.predicted_cleaning_mass[i],
+                endpoint.rates.cleaning_mass[i],
+                endpoint.rates.cleaning_damping_rate[i],
+                half_timestep,
+                self.start.masses[i],
+                self.primitive_cache.density[i],
+                self.primitive_cache.pressure[i],
+                self.primitive_cache.magnetic[i],
+                self.start.gamma,
+                endpoint.rates.maximum_signal_speed[i],
+                self.old_rates.global_fastest_wave_speed,
+            );
+            self.half_cleaning[i] = cleaning_kick.value;
+            endpoint.rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+            self.drift.predicted_velocities[i] = self.drift.actual_velocities[i];
+            self.drift.predicted_specific_internal_energy[i] = self.half_internal[i];
+            self.drift.predicted_magnetic_volume[i] = self.half_magnetic[i];
+            self.drift.predicted_cleaning_mass[i] = self.half_cleaning[i];
+            self.primitive_cache.pressure[i] =
+                (self.start.gamma - 1.0) * self.primitive_cache.density[i] * self.half_internal[i];
+            let volume = self.start.masses[i] / self.primitive_cache.density[i];
+            self.primitive_cache.magnetic[i] = self.half_magnetic[i] / volume;
+            self.primitive_cache.cleaning_scalar[i] = self.half_cleaning[i] / self.start.masses[i];
+        }
+        let state = MhdMfmState2d {
+            positions: self.drift.positions.clone(),
+            masses: self.start.masses.clone(),
+            velocities: self.drift.actual_velocities.clone(),
+            specific_internal_energy: self.half_internal.clone(),
+            smoothing_lengths: self.drift.predicted_smoothing_lengths.clone(),
+            magnetic_volume: self.half_magnetic.clone(),
+            cleaning_mass: self.half_cleaning.clone(),
+            domain: self.start.domain,
+            gamma: self.start.gamma,
+        };
+        state.validate()?;
+        if active.iter().all(|&is_active| is_active) {
+            let refreshed_global =
+                public_mhd_global_fastest_wave_speed_after_full_kick_2d(&state, &endpoint.rates)?;
+            endpoint.rates.global_fastest_wave_speed = refreshed_global;
+            for i in 0..count {
+                let particle_size =
+                    public_particle_size_2d(&state, i, self.primitive_cache.density[i]);
+                endpoint.rates.cleaning_damping_rate[i] =
+                    controls.parabolic_sigma * refreshed_global / particle_size;
+            }
+        }
+        self.old_rates = endpoint.rates.clone();
+        self.awaiting_second_kick = false;
+        Ok(PublicMhdHierarchyKickResult2d {
+            state,
+            rates: endpoint.rates,
+            wakeup: endpoint.wakeup,
+        })
+    }
+
+    /// Reassign the currently active particles, apply their next first
+    /// half-kicks, and drift the earliest arriving set to the following sync.
+    ///
+    /// This transition deliberately excludes pending wakeups: callers must
+    /// process any wakeup flags before using it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid active bounds, timeline reassignment, or
+    /// kick/drift arithmetic.
+    pub fn begin_next_sync_without_wakeups(
+        &mut self,
+        active_bounds: &[Option<f64>],
+    ) -> Result<PublicMhdHierarchySync2d, MhdEvolution2dError> {
+        let mut next = self.clone();
+        let result = next.begin_next_sync_without_wakeups_in_place(active_bounds)?;
+        *self = next;
+        Ok(result)
+    }
+
+    fn begin_next_sync_without_wakeups_in_place(
+        &mut self,
+        active_bounds: &[Option<f64>],
+    ) -> Result<PublicMhdHierarchySync2d, MhdEvolution2dError> {
+        if self.awaiting_second_kick {
+            return Err(invalid(
+                None,
+                "hierarchy_first_kick_phase",
+                self.timeline.current_time(),
+            ));
+        }
+        let active = self.timeline.active_mask();
+        self.timeline.reassign_active_bounds(active_bounds)?;
+        for (i, &is_active) in active.iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let half_timestep = 0.5
+                * self
+                    .timeline
+                    .duration_for_ticks(self.timeline.step_ticks()[i]);
+            self.drift.actual_velocities[i] =
+                self.drift.actual_velocities[i] + self.old_rates.acceleration[i] * half_timestep;
+            self.half_internal[i] = limited_internal_energy_update_2d(
+                self.half_internal[i],
+                self.old_rates.specific_internal_energy[i],
+                half_timestep,
+                self.minimum_specific_internal_energy,
+            )?;
+            self.half_magnetic[i] =
+                self.half_magnetic[i] + self.old_rates.magnetic_volume[i] * half_timestep;
+            let cleaning_kick = kick_cleaning_mass_public_2d(
+                self.half_cleaning[i],
+                self.drift.predicted_cleaning_mass[i],
+                self.old_rates.cleaning_mass[i],
+                self.old_rates.cleaning_damping_rate[i],
+                half_timestep,
+                self.start.masses[i],
+                self.primitive_cache.density[i],
+                self.primitive_cache.pressure[i],
+                self.primitive_cache.magnetic[i],
+                self.start.gamma,
+                self.old_rates.maximum_signal_speed[i],
+                self.old_rates.global_fastest_wave_speed,
+            );
+            self.half_cleaning[i] = cleaning_kick.value;
+            self.old_rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+        }
+        let arriving = self.timeline.advance_to_next_sync()?;
+        for (i, &is_active) in arriving.iter().enumerate() {
+            if is_active {
+                self.drift_particle_to_current(i)?;
+            }
+        }
+        self.awaiting_second_kick = true;
+        Ok(PublicMhdHierarchySync2d {
+            tick: self.timeline.current_tick(),
+            time: self.timeline.current_time(),
+            active: arriving,
+            drift: self.drift.clone(),
+        })
     }
 
     #[must_use]
@@ -2373,7 +2733,8 @@ pub fn finish_public_mhd_kdk_adaptive_2d(
             step.minimum_specific_internal_energy,
         )?);
         final_magnetic.push(step.half_magnetic[i] + rates.magnetic_volume[i] * half_timestep);
-        let particle_size = (step.start.masses[i] / predicted_primitive.density[i]).sqrt();
+        let particle_size =
+            public_particle_size_2d(&predicted_state, i, predicted_primitive.density[i]);
         let damping_rate = step.controls.parabolic_sigma * step.old_rates.global_fastest_wave_speed
             / particle_size;
         let cleaning_kick = kick_cleaning_mass_public_2d(
@@ -2551,7 +2912,8 @@ fn advance_public_mhd_kdk_legacy_reference_2d(
             minimum_specific_internal_energy,
         )?);
         final_magnetic.push(half_magnetic[i] + rates.magnetic_volume[i] * half_timestep);
-        let endpoint_particle_size = (state.masses[i] / predicted_primitive.density[i]).sqrt();
+        let endpoint_particle_size =
+            public_particle_size_2d(&predicted_state, i, predicted_primitive.density[i]);
         let endpoint_damping_rate =
             controls.parabolic_sigma * old_rates.global_fastest_wave_speed / endpoint_particle_size;
         let cleaning_kick = kick_cleaning_mass_public_2d(
@@ -4010,6 +4372,282 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::float_cmp, clippy::too_many_lines)]
+    fn arriving_second_kick_resets_only_active_predictors() {
+        let state = sheet(16, 4, true);
+        let rates = mhd_mfm_spatial_rates_2d(&state, no_sources()).unwrap();
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let short_ticks = 1_u64 << 49;
+        let long_ticks = 1_u64 << 50;
+        let timebins: Vec<_> = (0..state.positions.len())
+            .map(|i| {
+                let ticks = if i % 2 == 0 { long_ticks } else { short_ticks };
+                PublicMhdInitialTimebin2d {
+                    bounded_timestep: ticks as f64 * tick_duration,
+                    raw_ticks: ticks,
+                    ticks,
+                    time_bin: ticks.ilog2(),
+                    duration: ticks as f64 * tick_duration,
+                }
+            })
+            .collect();
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let sync = hierarchy.drift_to_first_sync().unwrap();
+        let active = sync.active;
+        let before_actual_velocity = hierarchy.drift.actual_velocities.clone();
+        let before_actual_internal = hierarchy.half_internal.clone();
+        let before_actual_magnetic = hierarchy.half_magnetic.clone();
+        let before_actual_cleaning = hierarchy.half_cleaning.clone();
+        let before_predicted_velocity = hierarchy.drift.predicted_velocities.clone();
+        let before_predicted_internal = hierarchy.drift.predicted_specific_internal_energy.clone();
+        let before_predicted_magnetic = hierarchy.drift.predicted_magnetic_volume.clone();
+        let before_predicted_cleaning = hierarchy.drift.predicted_cleaning_mass.clone();
+
+        let mut endpoint_rates = rates.clone();
+        for (i, &is_active) in active.iter().enumerate() {
+            if is_active {
+                endpoint_rates.acceleration[i] = Vector3::new(0.25, -0.5, 0.75);
+                endpoint_rates.specific_internal_energy[i] = 0.125;
+                endpoint_rates.magnetic_volume[i] = Vector3::new(-0.5, 0.25, 0.125);
+            }
+        }
+        let wakeup: Vec<_> = active.iter().map(|&is_active| !is_active).collect();
+        let endpoint = PublicMhdActiveRateResult2d {
+            rates: endpoint_rates.clone(),
+            wakeup: wakeup.clone(),
+            controls: no_sources(),
+        };
+        let mut corrupted = endpoint.clone();
+        let inactive = active.iter().position(|&is_active| !is_active).unwrap();
+        corrupted.rates.acceleration[inactive].x += 1.0;
+        assert!(hierarchy.finish_arriving_active_kicks(corrupted).is_err());
+        let result = hierarchy
+            .finish_arriving_active_kicks(endpoint.clone())
+            .unwrap();
+        assert!(hierarchy.finish_arriving_active_kicks(endpoint).is_err());
+        let half_timestep = 0.5 * short_ticks as f64 * tick_duration;
+        for (i, &is_active) in active.iter().enumerate() {
+            if is_active {
+                assert_eq!(
+                    result.state.velocities[i],
+                    before_actual_velocity[i] + endpoint_rates.acceleration[i] * half_timestep
+                );
+                assert_eq!(
+                    result.state.specific_internal_energy[i],
+                    before_actual_internal[i]
+                        + endpoint_rates.specific_internal_energy[i] * half_timestep
+                );
+                assert_eq!(
+                    result.state.magnetic_volume[i],
+                    before_actual_magnetic[i] + endpoint_rates.magnetic_volume[i] * half_timestep
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_velocities[i],
+                    result.state.velocities[i]
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_specific_internal_energy[i],
+                    result.state.specific_internal_energy[i]
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_magnetic_volume[i],
+                    result.state.magnetic_volume[i]
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_cleaning_mass[i],
+                    result.state.cleaning_mass[i]
+                );
+            } else {
+                assert_eq!(result.state.velocities[i], before_actual_velocity[i]);
+                assert_eq!(
+                    result.state.specific_internal_energy[i].to_bits(),
+                    before_actual_internal[i].to_bits()
+                );
+                assert_eq!(result.state.magnetic_volume[i], before_actual_magnetic[i]);
+                assert_eq!(
+                    result.state.cleaning_mass[i].to_bits(),
+                    before_actual_cleaning[i].to_bits()
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_velocities[i],
+                    before_predicted_velocity[i]
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_specific_internal_energy[i].to_bits(),
+                    before_predicted_internal[i].to_bits()
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_magnetic_volume[i],
+                    before_predicted_magnetic[i]
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_cleaning_mass[i].to_bits(),
+                    before_predicted_cleaning[i].to_bits()
+                );
+            }
+        }
+        assert_eq!(result.rates, endpoint_rates);
+        assert_eq!(result.wakeup, wakeup);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn first_hierarchy_sync_runs_cached_active_force_and_second_kick() {
+        let state = sheet(16, 4, true);
+        let controls = no_sources();
+        let rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let short_ticks = 1_u64 << 49;
+        let long_ticks = 1_u64 << 50;
+        let timebins: Vec<_> = (0..state.positions.len())
+            .map(|i| {
+                let ticks = if i % 2 == 0 { long_ticks } else { short_ticks };
+                PublicMhdInitialTimebin2d {
+                    bounded_timestep: ticks as f64 * tick_duration,
+                    raw_ticks: ticks,
+                    ticks,
+                    time_bin: ticks.ilog2(),
+                    duration: ticks as f64 * tick_duration,
+                }
+            })
+            .collect();
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let sync = hierarchy.drift_to_first_sync().unwrap();
+        for i in 0..state.positions.len() {
+            hierarchy.drift_neighbor_to_current(i).unwrap();
+        }
+        hierarchy
+            .refresh_arriving_active_caches(20.0, 0.05)
+            .unwrap();
+        let endpoint = hierarchy
+            .evaluate_arriving_active_rates(controls, 0.2)
+            .unwrap();
+        assert!(endpoint.rates.pair_count > 0);
+        assert!(endpoint.rates.pair_count < 2 * rates.pair_count);
+        for (i, &is_active) in sync.active.iter().enumerate() {
+            if !is_active {
+                assert_eq!(endpoint.rates.acceleration[i], rates.acceleration[i]);
+                assert_eq!(
+                    endpoint.rates.specific_internal_energy[i].to_bits(),
+                    rates.specific_internal_energy[i].to_bits()
+                );
+                assert_eq!(endpoint.rates.magnetic_volume[i], rates.magnetic_volume[i]);
+            }
+        }
+        assert!(endpoint.wakeup.iter().all(|&wakeup| !wakeup));
+        let kicked = hierarchy.finish_arriving_active_kicks(endpoint).unwrap();
+        kicked.state.validate().unwrap();
+        for (i, &is_active) in sync.active.iter().enumerate() {
+            if is_active {
+                assert_eq!(
+                    hierarchy.predictor_ticks()[i],
+                    hierarchy.timeline.current_tick()
+                );
+                assert_eq!(
+                    hierarchy.drift.predicted_velocities[i],
+                    kicked.state.velocities[i]
+                );
+            }
+        }
+        let next_bounds: Vec<_> = sync
+            .active
+            .iter()
+            .map(|&is_active| is_active.then_some(short_ticks as f64 * tick_duration))
+            .collect();
+        let next_sync = hierarchy
+            .begin_next_sync_without_wakeups(&next_bounds)
+            .unwrap();
+        assert_eq!(next_sync.tick, long_ticks);
+        assert!(next_sync.active.iter().all(|&is_active| is_active));
+        hierarchy
+            .refresh_arriving_active_caches(20.0, 0.05)
+            .unwrap();
+        let second_predicted = hierarchy.predicted_state().unwrap();
+        let expected_directed_pairs = 2 * interacting_pairs_2d(
+            &second_predicted.positions,
+            &second_predicted.smoothing_lengths,
+            second_predicted.domain,
+        )
+        .unwrap()
+        .len();
+        let second_endpoint = hierarchy
+            .evaluate_arriving_active_rates(controls, 0.2)
+            .unwrap();
+        assert_eq!(second_endpoint.rates.pair_count, expected_directed_pairs);
+        let second_kick = hierarchy
+            .finish_arriving_active_kicks(second_endpoint)
+            .unwrap();
+        second_kick.state.validate().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn full_sync_refreshes_dedner_global_before_the_next_first_kick() {
+        let mut state = sheet(16, 4, true);
+        state.cleaning_mass.fill(1.0e-6);
+        let controls = DivergenceControl2d::default();
+        let mut rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        rates.global_fastest_wave_speed *= 0.25;
+        let primitive = state.primitive_columns().unwrap();
+        for i in 0..state.positions.len() {
+            rates.cleaning_mass[i] = 0.0;
+            rates.cleaning_damping_rate[i] = controls.parabolic_sigma
+                * rates.global_fastest_wave_speed
+                / public_particle_size_2d(&state, i, primitive.density[i]);
+        }
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let ticks = 1_u64 << 49;
+        let timebins = vec![
+            PublicMhdInitialTimebin2d {
+                bounded_timestep: ticks as f64 * tick_duration,
+                raw_ticks: ticks,
+                ticks,
+                time_bin: ticks.ilog2(),
+                duration: ticks as f64 * tick_duration,
+            };
+            state.positions.len()
+        ];
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let sync = hierarchy.drift_to_first_sync().unwrap();
+        assert!(sync.active.iter().all(|&is_active| is_active));
+        let endpoint = PublicMhdActiveRateResult2d {
+            rates: rates.clone(),
+            wakeup: vec![false; state.positions.len()],
+            controls,
+        };
+        let kicked = hierarchy.finish_arriving_active_kicks(endpoint).unwrap();
+        let refreshed_global =
+            public_mhd_global_fastest_wave_speed_after_full_kick_2d(&kicked.state, &kicked.rates)
+                .unwrap();
+        assert_eq!(
+            kicked.rates.global_fastest_wave_speed.to_bits(),
+            refreshed_global.to_bits()
+        );
+        for i in 0..state.positions.len() {
+            let expected_damping = controls.parabolic_sigma * refreshed_global
+                / public_particle_size_2d(&kicked.state, i, hierarchy.primitive_cache.density[i]);
+            assert_eq!(
+                kicked.rates.cleaning_damping_rate[i].to_bits(),
+                expected_damping.to_bits()
+            );
+        }
+        let before_first_kick = hierarchy.half_cleaning.clone();
+        let half_timestep = 0.5 * ticks as f64 * tick_duration;
+        let bounds = vec![Some(ticks as f64 * tick_duration); state.positions.len()];
+        hierarchy.begin_next_sync_without_wakeups(&bounds).unwrap();
+        for (i, &before) in before_first_kick.iter().enumerate() {
+            let expected = before * (-half_timestep * kicked.rates.cleaning_damping_rate[i]).exp();
+            assert_eq!(hierarchy.half_cleaning[i].to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn ordered_active_targets_match_full_rates_and_retain_partial_global_speed() {
         let state = sheet(16, 4, true);
@@ -4110,7 +4748,7 @@ mod tests {
             partial.global_fastest_wave_speed.to_bits(),
             123.0_f64.to_bits()
         );
-        let particle_size = (state.masses[1] / primitive.density[1]).sqrt();
+        let particle_size = public_particle_size_2d(&state, 1, primitive.density[1]);
         assert_eq!(
             partial.cleaning_damping_rate[1].to_bits(),
             (controls.parabolic_sigma * 123.0 / particle_size).to_bits()
