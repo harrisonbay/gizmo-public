@@ -1,17 +1,19 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    GradientEstimate, MeshlessPoint1d, MfmEvolvingState1d, density_at_hsml_1d,
-    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
-    solve_smoothing_lengths_1d,
+    GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d,
+    SynchronizedTimeline1d, begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d,
+    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
+    select_public_soundwave_timestep_1d, solve_smoothing_lengths_1d,
 };
-use gizmo_io::read_soundwave;
+use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
 use gizmo_params::SoundwaveParameters;
 
 fn main() -> ExitCode {
@@ -55,7 +57,7 @@ fn run() -> Result<(), ApplicationError> {
         initialized.summary.print(&manifest.sha256());
         Ok(())
     } else {
-        Err(ApplicationError::NotYetPorted)
+        evolve_soundwave(initialized)
     }
 }
 
@@ -349,6 +351,202 @@ impl InitializedSoundwave {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn evolve_soundwave(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
+    let output_dir = PathBuf::from(&initialized.parameters.output_dir);
+    fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
+    let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
+        .map_err(ApplicationError::Hydro)?;
+    let tick_duration = initialized.parameters.time_max / LEGACY_TIMEBASE_TICKS as f64;
+    let mut rates =
+        mfm_spatial_rates_1d(initialized.state.as_view()).map_err(ApplicationError::Hydro)?;
+    let mut next_output_time = 0.0_f64;
+    let mut next_output_tick = Some(0_u64);
+    let mut snapshot_number = 0_u32;
+    let mut last_output_tick = None;
+    let mut step_count = 0_u64;
+
+    while !timeline.is_finished() {
+        let selection = select_public_soundwave_timestep_1d(
+            initialized.state.as_view(),
+            &rates,
+            initialized.parameters.max_timestep,
+            initialized.parameters.courant_factor,
+            initialized.parameters.integration_accuracy,
+        )
+        .map_err(ApplicationError::Hydro)?;
+        let synchronized = timeline
+            .select_step(selection.duration, initialized.parameters.max_timestep)
+            .map_err(ApplicationError::Hydro)?;
+        let start_tick = timeline.current_tick();
+        let end_tick = start_tick + synchronized.ticks;
+        let prepared = begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
+            .map_err(ApplicationError::Hydro)?;
+
+        while next_output_tick.is_some_and(|tick| tick <= end_tick) {
+            let output_tick = next_output_tick.expect("checked above");
+            if output_tick < start_tick {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "snapshot tick {output_tick} precedes current tick {start_tick}"
+                )));
+            }
+            let elapsed = (output_tick - start_tick) as f64 * tick_duration;
+            let drift = prepared
+                .drift_state(elapsed)
+                .map_err(ApplicationError::Hydro)?;
+            write_drift_snapshot(
+                &initialized,
+                &drift,
+                output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                output_tick as f64 * tick_duration,
+            )?;
+            last_output_tick = Some(output_tick);
+            snapshot_number = snapshot_number.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("snapshot number overflow".to_owned())
+            })?;
+
+            next_output_time += initialized.parameters.time_between_snapshots;
+            next_output_tick = (next_output_time <= initialized.parameters.time_max)
+                .then(|| legacy_output_tick(next_output_time, tick_duration));
+            if next_output_tick.is_some_and(|tick| tick <= output_tick) {
+                return Err(ApplicationError::StateMismatch(
+                    "snapshot cadence does not advance on the integer timeline".to_owned(),
+                ));
+            }
+        }
+
+        let (endpoint, new_rates) = finish_mfm_kdk_1d(
+            prepared,
+            initialized.parameters.desired_num_neighbors,
+            initialized.parameters.max_neighbor_deviation,
+        )
+        .map_err(ApplicationError::Hydro)?;
+        initialized.state = endpoint;
+        rates = new_rates;
+        timeline
+            .advance(synchronized)
+            .map_err(ApplicationError::Hydro)?;
+        step_count = step_count
+            .checked_add(1)
+            .ok_or_else(|| ApplicationError::StateMismatch("step count overflow".to_owned()))?;
+    }
+
+    if last_output_tick != Some(LEGACY_TIMEBASE_TICKS) {
+        write_completed_snapshot(
+            &initialized,
+            output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+            initialized.parameters.time_max,
+        )?;
+        snapshot_number = snapshot_number.checked_add(1).ok_or_else(|| {
+            ApplicationError::StateMismatch("snapshot number overflow".to_owned())
+        })?;
+    }
+    eprintln!(
+        "completed {step_count} synchronized steps to t={:.17e}; wrote {snapshot_number} snapshots",
+        timeline.current_time()
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn legacy_output_tick(output_time: f64, tick_duration: f64) -> u64 {
+    (output_time / tick_duration) as u64
+}
+
+fn write_drift_snapshot(
+    initialized: &InitializedSoundwave,
+    drift: &MfmDriftState1d,
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    write_snapshot_columns(
+        initialized,
+        &drift.positions,
+        &drift.conserved_velocities,
+        &drift.predicted_specific_internal_energy,
+        &drift.predicted_density,
+        &drift.predicted_smoothing_lengths,
+        path,
+        time,
+    )
+}
+
+fn write_completed_snapshot(
+    initialized: &InitializedSoundwave,
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let density: Vec<f64> = density_at_hsml_1d(
+        &initialized.state.positions,
+        &initialized.state.masses,
+        &initialized.state.smoothing_lengths,
+        initialized.state.box_size,
+    )
+    .map_err(ApplicationError::Hydro)?
+    .into_iter()
+    .map(|estimate| estimate.density)
+    .collect();
+    write_snapshot_columns(
+        initialized,
+        &initialized.state.positions,
+        &initialized.state.velocities,
+        &initialized.state.specific_internal_energy,
+        &density,
+        &initialized.state.smoothing_lengths,
+        path,
+        time,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_snapshot_columns(
+    initialized: &InitializedSoundwave,
+    positions: &[f64],
+    velocities: &[f64],
+    internal_energy: &[f64],
+    density: &[f64],
+    smoothing_lengths: &[f64],
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let coordinates: Vec<[f64; 3]> = positions
+        .iter()
+        .zip(&initialized.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.position[0], shell.position[1]])
+        .collect();
+    let velocity_vectors: Vec<[f64; 3]> = velocities
+        .iter()
+        .zip(&initialized.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.velocity[0], shell.velocity[1]])
+        .collect();
+    let gas_count = u64::try_from(initialized.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u64".to_owned()))?;
+    let header = SnapshotHeader {
+        time,
+        box_size: initialized.state.box_size,
+        num_part_total: [gas_count, 0, 0, 0, 0, 0],
+        double_precision: true,
+    };
+    write_soundwave(
+        path,
+        SoundWaveWriteView {
+            header: &header,
+            coordinates: &coordinates,
+            velocities: &velocity_vectors,
+            ids: &initialized.particle_ids,
+            masses: &initialized.state.masses,
+            internal_energy,
+            density,
+            smoothing_length: smoothing_lengths,
+        },
+    )
+    .map_err(ApplicationError::Output)
+}
+
 fn soundwave_gradient_errors(
     snapshot: &gizmo_io::SoundWaveSnapshot,
     positions: &[f64],
@@ -567,12 +765,13 @@ enum ApplicationError {
     Config(gizmo_config::ReadConfigError),
     Parameters(gizmo_params::ReadParameterError),
     Input(gizmo_io::InputError),
+    Output(gizmo_io::OutputError),
+    OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
     UnsupportedConfig(String),
     UnsupportedRestart(RestartFlag),
     MissingDataset(&'static str),
     StateMismatch(String),
-    NotYetPorted,
 }
 
 impl std::fmt::Display for ApplicationError {
@@ -582,6 +781,13 @@ impl std::fmt::Display for ApplicationError {
             Self::Config(error) => error.fmt(formatter),
             Self::Parameters(error) => error.fmt(formatter),
             Self::Input(error) => error.fmt(formatter),
+            Self::Output(error) => error.fmt(formatter),
+            Self::OutputDirectory(error) => {
+                write!(
+                    formatter,
+                    "failed to create snapshot output directory: {error}"
+                )
+            }
             Self::Hydro(error) => error.fmt(formatter),
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
@@ -595,9 +801,6 @@ impl std::fmt::Display for ApplicationError {
                 write!(formatter, "initial condition is missing required `{name}`")
             }
             Self::StateMismatch(error) => write!(formatter, "initial state mismatch: {error}"),
-            Self::NotYetPorted => formatter.write_str(
-                "simulation execution is not yet ported; no scientific computation was performed",
-            ),
         }
     }
 }
@@ -676,5 +879,26 @@ DEVELOPER_MODE
                 Err(ApplicationError::UnsupportedRestart(actual)) if actual == restart
             ));
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn default_output_schedule_matches_long_integer_c_timeline() {
+        let tick_duration = 1.5 / LEGACY_TIMEBASE_TICKS as f64;
+        assert_eq!(
+            legacy_output_tick(0.1, tick_duration),
+            76_861_433_640_456_464
+        );
+
+        let mut time = 0.0;
+        let mut ticks = Vec::new();
+        while time <= 1.5 {
+            ticks.push(legacy_output_tick(time, tick_duration));
+            time += 0.1;
+        }
+        assert_eq!(ticks.len(), 15);
+        assert_eq!(ticks[0], 0);
+        assert!(ticks[14] < LEGACY_TIMEBASE_TICKS);
+        assert!(time > 1.5);
     }
 }
