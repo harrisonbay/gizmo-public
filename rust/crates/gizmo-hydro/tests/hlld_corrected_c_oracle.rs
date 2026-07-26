@@ -1,5 +1,5 @@
 use gizmo_hydro::mhd::{
-    hlld_riemann, FluxFrame1d, HlldOptions, IdealMhdPrimitive1d, MhdRiemannMethod, Vector3,
+    FluxFrame1d, HlldOptions, IdealMhdPrimitive1d, MhdRiemannMethod, Vector3, hlld_riemann,
 };
 
 const GAMMA: f64 = 5.0 / 3.0;

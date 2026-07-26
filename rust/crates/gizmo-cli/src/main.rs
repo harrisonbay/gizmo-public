@@ -11,6 +11,11 @@ use gizmo_config::ConfigManifest;
 use gizmo_hydro::grain::{
     EpsteinDragParameters, GrainGasPoint1d, GrainPoint1d, compute_epstein_drag_batch_1d,
 };
+use gizmo_hydro::mhd::Vector3;
+use gizmo_hydro::mhd_evolution::{
+    DivergenceControl1d, MhdMfmRates1d, MhdMfmState1d, advance_mhd_kdk_1d,
+    global_mhd_courant_timestep_1d, mhd_mfm_spatial_rates_1d,
+};
 use gizmo_hydro::{
     BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
     MfmEvolvingState1d, SynchronizedTimeline1d, begin_mfm_kdk_1d, begin_mfm_reflective_kdk_1d,
@@ -20,8 +25,9 @@ use gizmo_hydro::{
     select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d_with_boundary,
 };
 use gizmo_io::{
-    DustyWaveWriteView, GasWriteView, GrainWriteView, SnapshotHeader, SoundWaveWriteView,
-    read_dustywave, read_soundwave, write_dustywave, write_soundwave,
+    DustyWaveWriteView, GasWriteView, GrainWriteView, MhdWaveWriteView, SnapshotHeader,
+    SoundWaveWriteView, read_dustywave, read_mhd_wave, read_soundwave, write_dustywave,
+    write_mhd_wave, write_soundwave,
 };
 use gizmo_params::SoundwaveParameters;
 
@@ -81,6 +87,7 @@ fn reject_unsupported_restart(restart: RestartFlag) -> Result<(), ApplicationErr
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StrictProfile {
     Soundwave,
+    MhdWave,
     EqualMassShocktube,
     InteractingBlast,
     Dustywave,
@@ -89,7 +96,7 @@ enum StrictProfile {
 impl StrictProfile {
     const fn gamma(self) -> f64 {
         match self {
-            Self::Soundwave | Self::Dustywave => 5.0 / 3.0,
+            Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
             Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
@@ -97,6 +104,7 @@ impl StrictProfile {
     const fn name(self) -> &'static str {
         match self {
             Self::Soundwave => "soundwave",
+            Self::MhdWave => "MHD wave",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
             Self::Dustywave => "dusty wave",
@@ -105,7 +113,7 @@ impl StrictProfile {
 
     const fn boundary(self) -> BoundaryMode1d {
         match self {
-            Self::Soundwave | Self::EqualMassShocktube | Self::Dustywave => {
+            Self::Soundwave | Self::MhdWave | Self::EqualMassShocktube | Self::Dustywave => {
                 BoundaryMode1d::Periodic
             }
             Self::InteractingBlast => BoundaryMode1d::Reflective,
@@ -113,6 +121,7 @@ impl StrictProfile {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
     const REQUIRED_FLAGS: [&str; 4] = [
         "DEVELOPER_MODE",
@@ -120,7 +129,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
-    const ALLOWED: [&str; 14] = [
+    const ALLOWED: [&str; 15] = [
         "BOX_BND_PARTICLES",
         "BOX_PERIODIC",
         "BOX_REFLECT_X",
@@ -133,6 +142,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "GRAIN_FLUID",
         "HYDRO_MESHLESS_FINITE_MASS",
         "INPUT_IN_DOUBLEPRECISION",
+        "MAGNETIC",
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
@@ -154,6 +164,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "FORCE_EQUAL_TIMESTEPS",
         "GRAIN_BACKREACTION",
         "GRAIN_FLUID",
+        "MAGNETIC",
     ] {
         if manifest.get(topology_flag).is_some() {
             require_config_flag(manifest, topology_flag)?;
@@ -176,6 +187,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         .get("EOS_ENFORCE_ADIABAT")
         .and_then(|option| option.value.as_deref());
     let input_double = manifest.get("INPUT_IN_DOUBLEPRECISION").is_some();
+    let magnetic = manifest.get("MAGNETIC").is_some();
     if !grain_fluid && !input_double {
         return Err(ApplicationError::UnsupportedConfig(
             "required option `INPUT_IN_DOUBLEPRECISION` is missing".to_owned(),
@@ -192,17 +204,21 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         grain_backreaction,
         enforce_adiabat,
         input_double,
+        magnetic,
     ) {
-        (Some("(5.0/3.0)"), true, true, false, false, false, false, None, true) => {
+        (Some("(5.0/3.0)"), true, true, false, false, false, false, None, true, false) => {
             Ok(StrictProfile::Soundwave)
         }
-        (Some("(1.4)"), true, true, false, false, false, false, None, true) => {
+        (Some("(5.0/3.0)"), true, false, false, false, false, false, None, true, true) => {
+            Ok(StrictProfile::MhdWave)
+        }
+        (Some("(1.4)"), true, true, false, false, false, false, None, true, false) => {
             Ok(StrictProfile::EqualMassShocktube)
         }
-        (Some("(1.4)"), false, false, true, true, false, false, None, true) => {
+        (Some("(1.4)"), false, false, true, true, false, false, None, true, false) => {
             Ok(StrictProfile::InteractingBlast)
         }
-        (Some("(5./3.)"), true, false, false, false, true, true, Some("(3./5.)"), false) => {
+        (Some("(5./3.)"), true, false, false, false, true, true, Some("(3./5.)"), false, false) => {
             Ok(StrictProfile::Dustywave)
         }
         _ => Err(ApplicationError::UnsupportedConfig(format!(
@@ -212,7 +228,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
              BOX_BND_PARTICLES={boundary_particles}, GRAIN_FLUID={grain_fluid}, \
              GRAIN_BACKREACTION={grain_backreaction}, \
              EOS_ENFORCE_ADIABAT={enforce_adiabat:?}, \
-             INPUT_IN_DOUBLEPRECISION={input_double}"
+             INPUT_IN_DOUBLEPRECISION={input_double}, MAGNETIC={magnetic}"
         ))),
     }
 }
@@ -247,14 +263,19 @@ fn require_config_value(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn initialize_profile(
     parameter_file: &Path,
     profile: StrictProfile,
-) -> Result<InitializedSoundwave, ApplicationError> {
+) -> Result<InitializedProfile, ApplicationError> {
     let parameters = read_profile_parameters(parameter_file, profile)?;
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
+    if profile == StrictProfile::MhdWave {
+        return initialize_mhd_wave(&fixture_path, parameters).map(InitializedProfile::Mhd);
+    }
     if profile == StrictProfile::Dustywave {
-        return initialize_dustywave(&fixture_path, parameters, profile);
+        return initialize_dustywave(&fixture_path, parameters, profile)
+            .map(InitializedProfile::Hydro);
     }
     let snapshot = read_soundwave(&fixture_path).map_err(ApplicationError::Input)?;
     if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
@@ -341,7 +362,7 @@ fn initialize_profile(
         box_size: snapshot.header.box_size,
         gamma: profile.gamma(),
     };
-    Ok(InitializedSoundwave {
+    Ok(InitializedProfile::Hydro(InitializedSoundwave {
         profile,
         parameters,
         particle_ids,
@@ -349,6 +370,89 @@ fn initialize_profile(
         state,
         grains: None,
         summary,
+    }))
+}
+
+fn initialize_mhd_wave(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+) -> Result<InitializedMhdWave, ApplicationError> {
+    let snapshot = read_mhd_wave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    let positions: Vec<f64> = snapshot
+        .gas
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate[0])
+        .collect();
+    let solved = solve_public_c_initial_smoothing_lengths_1d_with_boundary(
+        &positions,
+        &snapshot.gas.masses,
+        snapshot.header.box_size,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+        BoundaryMode1d::Periodic,
+    )
+    .map_err(ApplicationError::Hydro)?;
+    let smoothing_lengths = solved
+        .into_iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    let velocities = snapshot
+        .gas
+        .velocities
+        .iter()
+        .copied()
+        .map(|value| Vector3::new(value[0], value[1], value[2]))
+        .collect();
+    let magnetic: Vec<Vector3> = snapshot
+        .gas
+        .magnetic_field
+        .iter()
+        .copied()
+        .map(|value| Vector3::new(value[0], value[1], value[2]))
+        .collect();
+    // Restart mode zero follows the C initial-condition path: the magnetic
+    // field is physical input, while stored cleaning diagnostics are stale
+    // derived state and must not seed a new evolution.
+    let cleaning_scalar = vec![0.0; positions.len()];
+    let state = MhdMfmState1d::from_primitive(
+        positions,
+        snapshot.gas.masses,
+        velocities,
+        snapshot.gas.internal_energy,
+        smoothing_lengths,
+        &magnetic,
+        &cleaning_scalar,
+        snapshot.header.box_size,
+        StrictProfile::MhdWave.gamma(),
+    )
+    .map_err(ApplicationError::MhdEvolution)?;
+    let controls = DivergenceControl1d {
+        hyperbolic_sigma: parameters
+            .divb_cleaning_hyperbolic_sigma
+            .expect("strict MHD parameters require hyperbolic cleaning"),
+        parabolic_sigma: parameters
+            .divb_cleaning_parabolic_sigma
+            .expect("strict MHD parameters require parabolic cleaning"),
+        ..DivergenceControl1d::default()
+    };
+    Ok(InitializedMhdWave {
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        transverse_positions: snapshot
+            .gas
+            .coordinates
+            .into_iter()
+            .map(|position| [position[1], position[2]])
+            .collect(),
+        state,
+        controls,
     })
 }
 
@@ -528,6 +632,9 @@ fn read_profile_parameters(
             .map_err(ApplicationError::Parameters);
     }
     let input = fs::read_to_string(parameter_file).map_err(ApplicationError::ParameterFile)?;
+    if profile == StrictProfile::MhdWave {
+        return read_mhd_wave_parameters(&input);
+    }
     let mut retained = Vec::new();
     let mut profile_tags = BTreeSet::new();
     for (line_index, raw_line) in input.lines().enumerate() {
@@ -688,6 +795,118 @@ fn read_profile_parameters(
     Ok(parameters)
 }
 
+#[allow(clippy::too_many_lines)]
+fn read_mhd_wave_parameters(input: &str) -> Result<SoundwaveParameters, ApplicationError> {
+    const REQUIRED_TAGS: [&str; 19] = [
+        "InitCondFile",
+        "OutputDir",
+        "TimeMax",
+        "BoxSize",
+        "TimeBetSnapshot",
+        "MaxSizeTimestep",
+        "DesNumNgb",
+        "MaxMemSize",
+        "ErrTolIntAccuracy",
+        "CourantFac",
+        "MaxRMSDisplacementFac",
+        "ErrTolForceAcc",
+        "TimeBetStatistics",
+        "MaxNumNgbDeviation",
+        "ErrTolTheta",
+        "DivBcleaningParabolicSigma",
+        "DivBcleaningHyperbolicSigma",
+        "ResubmitOn",
+        "ResubmitCommand",
+    ];
+    let actual_tags: BTreeSet<&str> = input
+        .lines()
+        .filter_map(|line| {
+            let definition = line
+                .split_once('%')
+                .map_or(line, |(before, _)| before)
+                .trim();
+            (!definition.is_empty()).then(|| definition.split_whitespace().next().unwrap_or(""))
+        })
+        .collect();
+    let required_tags: BTreeSet<&str> = REQUIRED_TAGS.iter().copied().collect();
+    if actual_tags != required_tags {
+        let missing: Vec<_> = required_tags.difference(&actual_tags).copied().collect();
+        let unexpected: Vec<_> = actual_tags.difference(&required_tags).copied().collect();
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "MHD wave requires the exact frontier parameter vocabulary; \
+             missing={missing:?}, unexpected={unexpected:?}"
+        )));
+    }
+    let parameters = SoundwaveParameters::parse(input)
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    let required_scalars: [(&str, f64, f64); 12] = [
+        ("TimeMax", parameters.time_max, 0.5),
+        ("BoxSize", parameters.box_size, 1.0),
+        ("TimeBetSnapshot", parameters.time_between_snapshots, 0.05),
+        ("MaxSizeTimestep", parameters.max_timestep, 0.1),
+        ("DesNumNgb", parameters.desired_num_neighbors, 4.0),
+        ("ErrTolIntAccuracy", parameters.integration_accuracy, 0.01),
+        ("CourantFac", parameters.courant_factor, 0.2),
+        (
+            "MaxRMSDisplacementFac",
+            parameters.max_rms_displacement_factor,
+            0.1,
+        ),
+        ("ErrTolForceAcc", parameters.force_accuracy, 0.001),
+        ("TimeBetStatistics", parameters.time_between_statistics, 0.5),
+        (
+            "MaxNumNgbDeviation",
+            parameters.max_neighbor_deviation,
+            1.0e-6,
+        ),
+        ("ErrTolTheta", parameters.tree_opening_angle, 0.7),
+    ];
+    for (field, actual, expected) in required_scalars {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "MHD wave requires `{field} {expected}`, found `{actual}`"
+            )));
+        }
+    }
+    let required_cleaning: [(&str, Option<f64>, f64); 2] = [
+        (
+            "DivBcleaningParabolicSigma",
+            parameters.divb_cleaning_parabolic_sigma,
+            0.2,
+        ),
+        (
+            "DivBcleaningHyperbolicSigma",
+            parameters.divb_cleaning_hyperbolic_sigma,
+            1.0,
+        ),
+    ];
+    for (field, actual, expected) in required_cleaning {
+        if actual.is_none_or(|value| value.to_bits() != expected.to_bits()) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "MHD wave requires `{field} {expected}`, found {actual:?}"
+            )));
+        }
+    }
+    if parameters.init_cond_file != "mhd_wave_ics"
+        || parameters.output_dir != "output"
+        || parameters.max_memory_mb != Some(1000)
+        || parameters.min_timestep.is_some()
+        || parameters.resubmit
+        || parameters.resubmit_command != "none"
+        || parameters.grain_internal_density.is_some()
+        || parameters.grain_size_min.is_some()
+        || parameters.grain_size_max.is_some()
+        || parameters.grain_size_spectrum_powerlaw.is_some()
+        || parameters.type3_softening.is_some()
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "MHD wave string, memory, restart, or non-MHD parameters differ from frontier.params"
+                .to_owned(),
+        ));
+    }
+    Ok(parameters)
+}
+
 fn summarize_initialization(
     snapshot: &gizmo_io::SoundWaveSnapshot,
     positions: &[f64],
@@ -763,6 +982,99 @@ struct InitializedSoundwave {
     state: MfmEvolvingState1d,
     grains: Option<GrainRuntimeState1d>,
     summary: Option<InitializationSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InitializedMhdWave {
+    parameters: SoundwaveParameters,
+    particle_ids: Vec<u64>,
+    transverse_positions: Vec<[f64; 2]>,
+    state: MhdMfmState1d,
+    controls: DivergenceControl1d,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum InitializedProfile {
+    Hydro(InitializedSoundwave),
+    Mhd(InitializedMhdWave),
+}
+
+impl InitializedProfile {
+    fn validate_owned_state(&self) -> Result<(), ApplicationError> {
+        match self {
+            Self::Hydro(initialized) => initialized.validate_owned_state(),
+            Self::Mhd(initialized) => initialized.validate_owned_state(),
+        }
+    }
+
+    fn print_initialization(&self, config_sha256: &str) {
+        match self {
+            Self::Hydro(initialized) => initialized.print_initialization(config_sha256),
+            Self::Mhd(initialized) => initialized.print_initialization(config_sha256),
+        }
+    }
+}
+
+impl InitializedMhdWave {
+    fn validate_owned_state(&self) -> Result<(), ApplicationError> {
+        let particle_count = self.state.positions.len();
+        for (field, actual) in [
+            ("ParticleIDs", self.particle_ids.len()),
+            ("transverse positions", self.transverse_positions.len()),
+            ("masses", self.state.masses.len()),
+            ("velocities", self.state.velocities.len()),
+            (
+                "specific internal energy",
+                self.state.specific_internal_energy.len(),
+            ),
+            ("smoothing lengths", self.state.smoothing_lengths.len()),
+            ("magnetic volume", self.state.magnetic_volume.len()),
+            ("cleaning mass", self.state.cleaning_mass.len()),
+        ] {
+            if actual != particle_count {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "{field} has {actual} entries, expected {particle_count}"
+                )));
+            }
+        }
+        if self.particle_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ApplicationError::StateMismatch(
+                "MHD ParticleIDs are not strictly sorted".to_owned(),
+            ));
+        }
+        if self.parameters.box_size.to_bits() != self.state.box_size.to_bits()
+            || self.state.gamma.to_bits() != StrictProfile::MhdWave.gamma().to_bits()
+        {
+            return Err(ApplicationError::StateMismatch(
+                "MHD runtime bundle has inconsistent box size or EOS gamma".to_owned(),
+            ));
+        }
+        if self
+            .transverse_positions
+            .iter()
+            .flatten()
+            .any(|component| !component.is_finite())
+        {
+            return Err(ApplicationError::StateMismatch(
+                "MHD runtime bundle has non-finite transverse coordinates".to_owned(),
+            ));
+        }
+        self.state
+            .primitive_columns()
+            .map_err(ApplicationError::MhdEvolution)?;
+        Ok(())
+    }
+
+    fn print_initialization(&self, config_sha256: &str) {
+        println!("{{");
+        println!("  \"config_sha256\": \"{config_sha256}\",");
+        println!("  \"profile\": \"MHD wave\",");
+        println!("  \"particles\": {},", self.state.positions.len());
+        println!("  \"box_size\": {},", self.state.box_size);
+        println!("  \"gamma\": {},", self.state.gamma);
+        println!("  \"cleaning_phi_initialized_to_zero\": true");
+        println!("}}");
+    }
 }
 
 impl InitializedSoundwave {
@@ -882,7 +1194,15 @@ impl InitializedSoundwave {
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
-fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
+fn evolve_profile(initialized: InitializedProfile) -> Result<(), ApplicationError> {
+    match initialized {
+        InitializedProfile::Hydro(initialized) => evolve_hydro_profile(initialized),
+        InitializedProfile::Mhd(initialized) => evolve_mhd_wave(initialized),
+    }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn evolve_hydro_profile(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
     if initialized.profile == StrictProfile::Dustywave {
         return evolve_dustywave(initialized);
     }
@@ -1009,6 +1329,135 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
         timeline.current_time()
     );
     Ok(())
+}
+
+fn evolve_mhd_wave(mut initialized: InitializedMhdWave) -> Result<(), ApplicationError> {
+    const OUTPUT_COUNT: u32 = 10;
+    let output_dir = PathBuf::from(&initialized.parameters.output_dir);
+    fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
+    let mut rates = mhd_mfm_spatial_rates_1d(&initialized.state, initialized.controls)
+        .map_err(ApplicationError::MhdEvolution)?;
+    let mut time = 0.0_f64;
+    let mut snapshot_number = 0_u32;
+    let mut step_count = 0_u64;
+    write_mhd_snapshot(
+        &initialized,
+        &rates,
+        output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+        time,
+    )?;
+    snapshot_number += 1;
+
+    for output_index in 1..=OUTPUT_COUNT {
+        let output_time = if output_index == OUTPUT_COUNT {
+            initialized.parameters.time_max
+        } else {
+            f64::from(output_index) * initialized.parameters.time_between_snapshots
+        };
+        while time < output_time {
+            let cfl = global_mhd_courant_timestep_1d(
+                &initialized.state,
+                &rates,
+                initialized.parameters.courant_factor,
+            )
+            .map_err(ApplicationError::MhdEvolution)?;
+            // Every particle advances on the same global step. Capping at the
+            // next output boundary makes each of the eleven public snapshots a
+            // completed KDK state, not a wave-specific interpolation.
+            let timestep = cfl
+                .min(initialized.parameters.max_timestep)
+                .min(output_time - time);
+            let result = advance_mhd_kdk_1d(
+                &initialized.state,
+                &rates,
+                timestep,
+                initialized.parameters.desired_num_neighbors,
+                initialized.parameters.max_neighbor_deviation,
+                0.0,
+                initialized.controls,
+            )
+            .map_err(ApplicationError::MhdEvolution)?;
+            initialized.state = result.state;
+            rates = result.rates;
+            time += timestep;
+            let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
+            if (time - output_time).abs() <= tolerance {
+                time = output_time;
+            }
+            step_count = step_count.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("MHD step count overflow".to_owned())
+            })?;
+        }
+        write_mhd_snapshot(
+            &initialized,
+            &rates,
+            output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+            output_time,
+        )?;
+        snapshot_number += 1;
+    }
+    eprintln!(
+        "completed {step_count} synchronized MHD KDK steps to t={time:.17e}; \
+         wrote {snapshot_number} snapshots"
+    );
+    Ok(())
+}
+
+fn write_mhd_snapshot(
+    initialized: &InitializedMhdWave,
+    rates: &MhdMfmRates1d,
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let primitive = initialized
+        .state
+        .primitive_columns()
+        .map_err(ApplicationError::MhdEvolution)?;
+    let coordinates: Vec<[f64; 3]> = initialized
+        .state
+        .positions
+        .iter()
+        .zip(&initialized.transverse_positions)
+        .map(|(&x, transverse)| [x, transverse[0], transverse[1]])
+        .collect();
+    let velocities: Vec<[f64; 3]> = initialized
+        .state
+        .velocities
+        .iter()
+        .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let magnetic_field: Vec<[f64; 3]> = primitive
+        .magnetic
+        .iter()
+        .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let gas_count = u64::try_from(initialized.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u64".to_owned()))?;
+    let header = SnapshotHeader {
+        time,
+        box_size: initialized.state.box_size,
+        num_part_total: [gas_count, 0, 0, 0, 0, 0],
+        double_precision: true,
+        effective_kernel_neighbors: Some(initialized.parameters.desired_num_neighbors),
+    };
+    write_mhd_wave(
+        path,
+        MhdWaveWriteView {
+            header: &header,
+            coordinates: &coordinates,
+            velocities: &velocities,
+            magnetic_field: &magnetic_field,
+            ids: &initialized.particle_ids,
+            masses: &initialized.state.masses,
+            internal_energy: &initialized.state.specific_internal_energy,
+            density: &primitive.density,
+            smoothing_length: &initialized.state.smoothing_lengths,
+            cleaning_phi: Some(&primitive.cleaning_scalar),
+            cleaning_grad_phi: None,
+            divergence_of_magnetic_field: Some(&rates.magnetic_divergence),
+        },
+    )
+    .map_err(ApplicationError::Output)
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
@@ -1686,6 +2135,7 @@ enum ApplicationError {
     Output(gizmo_io::OutputError),
     OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
+    MhdEvolution(gizmo_hydro::mhd_evolution::MhdEvolutionError),
     Grain(gizmo_hydro::grain::GrainError),
     UnsupportedConfig(String),
     UnsupportedParameters(String),
@@ -1712,6 +2162,7 @@ impl std::fmt::Display for ApplicationError {
                 )
             }
             Self::Hydro(error) => error.fmt(formatter),
+            Self::MhdEvolution(error) => error.fmt(formatter),
             Self::Grain(error) => error.fmt(formatter),
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
@@ -1762,6 +2213,10 @@ DEVELOPER_MODE
         include_str!("../../../../validation/oracles/interactblast/legacy-config.sh");
     const DUSTYWAVE_CONFIG: &str =
         include_str!("../../../../validation/oracles/dustywave/legacy-config.sh");
+    const MHD_WAVE_CONFIG: &str =
+        include_str!("../../../../validation/oracles/mhd_wave/frontier-config.sh");
+    const MHD_WAVE_PARAMETERS: &str =
+        include_str!("../../../../validation/oracles/mhd_wave/frontier.params");
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -1823,6 +2278,46 @@ ResubmitCommand none
             Err(ApplicationError::UnsupportedConfig(message))
                 if message.contains("FORCE_EQUAL_TIMESTEPS=false")
         ));
+    }
+
+    #[test]
+    fn exact_mhd_wave_config_profile_is_required() {
+        let manifest = ConfigManifest::parse(MHD_WAVE_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::MhdWave
+        );
+        for invalid in [
+            MHD_WAVE_CONFIG.replace("MAGNETIC\n", ""),
+            format!("{MHD_WAVE_CONFIG}FORCE_EQUAL_TIMESTEPS\n"),
+            MHD_WAVE_CONFIG.replace("EOS_GAMMA=(5.0/3.0)", "EOS_GAMMA=(5./3.)"),
+            MHD_WAVE_CONFIG.replace("MAGNETIC\n", "MAGNETIC=1\n"),
+        ] {
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&invalid).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_mhd_wave_parameters_and_cleaning_sigmas_are_required() {
+        let parameters = read_mhd_wave_parameters(MHD_WAVE_PARAMETERS).unwrap();
+        assert_eq!(parameters.divb_cleaning_parabolic_sigma, Some(0.2));
+        assert_eq!(parameters.divb_cleaning_hyperbolic_sigma, Some(1.0));
+        for invalid in [
+            MHD_WAVE_PARAMETERS.replace("DivBcleaningParabolicSigma         0.2\n", ""),
+            MHD_WAVE_PARAMETERS.replace(
+                "DivBcleaningHyperbolicSigma        1.0",
+                "DivBcleaningHyperbolicSigma        0.9",
+            ),
+            format!("{MHD_WAVE_PARAMETERS}MinSizeTimestep 1e-8\n"),
+        ] {
+            assert!(matches!(
+                read_mhd_wave_parameters(&invalid),
+                Err(ApplicationError::UnsupportedParameters(_))
+            ));
+        }
     }
 
     #[test]

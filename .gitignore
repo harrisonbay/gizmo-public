@@ -16,6 +16,7 @@ __pycache__/
 validation/artifacts/
 validation/oracles/*/*.hdf5
 validation/oracles/*/*_exact.txt
+validation/oracles/*/output/
 
 # Local editor and platform files
 .DS_Store
