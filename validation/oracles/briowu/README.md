@@ -46,7 +46,7 @@ pre-force Rust initialization snapshot.
 The corrected-C profile is differential evidence only. It cannot replace an
 independent exact solution, convergence study, or the machine-readable curves
 used for the published figures. Those missing upstream files are requested in
-`../UPSTREAM_REQUEST.md`.
+`UPSTREAM_REQUEST.md`.
 
 ## Rust implementation status
 
@@ -55,8 +55,9 @@ periodic cell lists, the normalized 2-D cubic kernel, MFM density, conditioned
 2-D MLS moments, batched limited gradients, vector face geometry,
 arbitrary-normal HLLD, the MFM entropic/PdV energy correction, Powell/Dedner
 terms and safety limiters, the density-loop `Particle_DivVel` estimator,
-public-C adaptive smoothing lengths, and synchronized primitive KDK evolution.
-The strict CLI accepts this profile without a one-dimensional projection and
+public-C adaptive smoothing lengths, synchronized primitive KDK evolution, and
+the exact initial per-particle timestep bounds and `2^60` bin scheduler. The
+strict CLI accepts this profile without a one-dimensional projection and
 writes `t=0`, `0.1`, and `0.2` snapshots.
 
 Run the pinned initialization, three-pass adaptive-H, and full production
@@ -71,19 +72,20 @@ finite, nonzero force over the real fixture. It also contains regressions for
 the oblique discontinuity HLLD branch, exact affine reconstruction, pair
 limiters, CFL length, adaptive-H drift, and the C retry ladder.
 
-This is not yet a terminal trajectory claim. Rust currently advances every
-particle on a synchronized global step, whereas the C baseline uses
-hierarchical individual-particle time bins. The corrected-C logs establish the
-global synchronization cadence, but not a common particle bin. The split Rust
-KDK API now exposes and serializes C's mixed drift view: half-kicked actual
-velocity with predicted density, internal energy, H, B, and phi before endpoint
-density/force/second-kick work. However, its synchronized `snapshot_000`
-maximum `|vx|` is `0.0090988`, exactly half the corrected-C value near `0.0182`.
-Its maximum `|vy|=0.0263302` already matches corrected C. That split is direct
-evidence that the x-extremum particles begin in a two-times-larger individual
-bin while the y extrema use the minimum bin. Reproducing those bins and
-inactive-particle/deferred-flux semantics is now the principal blocker before a
-Rust `t=0.2` profile can be promoted to the 5% gate.
+This is not yet a terminal trajectory claim. Literal public-C formulas assign
+the fixture to two initial bins: 25,088 particles in bin 49 and 25,088 in bin
+50. This distribution is a deterministic Rust regression, not a C oracle,
+until the requested particle-ID dump is available. The hierarchical initial
+event applies each particle's own half-kick and reaches maximum
+`|vx|=0.0181975` and `|vy|=0.0263302`, matching the corrected-C extrema that
+the synchronized step could not reproduce.
+
+The remaining work is endpoint evolution. Corrected C recomputes and kicks only
+active targets while inactive neighbors lazily drift predicted primitives from
+retained endpoint rates and stale gradients. This MFM build has no deferred
+equal-and-opposite flux ledger. Porting that persistent target-local state and
+mutable lazy-neighbor traversal is the principal blocker before a Rust `t=0.2`
+profile can be promoted to the 5% gate.
 
 ## Approximate published-figure reference
 

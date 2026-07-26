@@ -14,8 +14,9 @@ entropic/PdV energy correction. The strict restart-0 CLI evolves that profile
 with synchronized KDK stepping and writes checked, upstream-compatible HDF5
 snapshots. The Brio-Wu slice additionally implements rectangular-periodic 2-D
 MFM geometry, adaptive smoothing lengths, limited planar MLS gradients,
-arbitrary-normal HLLD, Powell/Dedner terms, and synchronized 2-D KDK. Other
-physics/configuration profiles fail closed.
+arbitrary-normal HLLD, Powell/Dedner terms, synchronized 2-D KDK, exact
+per-particle time-bin selection, and the hierarchical initial kick/drift
+event. Other physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh

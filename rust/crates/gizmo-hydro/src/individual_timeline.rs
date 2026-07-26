@@ -1,9 +1,9 @@
 //! Public-GIZMO-compatible individual-particle power-of-two scheduling.
 //!
 //! This module models the integer-time state machine independently of any
-//! hydro operator.  Particle bin zero is only an initialization sentinel:
-//! normal selected steps contain at least two ticks and therefore use bin one
-//! or higher.
+//! hydro operator. Particle bin zero is represented by a zero step and is
+//! always active; normal selected steps contain at least two ticks and use bin
+//! one through bin 59.
 
 use std::error::Error;
 use std::fmt;
@@ -15,11 +15,12 @@ pub enum IndividualTimelineError {
     InvalidTimeline,
     InvalidBound,
     InvalidStep,
-    NoTwoTickStepRemaining,
+    BeyondTimelineEnd,
     Finished,
     NoOccupiedBin,
     MismatchedLength { expected: usize, actual: usize },
-    InactiveParticle { index: usize },
+    MissingActiveBound { index: usize },
+    UnexpectedInactiveBound { index: usize },
 }
 
 impl fmt::Display for IndividualTimelineError {
@@ -28,9 +29,7 @@ impl fmt::Display for IndividualTimelineError {
             Self::InvalidTimeline => write!(formatter, "invalid individual-particle timeline"),
             Self::InvalidBound => write!(formatter, "invalid physical timestep bound"),
             Self::InvalidStep => write!(formatter, "invalid integer particle timestep"),
-            Self::NoTwoTickStepRemaining => {
-                write!(formatter, "fewer than two integer-time ticks remain")
-            }
+            Self::BeyondTimelineEnd => write!(formatter, "particle step crosses TimeMax"),
             Self::Finished => write!(formatter, "timeline is already finished"),
             Self::NoOccupiedBin => write!(formatter, "timeline has no occupied time bin"),
             Self::MismatchedLength { expected, actual } => {
@@ -39,11 +38,11 @@ impl fmt::Display for IndividualTimelineError {
                     "expected {expected} particle entries, found {actual}"
                 )
             }
-            Self::InactiveParticle { index } => {
-                write!(
-                    formatter,
-                    "particle {index} is not active at the current tick"
-                )
+            Self::MissingActiveBound { index } => {
+                write!(formatter, "active particle {index} has no timestep bound")
+            }
+            Self::UnexpectedInactiveBound { index } => {
+                write!(formatter, "inactive particle {index} has a timestep bound")
             }
         }
     }
@@ -68,6 +67,33 @@ pub struct IndividualParticleTimeline {
     clippy::cast_sign_loss
 )]
 impl IndividualParticleTimeline {
+    /// Construct public C's bin-zero state before initial timestep assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid timeline or zero particles.
+    pub fn new_unassigned(
+        time_begin: f64,
+        time_max: f64,
+        particle_count: usize,
+    ) -> Result<Self, IndividualTimelineError> {
+        if !time_begin.is_finite()
+            || !time_max.is_finite()
+            || time_max <= time_begin
+            || particle_count == 0
+        {
+            return Err(IndividualTimelineError::InvalidTimeline);
+        }
+        Ok(Self {
+            time_begin,
+            time_max,
+            current_tick: 0,
+            time_bins: vec![0; particle_count],
+            begin_ticks: vec![0; particle_count],
+            step_ticks: vec![0; particle_count],
+        })
+    }
+
     /// Assign the initial particle bins from independent physical bounds.
     ///
     /// Like `get_timestep()` followed by `find_timesteps()`, each bound is
@@ -93,7 +119,7 @@ impl IndividualParticleTimeline {
         let mut time_bins = Vec::with_capacity(physical_bounds.len());
         let mut step_ticks = Vec::with_capacity(physical_bounds.len());
         for &bound in physical_bounds {
-            let ticks = quantize_bound(bound, tick_duration, LEGACY_TIMEBASE_TICKS)?;
+            let ticks = quantize_bound(bound, tick_duration)?;
             time_bins.push(bin_for_step(ticks));
             step_ticks.push(ticks);
         }
@@ -115,7 +141,7 @@ impl IndividualParticleTimeline {
     ///
     /// # Errors
     ///
-    /// Returns an error unless every step is a power of two in `[2, 2^60]`.
+    /// Returns an error unless every step is a power of two in `[2, 2^59]`.
     pub fn from_initial_steps(
         time_begin: f64,
         time_max: f64,
@@ -130,7 +156,7 @@ impl IndividualParticleTimeline {
         }
         if steps
             .iter()
-            .any(|&step| !(2..=LEGACY_TIMEBASE_TICKS).contains(&step) || !step.is_power_of_two())
+            .any(|&step| !(2..LEGACY_TIMEBASE_TICKS).contains(&step) || !step.is_power_of_two())
         {
             return Err(IndividualTimelineError::InvalidStep);
         }
@@ -155,6 +181,11 @@ impl IndividualParticleTimeline {
     }
 
     #[must_use]
+    pub fn duration_for_ticks(&self, ticks: u64) -> f64 {
+        self.tick_duration() * ticks as f64
+    }
+
+    #[must_use]
     pub fn time_bins(&self) -> &[u8] {
         &self.time_bins
     }
@@ -173,7 +204,7 @@ impl IndividualParticleTimeline {
     pub fn active_mask(&self) -> Vec<bool> {
         self.step_ticks
             .iter()
-            .map(|&step| self.current_tick % step == 0)
+            .map(|&step| step == 0 || self.current_tick % step == 0)
             .collect()
     }
 
@@ -191,6 +222,9 @@ impl IndividualParticleTimeline {
     pub fn next_sync_tick(&self) -> Result<u64, IndividualTimelineError> {
         if self.is_finished() {
             return Err(IndividualTimelineError::Finished);
+        }
+        if self.step_ticks.contains(&0) {
+            return Ok(self.current_tick);
         }
         self.step_ticks
             .iter()
@@ -217,7 +251,8 @@ impl IndividualParticleTimeline {
     ///
     /// A step may grow only into a bin synchronized at this tick. This is the
     /// `TimeBinActive[bin]` growth restriction from `find_timesteps()`.
-    /// Inactive particles are rejected instead of silently changing schedule.
+    /// Every active particle must have a bound and every inactive particle
+    /// must have `None`, matching the dense C active-list traversal.
     ///
     /// # Errors
     ///
@@ -233,22 +268,41 @@ impl IndividualParticleTimeline {
                 actual: physical_bounds.len(),
             });
         }
-        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
+        if self.is_finished() {
+            return Err(IndividualTimelineError::Finished);
+        }
+        let active = self.active_mask();
         let tick_duration = self.tick_duration();
-        for (index, bound) in physical_bounds.iter().enumerate() {
-            let Some(bound) = bound else {
-                continue;
-            };
-            if self.current_tick % self.step_ticks[index] != 0 {
-                return Err(IndividualTimelineError::InactiveParticle { index });
+        let remaining = LEGACY_TIMEBASE_TICKS - self.current_tick;
+        let mut replacements = Vec::new();
+        for (index, (&is_active, bound)) in active.iter().zip(physical_bounds).enumerate() {
+            match (is_active, bound) {
+                (true, None) => {
+                    return Err(IndividualTimelineError::MissingActiveBound { index });
+                }
+                (false, Some(_)) => {
+                    return Err(IndividualTimelineError::UnexpectedInactiveBound { index });
+                }
+                (false, None) => {}
+                (true, Some(bound)) => {
+                    let mut step = quantize_bound(*bound, tick_duration)?;
+                    while self.current_tick % step != 0 {
+                        step >>= 1;
+                    }
+                    if step > remaining {
+                        return Err(IndividualTimelineError::BeyondTimelineEnd);
+                    }
+                    let begin = self.begin_ticks[index]
+                        .checked_add(self.step_ticks[index])
+                        .ok_or(IndividualTimelineError::BeyondTimelineEnd)?;
+                    replacements.push((index, begin, step, bin_for_step(step)));
+                }
             }
-            let mut step = quantize_bound(*bound, tick_duration, remaining)?;
-            while self.current_tick % step != 0 {
-                step >>= 1;
-            }
-            self.begin_ticks[index] = self.current_tick;
+        }
+        for (index, begin, step, bin) in replacements {
+            self.begin_ticks[index] = begin;
             self.step_ticks[index] = step;
-            self.time_bins[index] = bin_for_step(step);
+            self.time_bins[index] = bin;
         }
         Ok(())
     }
@@ -263,11 +317,7 @@ impl IndividualParticleTimeline {
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn quantize_bound(
-    physical_bound: f64,
-    tick_duration: f64,
-    maximum_ticks: u64,
-) -> Result<u64, IndividualTimelineError> {
+fn quantize_bound(physical_bound: f64, tick_duration: f64) -> Result<u64, IndividualTimelineError> {
     if !physical_bound.is_finite() || physical_bound <= 0.0 {
         return Err(IndividualTimelineError::InvalidBound);
     }
@@ -275,11 +325,11 @@ fn quantize_bound(
     if !requested.is_finite() {
         return Err(IndividualTimelineError::InvalidBound);
     }
-    if maximum_ticks < 2 {
-        return Err(IndividualTimelineError::NoTwoTickStepRemaining);
-    }
     // `get_timestep()` promotes requests of zero or one integer tick to two.
-    let integer = (requested as u64).max(2).min(maximum_ticks);
+    let integer = (requested as u64).max(2);
+    if integer >= LEGACY_TIMEBASE_TICKS {
+        return Err(IndividualTimelineError::InvalidStep);
+    }
     let next_power = integer.next_power_of_two();
     Ok(if next_power > integer {
         next_power >> 1
@@ -322,6 +372,32 @@ mod tests {
                 .unwrap();
         assert_eq!(timeline.step_ticks(), &[2]);
         assert_eq!(timeline.time_bins(), &[1]);
+    }
+
+    #[test]
+    fn bin_zero_is_active_until_initial_assignment() {
+        let mut timeline = IndividualParticleTimeline::new_unassigned(0.0, 1.0, 2).unwrap();
+        assert_eq!(timeline.time_bins(), &[0, 0]);
+        assert_eq!(timeline.step_ticks(), &[0, 0]);
+        assert_eq!(timeline.active_mask(), [true, true]);
+        assert_eq!(timeline.next_sync_tick().unwrap(), 0);
+        timeline
+            .reassign_active_bounds(&[Some(physical_ticks(4)), Some(physical_ticks(2))])
+            .unwrap();
+        assert_eq!(timeline.step_ticks(), &[4, 2]);
+        assert_eq!(timeline.begin_ticks(), &[0, 0]);
+    }
+
+    #[test]
+    fn bin_sixty_is_rejected() {
+        assert_eq!(
+            IndividualParticleTimeline::from_initial_steps(0.0, 1.0, &[LEGACY_TIMEBASE_TICKS]),
+            Err(IndividualTimelineError::InvalidStep)
+        );
+        assert_eq!(
+            IndividualParticleTimeline::from_initial_bounds(0.0, 1.0, &[1.0]),
+            Err(IndividualTimelineError::InvalidStep)
+        );
     }
 
     #[test]
@@ -371,7 +447,23 @@ mod tests {
         timeline.advance_to_next_sync().unwrap();
         assert_eq!(
             timeline.reassign_active_bounds(&[Some(physical_ticks(4)), None]),
-            Err(IndividualTimelineError::InactiveParticle { index: 0 })
+            Err(IndividualTimelineError::UnexpectedInactiveBound { index: 0 })
         );
+    }
+
+    #[test]
+    fn failed_reassignment_is_transactional() {
+        let mut timeline = IndividualParticleTimeline::from_initial_bounds(
+            0.0,
+            1.0,
+            &[physical_ticks(2), physical_ticks(2)],
+        )
+        .unwrap();
+        let before = timeline.clone();
+        assert_eq!(
+            timeline.reassign_active_bounds(&[Some(physical_ticks(4)), None]),
+            Err(IndividualTimelineError::MissingActiveBound { index: 1 })
+        );
+        assert_eq!(timeline, before);
     }
 }

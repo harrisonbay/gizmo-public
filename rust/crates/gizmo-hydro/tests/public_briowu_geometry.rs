@@ -10,8 +10,8 @@ use gizmo_hydro::meshless_2d::{
 };
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution_2d::{
-    DivergenceControl2d, MhdMfmState2d, begin_public_mhd_kdk_adaptive_2d,
-    finish_public_mhd_kdk_adaptive_2d, mhd_mfm_spatial_rates_2d,
+    DivergenceControl2d, MhdMfmState2d, begin_public_mhd_initial_hierarchy_2d,
+    begin_public_mhd_kdk_adaptive_2d, finish_public_mhd_kdk_adaptive_2d, mhd_mfm_spatial_rates_2d,
     public_mhd_particle_timestep_bounds_2d, quantize_public_mhd_initial_timebins_2d,
 };
 use gizmo_io::read_mhd_wave;
@@ -254,7 +254,7 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
         .fold(f64::INFINITY, f64::min);
     let initial_timebins =
         quantize_public_mhd_initial_timebins_2d(&particle_bounds, 0.0, 0.2, 0.04)
-            .expect("assign the initial public-C integer time bins");
+            .expect("apply the literal public-C initial time-bin formulas");
     let timebin_counts =
         initial_timebins
             .iter()
@@ -268,6 +268,8 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
             .iter()
             .all(|timebin| timebin.ticks.is_power_of_two())
     );
+    // Deterministic formula-derived regression. Particle membership/counts
+    // remain unverified against C until the requested ID-keyed dump exists.
     assert_eq!(
         timebin_counts,
         BTreeMap::from([(49_u32, 25_088_usize), (50, 25_088)])
@@ -307,6 +309,33 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
         first_step.duration.to_bits()
     );
     assert_eq!(first_step.duration.to_bits(), (0.2_f64 / 2048.0).to_bits());
+    let mut initial_hierarchy =
+        begin_public_mhd_initial_hierarchy_2d(&state, &rates, &initial_timebins, 0.0, 0.2, 1.0e-10)
+            .expect("apply per-particle first half-kicks");
+    let first_hierarchy_sync = initial_hierarchy
+        .drift_to_first_sync()
+        .expect("drift predicted columns to the first occupied-bin endpoint");
+    assert_eq!(first_hierarchy_sync.tick, first_step.ticks);
+    assert_eq!(
+        first_hierarchy_sync
+            .active
+            .iter()
+            .filter(|&&active| active)
+            .count(),
+        25_088
+    );
+    let hierarchy_maximum_velocity = first_hierarchy_sync.drift.actual_velocities.iter().fold(
+        Vector3::ZERO,
+        |maximum, velocity| {
+            Vector3::new(
+                maximum.x.max(velocity.x.abs()),
+                maximum.y.max(velocity.y.abs()),
+                maximum.z.max(velocity.z.abs()),
+            )
+        },
+    );
+    assert!(hierarchy_maximum_velocity.x > 0.018);
+    assert!(hierarchy_maximum_velocity.y > 0.026);
     if std::env::var_os("GIZMO_BRIOWU_ADVANCE_ONE_STEP").is_some() {
         let mut step = begin_public_mhd_kdk_adaptive_2d(
             &state,
@@ -363,7 +392,8 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
     eprintln!(
         "density={:?} neighbors={:?} condition={:?} relative_closure={:?} \
          legacy_closure={:?} solved_neighbor_error={maximum_neighbor_error} rhs_pairs={} \
-         entropic_pairs={} physical_dt={physical_bound} synchronized_dt={} timebins={:?}",
+         entropic_pairs={} physical_dt={physical_bound} synchronized_dt={} timebins={:?} \
+         hierarchical_first_kick_max_v={hierarchy_maximum_velocity:?}",
         density_range,
         neighbor_range,
         condition_range,
