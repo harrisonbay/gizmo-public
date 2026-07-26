@@ -1,3 +1,5 @@
 validation/oracles/gresho/public.params whitespace=-blank-at-eol,-blank-at-eof
 validation/oracles/kh_mcnally/khener_rev1.txt whitespace=-blank-at-eol,-blank-at-eof
 validation/oracles/kh_mcnally/public.params whitespace=-blank-at-eol,-blank-at-eof
+validation/oracles/square/public.params whitespace=-blank-at-eol,-blank-at-eof
+validation/oracles/square/corrected-c.params whitespace=-blank-at-eol,-blank-at-eof

@@ -75,7 +75,18 @@ outliers large enough to fail a `1e-7` max/allclose-style gate.
 For `square`, please clarify which problem is authoritative. The prose
 describes `64^2` particles and boost `(142.3,-31.4)`, while the hosted IC has
 `128^2` particles and boost `(1243,-358)` with differently normalized density
-and pressure.
+and pressure. Please also provide a non-aliased y-phase output: the hosted
+`v_y=-358` wraps by an integer at every public `0.5` output interval. A
+copy/paste request naming the exact artifacts and fixture checksum is in
+`square/UPSTREAM_REQUEST.md`.
+
+For `sedov`, please clarify the factor-`10^10` mass-unit discrepancy, the
+30 Myr analytic-table time versus `TimeMax 0.03`, the 1 K versus 10 K ambient
+temperature, and the documented 64-particle top hat versus the hosted tapered
+278-particle thermal excess. Please provide the exact analyzer, tolerances,
+build provenance, and reduced radial plus angular-symmetry trajectory. A
+copy/paste request with the hosted checksums is in
+`sedov/UPSTREAM_REQUEST.md`.
 
 For `gresho`, please replace or explain `gresho_ics_grid.hdf5`. Its internal
 energy encodes the documented equilibrium for gamma `5/3`, while the supplied

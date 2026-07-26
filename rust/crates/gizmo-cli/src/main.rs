@@ -81,7 +81,10 @@ fn run() -> Result<(), ApplicationError> {
         invocation.restart as u8
     );
 
-    let profile = validate_strict_config(&manifest)?;
+    let profile = resolve_parameter_disambiguated_profile(
+        &invocation.parameter_file,
+        validate_strict_config(&manifest)?,
+    )?;
     let initialized = initialize_profile(&invocation.parameter_file, profile)?;
     initialized.validate_owned_state()?;
     if invocation.initialize_only {
@@ -107,6 +110,7 @@ enum StrictProfile {
     BrioWu,
     Gresho,
     KhMcnally,
+    Square,
     EqualMassShocktube,
     InteractingBlast,
     Dustywave,
@@ -117,7 +121,7 @@ impl StrictProfile {
         match self {
             Self::BrioWu => 2.0,
             Self::KhMcnally | Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
-            Self::Gresho | Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
+            Self::Gresho | Self::Square | Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
 
@@ -128,6 +132,7 @@ impl StrictProfile {
             Self::BrioWu => "Brio-Wu",
             Self::Gresho => "Gresho vortex",
             Self::KhMcnally => "McNally Kelvin-Helmholtz",
+            Self::Square => "advected square",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
             Self::Dustywave => "dusty wave",
@@ -141,9 +146,35 @@ impl StrictProfile {
             | Self::BrioWu
             | Self::Gresho
             | Self::KhMcnally
+            | Self::Square
             | Self::EqualMassShocktube
             | Self::Dustywave => BoundaryMode1d::Periodic,
             Self::InteractingBlast => BoundaryMode1d::Reflective,
+        }
+    }
+}
+
+fn resolve_parameter_disambiguated_profile(
+    parameter_file: &Path,
+    config_profile: StrictProfile,
+) -> Result<StrictProfile, ApplicationError> {
+    if config_profile != StrictProfile::Gresho {
+        return Ok(config_profile);
+    }
+    let input = fs::read_to_string(parameter_file).map_err(ApplicationError::ParameterFile)?;
+    let gresho = read_gresho_parameters(&input);
+    let square = read_square_parameters(&input);
+    match (gresho, square) {
+        (Ok(_), Err(_)) => Ok(StrictProfile::Gresho),
+        (Err(_), Ok(_)) => Ok(StrictProfile::Square),
+        (Ok(_), Ok(_)) => Err(ApplicationError::UnsupportedParameters(
+            "gamma-1.4 planar parameter file ambiguously matches Gresho and Square".to_owned(),
+        )),
+        (Err(gresho_error), Err(square_error)) => {
+            Err(ApplicationError::UnsupportedParameters(format!(
+                "gamma-1.4 planar parameters match neither strict profile; \
+                 Gresho: {gresho_error}; Square: {square_error}"
+            )))
         }
     }
 }
@@ -397,6 +428,9 @@ fn initialize_profile(
         return initialize_kh_mcnally(&fixture_path, parameters)
             .map(InitializedProfile::PlanarHydro);
     }
+    if profile == StrictProfile::Square {
+        return initialize_square(&fixture_path, parameters).map(InitializedProfile::PlanarHydro);
+    }
     if profile == StrictProfile::MhdWave {
         return initialize_mhd_wave(&fixture_path, parameters).map(InitializedProfile::Mhd);
     }
@@ -592,6 +626,140 @@ fn initialize_gresho(
         state,
         fixture_density_range: None,
     })
+}
+
+fn initialize_square(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+) -> Result<InitializedPlanarHydro, ApplicationError> {
+    let snapshot = read_soundwave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    if snapshot.header.double_precision {
+        return Err(ApplicationError::StateMismatch(
+            "the pinned public Square initial condition must use float32 HDF5 fields".to_owned(),
+        ));
+    }
+    let particle_count = snapshot.gas.len();
+    if particle_count != 16_384 {
+        return Err(ApplicationError::StateMismatch(format!(
+            "Square fixture has {particle_count} particles, expected 16384"
+        )));
+    }
+    let density = snapshot
+        .gas
+        .density
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("Density"))?;
+    snapshot
+        .gas
+        .smoothing_length
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("SmoothingLength"))?;
+    let fixture_density_range = density.iter().copied().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+    );
+    for (index, &particle_density) in density.iter().enumerate() {
+        validate_square_particle(
+            snapshot.gas.ids[index],
+            snapshot.gas.coordinates[index],
+            snapshot.gas.velocities[index],
+            snapshot.gas.masses[index],
+            particle_density,
+            snapshot.gas.internal_energy[index],
+        )?;
+    }
+    let domain = Box2d::new(1.0, 1.0).map_err(ApplicationError::Geometry2d)?;
+    let positions: Vec<_> = snapshot
+        .gas
+        .coordinates
+        .iter()
+        .map(|value| Vector2::new(value[0], value[1]))
+        .collect();
+    let smoothing_lengths = solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+        &positions,
+        &snapshot.gas.masses,
+        domain,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+        KernelFunction2d::Cubic,
+    )
+    .map_err(ApplicationError::Geometry2d)?
+    .into_iter()
+    .map(|particle| particle.smoothing_length)
+    .collect();
+    let state = HydroMfmState2d::from_primitive(
+        positions,
+        snapshot.gas.masses,
+        snapshot
+            .gas
+            .velocities
+            .iter()
+            .map(|value| Vector3::new(value[0], value[1], value[2]))
+            .collect(),
+        snapshot.gas.internal_energy,
+        smoothing_lengths,
+        domain,
+        StrictProfile::Square.gamma(),
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    Ok(InitializedPlanarHydro {
+        profile: StrictProfile::Square,
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        state,
+        fixture_density_range: Some(fixture_density_range),
+    })
+}
+
+fn validate_square_particle(
+    particle_id: u64,
+    [x, y, z]: [f64; 3],
+    [velocity_x, velocity_y, velocity_z]: [f64; 3],
+    mass: f64,
+    density: f64,
+    internal_energy: f64,
+) -> Result<(), ApplicationError> {
+    let grid_x = particle_id % 128;
+    let grid_y = particle_id / 128;
+    let expected_coordinates = [
+        (f64::from(u32::try_from(grid_x).expect("Square grid x-coordinate fits u32")) + 0.5)
+            / 128.0,
+        (f64::from(u32::try_from(grid_y).expect("Square grid y-coordinate fits u32")) + 0.5)
+            / 128.0,
+    ];
+    if grid_y >= 128
+        || x.to_bits() != expected_coordinates[0].to_bits()
+        || y.to_bits() != expected_coordinates[1].to_bits()
+        || z.to_bits() != 0.0_f64.to_bits()
+        || velocity_x.to_bits() != 1_243.0_f64.to_bits()
+        || velocity_y.to_bits() != (-358.0_f64).to_bits()
+        || velocity_z.to_bits() != 0.0_f64.to_bits()
+    {
+        return Err(ApplicationError::StateMismatch(format!(
+            "Square particle {particle_id} does not match the pinned 128x128 lattice and boost"
+        )));
+    }
+    let inside = (32..96).contains(&grid_x) && (32..96).contains(&grid_y);
+    let (expected_mass, expected_density, expected_internal_energy): (f64, f64, f64) = if inside {
+        (2.0_f64.powi(-19), 0.031_253_021_210_432_05, 0.25)
+    } else {
+        (2.0_f64.powi(-21), 0.007_813_255_302_608_013, 1.0)
+    };
+    if mass.to_bits() != expected_mass.to_bits()
+        || density.to_bits() != expected_density.to_bits()
+        || internal_energy.to_bits() != expected_internal_energy.to_bits()
+    {
+        return Err(ApplicationError::StateMismatch(format!(
+            "Square particle {particle_id} does not match the pinned contact state"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1114,6 +1282,9 @@ fn read_profile_parameters(
     if profile == StrictProfile::KhMcnally {
         return read_kh_mcnally_parameters(&input);
     }
+    if profile == StrictProfile::Square {
+        return read_square_parameters(&input);
+    }
     if profile == StrictProfile::MhdWave {
         return read_mhd_wave_parameters(&input);
     }
@@ -1273,6 +1444,102 @@ fn read_profile_parameters(
                 parameters.init_cond_file
             )));
         }
+    }
+    Ok(parameters)
+}
+
+fn read_square_parameters(input: &str) -> Result<SoundwaveParameters, ApplicationError> {
+    const REQUIRED_TAGS: [&str; 7] = [
+        "InitCondFile",
+        "OutputDir",
+        "TimeMax",
+        "BoxSize",
+        "TimeBetSnapshot",
+        "DesNumNgb",
+        "CourantFac",
+    ];
+    let mut retained = Vec::new();
+    let mut actual_tags = BTreeSet::new();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let definition = raw_line
+            .split_once('%')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if definition.is_empty() {
+            retained.push(raw_line);
+            continue;
+        }
+        let mut tokens = definition.split_whitespace();
+        let tag = tokens.next().unwrap_or_default();
+        if !actual_tags.insert(tag) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "line {}: duplicate Square parameter `{tag}`",
+                line_index + 1
+            )));
+        }
+        if tag == "CourantFac" {
+            if tokens.next() != Some("0.1") || tokens.next().is_some() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: inert `CourantFac` must equal `0.1` in the public Square profile",
+                    line_index + 1
+                )));
+            }
+        } else {
+            retained.push(raw_line);
+        }
+    }
+    let expected_tags: BTreeSet<_> = REQUIRED_TAGS.into_iter().collect();
+    if actual_tags != expected_tags {
+        let missing: Vec<_> = expected_tags.difference(&actual_tags).copied().collect();
+        let unexpected: Vec<_> = actual_tags.difference(&expected_tags).copied().collect();
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "Square requires the exact public parameter vocabulary; \
+             missing={missing:?}, unexpected={unexpected:?}"
+        )));
+    }
+    let parameters = SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    let required_scalars: [(&str, f64, f64); 9] = [
+        ("TimeMax", parameters.time_max, 10.0),
+        ("BoxSize", parameters.box_size, 1.0),
+        ("TimeBetSnapshot", parameters.time_between_snapshots, 0.5),
+        ("MaxSizeTimestep", parameters.max_timestep, 0.005),
+        ("DesNumNgb", parameters.desired_num_neighbors, 12.0),
+        ("ErrTolIntAccuracy", parameters.integration_accuracy, 0.02),
+        ("CourantFac", parameters.courant_factor, 0.4),
+        (
+            "MaxRMSDisplacementFac",
+            parameters.max_rms_displacement_factor,
+            0.25,
+        ),
+        (
+            "MaxNumNgbDeviation",
+            parameters.max_neighbor_deviation,
+            0.05,
+        ),
+    ];
+    for (field, actual, expected) in required_scalars {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "Square requires `{field} {expected}`, found `{actual}`"
+            )));
+        }
+    }
+    if parameters.init_cond_file != "square_ics"
+        || parameters.output_dir != "output"
+        || parameters.min_timestep.is_some()
+        || parameters.max_memory_mb.is_some()
+        || parameters.divb_cleaning_parabolic_sigma.is_some()
+        || parameters.divb_cleaning_hyperbolic_sigma.is_some()
+        || parameters.grain_internal_density.is_some()
+        || parameters.grain_size_min.is_some()
+        || parameters.grain_size_max.is_some()
+        || parameters.grain_size_spectrum_powerlaw.is_some()
+        || parameters.type3_softening.is_some()
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "Square strings or optional runtime fields differ from the public profile".to_owned(),
+        ));
     }
     Ok(parameters)
 }
@@ -1923,6 +2190,7 @@ impl InitializedPlanarHydro {
         let expected_count = match self.profile {
             StrictProfile::Gresho => 4_092,
             StrictProfile::KhMcnally => 66_868,
+            StrictProfile::Square => 16_384,
             _ => {
                 return Err(ApplicationError::StateMismatch(
                     "non-planar profile stored in planar hydro runtime".to_owned(),
@@ -1943,7 +2211,10 @@ impl InitializedPlanarHydro {
         if self.state.domain.lengths() != Vector2::new(1.0, 1.0)
             || self.state.gamma.to_bits() != self.profile.gamma().to_bits()
             || self.parameters.box_size.to_bits() != 1.0_f64.to_bits()
-            || (self.profile == StrictProfile::KhMcnally) != self.fixture_density_range.is_some()
+            || matches!(
+                self.profile,
+                StrictProfile::KhMcnally | StrictProfile::Square
+            ) != self.fixture_density_range.is_some()
             || self.state.kernel
                 != if self.profile == StrictProfile::KhMcnally {
                     KernelFunction2d::Quintic
@@ -2319,6 +2590,7 @@ fn evolve_profile(initialized: InitializedProfile) -> Result<(), ApplicationErro
 fn evolve_planar_hydro(initialized: &InitializedPlanarHydro) -> Result<(), ApplicationError> {
     let (output_count, expected_events) = match initialized.profile {
         StrictProfile::Gresho => (6_u32, Some(8_192_u64)),
+        StrictProfile::Square => (20_u32, Some(4_096_u64)),
         StrictProfile::KhMcnally
             if initialized.parameters.time_max.to_bits() == 1.5_f64.to_bits() =>
         {
@@ -3851,6 +4123,15 @@ ViscosityAMax                      2
         include_str!("../../../../validation/oracles/kh_mcnally/public-config.sh");
     const KH_MCNALLY_PARAMETERS: &str =
         include_str!("../../../../validation/oracles/kh_mcnally/public.params");
+    const SQUARE_PARAMETERS: &str = "\
+InitCondFile                       square_ics
+OutputDir                          output
+TimeMax                            10
+BoxSize                            1
+TimeBetSnapshot                    0.5
+DesNumNgb                          12
+CourantFac                         0.1
+";
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -3995,7 +4276,6 @@ ResubmitCommand none
         for invalid in [
             format!("{GRESHO_CONFIG}MAGNETIC\n"),
             format!("{GRESHO_CONFIG}DEVELOPER_MODE\n"),
-            format!("{GRESHO_CONFIG}OUTPUT_IN_DOUBLEPRECISION\n"),
             GRESHO_CONFIG.replace("EOS_GAMMA=(1.4)", "EOS_GAMMA=(5.0/3.0)"),
         ] {
             assert!(matches!(
@@ -4003,6 +4283,13 @@ ResubmitCommand none
                 Err(ApplicationError::UnsupportedConfig(_))
             ));
         }
+        assert!(matches!(
+            validate_strict_config(
+                &ConfigManifest::parse(&format!("{GRESHO_CONFIG}OUTPUT_IN_DOUBLEPRECISION\n"))
+                    .unwrap()
+            ),
+            Err(ApplicationError::UnsupportedConfig(_))
+        ));
 
         let parameters = read_gresho_parameters(GRESHO_PARAMETERS).unwrap();
         assert_eq!(parameters.max_timestep.to_bits(), 5.0e-4_f64.to_bits());
@@ -4025,6 +4312,64 @@ ResubmitCommand none
                 Err(ApplicationError::UnsupportedParameters(_))
             ));
         }
+    }
+
+    #[test]
+    fn exact_public_square_profile_preserves_inert_parameter_semantics() {
+        let parameters = read_square_parameters(SQUARE_PARAMETERS).unwrap();
+        assert_eq!(parameters.max_timestep.to_bits(), 0.005_f64.to_bits());
+        assert_eq!(
+            parameters.integration_accuracy.to_bits(),
+            0.02_f64.to_bits()
+        );
+        assert_eq!(parameters.courant_factor.to_bits(), 0.4_f64.to_bits());
+        assert_eq!(
+            parameters.max_rms_displacement_factor.to_bits(),
+            0.25_f64.to_bits()
+        );
+        assert_eq!(
+            parameters.max_neighbor_deviation.to_bits(),
+            0.05_f64.to_bits()
+        );
+        for invalid in [
+            SQUARE_PARAMETERS.replace("CourantFac                         0.1", "CourantFac 0.2"),
+            SQUARE_PARAMETERS.replace("CourantFac                         0.1\n", ""),
+            format!("{SQUARE_PARAMETERS}MaxSizeTimestep 0.005\n"),
+        ] {
+            assert!(matches!(
+                read_square_parameters(&invalid),
+                Err(ApplicationError::UnsupportedParameters(_))
+            ));
+        }
+        validate_square_particle(
+            0,
+            [0.003_906_25, 0.003_906_25, 0.0],
+            [1_243.0, -358.0, 0.0],
+            2.0_f64.powi(-21),
+            0.007_813_255_302_608_013,
+            1.0,
+        )
+        .unwrap();
+        validate_square_particle(
+            8_256,
+            [0.503_906_25, 0.503_906_25, 0.0],
+            [1_243.0, -358.0, 0.0],
+            2.0_f64.powi(-19),
+            0.031_253_021_210_432_05,
+            0.25,
+        )
+        .unwrap();
+        assert!(
+            validate_square_particle(
+                8_256,
+                [0.503_906_25, 0.503_906_25, 0.0],
+                [1_243.0, -358.0, 0.0],
+                2.0_f64.powi(-21),
+                0.031_253_021_210_432_05,
+                0.25,
+            )
+            .is_err()
+        );
     }
 
     #[test]

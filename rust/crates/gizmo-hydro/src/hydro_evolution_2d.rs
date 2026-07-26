@@ -3811,7 +3811,7 @@ mod tests {
             actual_internal_energy: vec![1.0],
             drift: PublicHydroDriftState2d {
                 positions: state.positions.clone(),
-                actual_velocities: vec![Vector3::new(0.25, 0.0, 0.0)],
+                actual_velocities: vec![Vector3::new(0.25, -358.0, 0.0)],
                 predicted_velocities: state.velocities.clone(),
                 predicted_specific_internal_energy: vec![1.0],
                 predicted_density: primitive.density.clone(),
@@ -3870,6 +3870,9 @@ mod tests {
         );
         // x=0.25 + 0.25*0.25 for the first drift, then 0.75*0.125.
         assert_eq!(projected.positions[0].x.to_bits(), 0.40625_f64.to_bits());
+        // The off-schedule drift must also advance and wrap a large transverse
+        // boost: y=0.25-358*0.375 wraps exactly to zero.
+        assert_eq!(projected.positions[0].y.abs().to_bits(), 0.0_f64.to_bits());
         let integer_velocity_position = 0.3125 + integer_velocity.x * 0.125;
         assert_ne!(
             projected.positions[0].x.to_bits(),
