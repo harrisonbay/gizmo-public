@@ -57,3 +57,40 @@ The public paper's error norm is particle L1. Sparse kernel-support outliers
 make a max-element norm misleading for this fixture: the pinned corrected-C
 trajectory stays below `1.6e-8` L1 in every field over all 11 outputs even
 though a few terminal elements differ by several `1e-7`.
+
+## Corrected-C HLLD interface oracle
+
+`hlld_flux_oracle.csv` is a direct differential oracle for the local MHD
+Riemann solve. It was emitted by `generate_hlld_oracle.c`, which includes the
+repository's actual `hydro/reimann.h`; the driver does not contain a translated
+or shared reimplementation of HLLD. Its compatibility definitions select the
+same public-wave mode:
+
+- `MAGNETIC`
+- `DIVBCLEANING_DEDNER`
+- `HYDRO_MESHLESS_FINITE_MASS`
+- `gamma=5/3`
+- unconstrained-gradient Dedner limiter `0.75`
+
+The four rows cover the constant fast-wave background, a nonzero-Phi and
+discontinuous-normal-field interface, the zero-normal-field degeneracy, and a
+Brio-Wu strong discontinuity. Each row records all conservative fluxes plus
+contact speed, star total pressure, corrected normal magnetic field, both
+Dedner interface terms, and corrected fast speeds. The Rust integration test
+`hlld_corrected_c_oracle.rs` uses the contact frame and compares every recorded
+output.
+
+At generation, `hydro/reimann.h` was commit
+`758fbc9f9e45d27bff3b85864669ccc0ffdd7de1`, with SHA-256
+`8807762c1efd465ced84646dac3555d87720d9dfbb6780bdda5eab146117e4ba`.
+Regenerate and check the pinned table with:
+
+```sh
+cc -std=c11 -O2 \
+  validation/oracles/mhd_wave/generate_hlld_oracle.c -lm \
+  -o /tmp/gizmo-hlld-oracle
+/tmp/gizmo-hlld-oracle |
+  diff -u validation/oracles/mhd_wave/hlld_flux_oracle.csv -
+cargo test --manifest-path rust/Cargo.toml \
+  -p gizmo-hydro --test hlld_corrected_c_oracle
+```
