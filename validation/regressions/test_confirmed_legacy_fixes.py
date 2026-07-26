@@ -8,6 +8,7 @@ GRAVTREE = (ROOT / "gravity" / "gravtree.c").read_text()
 RT_INJECTION = (ROOT / "radiation" / "rt_source_injection.c").read_text()
 HYDRO_EVALUATE = (ROOT / "hydro" / "hydro_evaluate.h").read_text()
 RIEMANN = (ROOT / "hydro" / "reimann.h").read_text()
+FORCETREE = (ROOT / "gravity" / "forcetree.c").read_text()
 
 
 class AdaptiveTreeforceRegression(unittest.TestCase):
@@ -228,6 +229,16 @@ class ExactRiemannIterationRegression(unittest.TestCase):
             "*(cs_L+cs_R)",
             guess,
         )
+
+
+class ForceTreeCapacityRegression(unittest.TestCase):
+    def test_empty_ordinary_nodes_use_the_nodes_array_capacity(self):
+        start = FORCETREE.index("void force_create_empty_nodes")
+        end = FORCETREE.index("void force_insert_pseudo_particles", start)
+        create_empty_nodes = FORCETREE[start:end]
+
+        self.assertIn("if((*nodecount) >= MaxNodes)", create_empty_nodes)
+        self.assertNotIn("(*nodecount) >= MaxTopNodes", create_empty_nodes)
 
 
 if __name__ == "__main__":

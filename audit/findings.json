@@ -357,6 +357,34 @@
         }
       ],
       "dossier": "audit/findings/GZ-0009.md"
+    },
+    {
+      "id": "GZ-0010",
+      "title": "Force tree applies the top-tree capacity to ordinary nodes",
+      "status": "fixed",
+      "confidence": "high",
+      "affected_flags": [
+        "RESTART_FLAG=0",
+        "ALL_TREE_CONFIGURATIONS"
+      ],
+      "summary": "force_create_empty_nodes() allocated ordinary internal nodes from the MaxNodes-sized Nodes array but aborted when their count reached either MaxNodes or the unrelated MaxTopNodes capacity for the domain-decomposition TopNodes array.",
+      "impact": "Valid sparse or nonuniform initial states can abort during restart-0 tree construction despite sufficient capacity in the array actually being written.",
+      "reproduction": "Run the public differential-mass shock-tube IC with the pinned one-rank 1-D profile. The uncorrected tree deterministically aborts when nodecount reaches MaxTopNodes; removing only that comparison allows tree construction and the run to complete.",
+      "falsification": "Show that nodecount indexes TopNodes or another MaxTopNodes-sized allocation in force_create_empty_nodes(), or reproduce an out-of-bounds Nodes write below MaxNodes after removing the unrelated guard.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The public initial condition is a deterministic restart-0 reproducer, and the allocation/index ownership gives an independent structural invariant."
+      },
+      "sources": [
+        {
+          "path": "gravity/forcetree.c",
+          "line_start": 350,
+          "line_end": 402,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/forcetree.c#L350-L402"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0010.md"
     }
   ]
 }
