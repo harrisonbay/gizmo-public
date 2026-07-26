@@ -557,9 +557,12 @@ pub fn dedner_parabolic_source(
 
 /// Solve a local one-dimensional ideal-MHD Riemann problem with HLLD.
 ///
-/// Invalid or non-positive HLLD intermediate states fall back to the
-/// positivity-preserving two-wave HLLE flux. Both paths first enforce a single
-/// normal magnetic field; Dedner correction is optional.
+/// Invalid contact pressure or non-finite HLLD arithmetic falls back to the
+/// positivity-preserving two-wave HLLE flux. As in the public HLLD routine,
+/// finite star energies are not reinterpreted as standalone primitive states:
+/// requiring every intermediate to have positive recovered gas pressure
+/// spuriously rejects valid strongly oblique MHD interfaces. Both paths first
+/// enforce a single normal magnetic field; Dedner correction is optional.
 ///
 /// # Errors
 ///
@@ -752,7 +755,11 @@ fn build_hlld_fan(
         common.star_total_pressure,
         common.corrected_normal_b,
     )?;
-    if !star_is_physical(star_left, gamma) || !star_is_physical(star_right, gamma) {
+    if !star_left.is_finite()
+        || !star_right.is_finite()
+        || star_left.density <= 0.0
+        || star_right.density <= 0.0
+    {
         return None;
     }
     // When the normal field is dynamically negligible, the Alfvén and
@@ -805,13 +812,12 @@ fn build_hlld_fan(
     }
     let alfven_left = common.contact_speed - common.corrected_normal_b.abs() / sqrt_density_left;
     let alfven_right = common.contact_speed + common.corrected_normal_b.abs() / sqrt_density_right;
-    if !alfven_left.is_finite()
-        || !alfven_right.is_finite()
-        || alfven_left < wave_left
-        || alfven_left > common.contact_speed
-        || alfven_right < common.contact_speed
-        || alfven_right > wave_right
-    {
+    // The public HLLD implementation does not reject an otherwise finite fan
+    // when a formal Alfvén speed lies outside an outer fast-wave estimate.
+    // This occurs for ordinary oblique Brio-Wu pairs after the Dedner normal-B
+    // correction; the contact-frame flux remains finite and is the branch C
+    // actually samples.
+    if !alfven_left.is_finite() || !alfven_right.is_finite() {
         return None;
     }
 
@@ -821,7 +827,11 @@ fn build_hlld_fan(
         common.contact_speed,
         common.corrected_normal_b,
     )?;
-    if !star_is_physical(double_left, gamma) || !star_is_physical(double_right, gamma) {
+    if !double_left.is_finite()
+        || !double_right.is_finite()
+        || double_left.density <= 0.0
+        || double_right.density <= 0.0
+    {
         return None;
     }
 
@@ -1079,17 +1089,6 @@ fn fast_speed_unchecked(state: IdealMhdPrimitive1d, gamma: f64) -> f64 {
     let sum = sound_squared + magnetic_squared_over_density;
     let discriminant = (sum * sum - 4.0 * sound_squared * normal_alfven_squared).max(0.0);
     (0.5 * (sum + discriminant.sqrt())).sqrt()
-}
-
-fn star_is_physical(state: IdealMhdConserved1d, gamma: f64) -> bool {
-    if !state.is_finite() || state.density <= 0.0 {
-        return false;
-    }
-    let velocity = state.momentum / state.density;
-    let gas_internal_energy = state.total_energy
-        - 0.5 * state.density * velocity.squared_norm()
-        - 0.5 * state.magnetic.squared_norm();
-    gas_internal_energy.is_finite() && (gamma - 1.0) * gas_internal_energy > 0.0
 }
 
 fn validate_gamma(gamma: f64) -> Result<(), MhdError> {

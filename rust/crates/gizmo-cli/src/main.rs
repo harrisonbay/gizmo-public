@@ -11,10 +11,15 @@ use gizmo_config::ConfigManifest;
 use gizmo_hydro::grain::{
     EpsteinDragParameters, GrainGasPoint1d, GrainPoint1d, compute_epstein_drag_batch_1d,
 };
+use gizmo_hydro::meshless_2d::{Box2d, Vector2, solve_public_c_smoothing_lengths_from_seeds_2d};
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution::{
     DivergenceControl1d, MhdMfmRates1d, MhdMfmState1d, advance_mhd_kdk_1d,
     global_mhd_courant_timestep_1d, mhd_mfm_spatial_rates_1d,
+};
+use gizmo_hydro::mhd_evolution_2d::{
+    DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, advance_mhd_kdk_adaptive_2d,
+    global_mhd_courant_timestep_2d, mhd_mfm_spatial_rates_2d,
 };
 use gizmo_hydro::{
     BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
@@ -88,6 +93,7 @@ fn reject_unsupported_restart(restart: RestartFlag) -> Result<(), ApplicationErr
 enum StrictProfile {
     Soundwave,
     MhdWave,
+    BrioWu,
     EqualMassShocktube,
     InteractingBlast,
     Dustywave,
@@ -97,6 +103,7 @@ impl StrictProfile {
     const fn gamma(self) -> f64 {
         match self {
             Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
+            Self::BrioWu => 2.0,
             Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
@@ -105,6 +112,7 @@ impl StrictProfile {
         match self {
             Self::Soundwave => "soundwave",
             Self::MhdWave => "MHD wave",
+            Self::BrioWu => "Brio-Wu",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
             Self::Dustywave => "dusty wave",
@@ -113,9 +121,11 @@ impl StrictProfile {
 
     const fn boundary(self) -> BoundaryMode1d {
         match self {
-            Self::Soundwave | Self::MhdWave | Self::EqualMassShocktube | Self::Dustywave => {
-                BoundaryMode1d::Periodic
-            }
+            Self::Soundwave
+            | Self::MhdWave
+            | Self::BrioWu
+            | Self::EqualMassShocktube
+            | Self::Dustywave => BoundaryMode1d::Periodic,
             Self::InteractingBlast => BoundaryMode1d::Reflective,
         }
     }
@@ -146,6 +156,12 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
+    if manifest
+        .get("BOX_SPATIAL_DIMENSION")
+        .is_some_and(|option| option.value.as_deref() == Some("2"))
+    {
+        return validate_briowu_config(manifest);
+    }
     for option in manifest.iter() {
         if !ALLOWED.contains(&option.name.as_str()) {
             return Err(ApplicationError::UnsupportedConfig(format!(
@@ -233,6 +249,56 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     }
 }
 
+fn validate_briowu_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
+    const REQUIRED_FLAGS: [&str; 4] = [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "BOX_PERIODIC",
+        "MAGNETIC",
+        "SELFGRAVITY_OFF",
+    ];
+    const REQUIRED_VALUES: [(&str, &str); 5] = [
+        ("BOX_LONG_X", "16"),
+        ("BOX_LONG_Y", "1"),
+        ("BOX_LONG_Z", "1"),
+        ("BOX_SPATIAL_DIMENSION", "2"),
+        ("EOS_GAMMA", "(2.0)"),
+    ];
+    const ALLOWED: [&str; 11] = [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "BOX_PERIODIC",
+        "BOX_LONG_X",
+        "BOX_LONG_Y",
+        "BOX_LONG_Z",
+        "BOX_SPATIAL_DIMENSION",
+        "EOS_GAMMA",
+        "MAGNETIC",
+        "SELFGRAVITY_OFF",
+        "OUTPUT_IN_DOUBLEPRECISION",
+        "DEVELOPER_MODE",
+    ];
+    for option in manifest.iter() {
+        if !ALLOWED.contains(&option.name.as_str()) {
+            return Err(ApplicationError::UnsupportedConfig(format!(
+                "option `{}` is outside the exact public Brio-Wu profile",
+                option.name
+            )));
+        }
+    }
+    for required in REQUIRED_FLAGS {
+        require_config_flag(manifest, required)?;
+    }
+    if manifest.get("OUTPUT_IN_DOUBLEPRECISION").is_some() {
+        require_config_flag(manifest, "OUTPUT_IN_DOUBLEPRECISION")?;
+    }
+    if manifest.get("DEVELOPER_MODE").is_some() {
+        require_config_flag(manifest, "DEVELOPER_MODE")?;
+    }
+    for (name, value) in REQUIRED_VALUES {
+        require_config_value(manifest, name, value)?;
+    }
+    Ok(StrictProfile::BrioWu)
+}
+
 fn require_config_flag(manifest: &ConfigManifest, name: &str) -> Result<(), ApplicationError> {
     let actual = manifest.get(name).map(|option| option.value.as_deref());
     match actual {
@@ -270,6 +336,9 @@ fn initialize_profile(
 ) -> Result<InitializedProfile, ApplicationError> {
     let parameters = read_profile_parameters(parameter_file, profile)?;
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
+    if profile == StrictProfile::BrioWu {
+        return initialize_briowu(&fixture_path, parameters).map(InitializedProfile::BrioWu);
+    }
     if profile == StrictProfile::MhdWave {
         return initialize_mhd_wave(&fixture_path, parameters).map(InitializedProfile::Mhd);
     }
@@ -371,6 +440,47 @@ fn initialize_profile(
         grains: None,
         summary,
     }))
+}
+
+fn initialize_briowu(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+) -> Result<InitializedBrioWu, ApplicationError> {
+    let snapshot = read_mhd_wave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    if snapshot.header.double_precision {
+        return Err(ApplicationError::StateMismatch(
+            "the pinned public Brio-Wu initial condition must use float32 HDF5 fields".to_owned(),
+        ));
+    }
+    let particle_count = snapshot.gas.len();
+    Ok(InitializedBrioWu {
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        positions: snapshot.gas.coordinates,
+        masses: snapshot.gas.masses,
+        velocities: snapshot.gas.velocities,
+        specific_internal_energy: snapshot.gas.internal_energy,
+        density: snapshot.gas.density,
+        smoothing_lengths: snapshot.gas.smoothing_length,
+        magnetic_field: snapshot.gas.magnetic_field,
+        // Restart flag zero treats these as derived/restart-only fields. In
+        // particular, the public IC misspells the GradPhi dataset name; no
+        // stored cleaning diagnostic is allowed to seed a fresh run.
+        cleaning_phi: vec![0.0; particle_count],
+        cleaning_grad_phi: vec![[0.0; 3]; particle_count],
+        divergence_of_magnetic_field: vec![0.0; particle_count],
+        box_lengths: [
+            16.0 * snapshot.header.box_size,
+            snapshot.header.box_size,
+            snapshot.header.box_size,
+        ],
+    })
 }
 
 fn initialize_mhd_wave(
@@ -632,6 +742,9 @@ fn read_profile_parameters(
             .map_err(ApplicationError::Parameters);
     }
     let input = fs::read_to_string(parameter_file).map_err(ApplicationError::ParameterFile)?;
+    if profile == StrictProfile::BrioWu {
+        return read_briowu_parameters(&input);
+    }
     if profile == StrictProfile::MhdWave {
         return read_mhd_wave_parameters(&input);
     }
@@ -791,6 +904,144 @@ fn read_profile_parameters(
                 parameters.init_cond_file
             )));
         }
+    }
+    Ok(parameters)
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_briowu_parameters(input: &str) -> Result<SoundwaveParameters, ApplicationError> {
+    const PUBLIC_TAGS: [&str; 7] = [
+        "InitCondFile",
+        "OutputDir",
+        "TimeMax",
+        "BoxSize",
+        "TimeBetSnapshot",
+        "MaxSizeTimestep",
+        "DesNumNgb",
+    ];
+    const FRONTIER_EXTRA_TAGS: [&str; 12] = [
+        "MaxNumNgbDeviation",
+        "MaxMemSize",
+        "ErrTolIntAccuracy",
+        "CourantFac",
+        "MaxRMSDisplacementFac",
+        "DivBcleaningParabolicSigma",
+        "DivBcleaningHyperbolicSigma",
+        "ResubmitOn",
+        "ResubmitCommand",
+        "ErrTolTheta",
+        "ErrTolForceAcc",
+        "TimeBetStatistics",
+    ];
+    const LEGACY_SOFTENINGS: [&str; 6] = [
+        "SofteningGas",
+        "SofteningHalo",
+        "SofteningDisk",
+        "SofteningBulge",
+        "SofteningStars",
+        "SofteningBndry",
+    ];
+    let mut retained = Vec::new();
+    let mut actual_tags = BTreeSet::new();
+    let mut softening_tags = BTreeSet::new();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let definition = raw_line
+            .split_once('%')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if definition.is_empty() {
+            retained.push(raw_line);
+            continue;
+        }
+        let mut tokens = definition.split_whitespace();
+        let tag = tokens.next().unwrap_or_default();
+        if !actual_tags.insert(tag) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "line {}: duplicate Brio-Wu parameter `{tag}`",
+                line_index + 1
+            )));
+        }
+        if LEGACY_SOFTENINGS.contains(&tag) {
+            let value = tokens.next();
+            if value != Some("0.001") || tokens.next().is_some() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: `{tag}` must equal `0.001` in the corrected-C Brio-Wu profile",
+                    line_index + 1
+                )));
+            }
+            softening_tags.insert(tag);
+        } else {
+            retained.push(raw_line);
+        }
+    }
+    let public: BTreeSet<&str> = PUBLIC_TAGS.into_iter().collect();
+    let mut frontier = public.clone();
+    frontier.extend(FRONTIER_EXTRA_TAGS);
+    let actual_without_softening: BTreeSet<&str> =
+        actual_tags.difference(&softening_tags).copied().collect();
+    let valid_public = actual_without_softening == public && softening_tags.is_empty();
+    let valid_frontier = actual_without_softening == frontier
+        && (softening_tags.is_empty() || softening_tags.len() == LEGACY_SOFTENINGS.len());
+    if !valid_public && !valid_frontier {
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "Brio-Wu requires either the exact 7-tag public profile or the exact \
+             frontier profile (optionally with all six legacy softenings); found \
+             tags={actual_tags:?}"
+        )));
+    }
+    let parameters = SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    let required_scalars: [(&str, f64, f64); 5] = [
+        ("TimeMax", parameters.time_max, 0.2),
+        ("BoxSize", parameters.box_size, 0.25),
+        ("TimeBetSnapshot", parameters.time_between_snapshots, 0.1),
+        ("MaxSizeTimestep", parameters.max_timestep, 0.04),
+        ("DesNumNgb", parameters.desired_num_neighbors, 20.0),
+    ];
+    for (field, actual, expected) in required_scalars {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "Brio-Wu requires `{field} {expected}`, found `{actual}`"
+            )));
+        }
+    }
+    let expected_neighbor_deviation: f64 = if valid_frontier { 0.1 } else { 0.05 };
+    if parameters.max_neighbor_deviation.to_bits() != expected_neighbor_deviation.to_bits() {
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "Brio-Wu requires `MaxNumNgbDeviation {expected_neighbor_deviation}`, found `{}`",
+            parameters.max_neighbor_deviation
+        )));
+    }
+    if parameters.init_cond_file != "briowu_ics"
+        || parameters.output_dir != "output"
+        || parameters.min_timestep.is_some()
+        || parameters.grain_internal_density.is_some()
+        || parameters.grain_size_min.is_some()
+        || parameters.grain_size_max.is_some()
+        || parameters.grain_size_spectrum_powerlaw.is_some()
+        || parameters.type3_softening.is_some()
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "Brio-Wu string, restart, or non-MHD parameters differ from the pinned profiles"
+                .to_owned(),
+        ));
+    }
+    if valid_frontier
+        && (parameters.max_memory_mb != Some(2000)
+            || parameters.integration_accuracy.to_bits() != 0.01_f64.to_bits()
+            || parameters.courant_factor.to_bits() != 0.2_f64.to_bits()
+            || parameters.max_rms_displacement_factor.to_bits() != 0.1_f64.to_bits()
+            || parameters.divb_cleaning_parabolic_sigma != Some(1.0)
+            || parameters.divb_cleaning_hyperbolic_sigma != Some(1.0)
+            || parameters.resubmit
+            || parameters.resubmit_command != "none"
+            || parameters.tree_opening_angle.to_bits() != 0.7_f64.to_bits()
+            || parameters.force_accuracy.to_bits() != 0.001_f64.to_bits()
+            || parameters.time_between_statistics.to_bits() != 0.5_f64.to_bits())
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "Brio-Wu frontier controls differ from corrected-c.params".to_owned(),
+        ));
     }
     Ok(parameters)
 }
@@ -994,9 +1245,27 @@ struct InitializedMhdWave {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct InitializedBrioWu {
+    parameters: SoundwaveParameters,
+    particle_ids: Vec<u64>,
+    positions: Vec<[f64; 3]>,
+    masses: Vec<f64>,
+    velocities: Vec<[f64; 3]>,
+    specific_internal_energy: Vec<f64>,
+    density: Vec<f64>,
+    smoothing_lengths: Vec<f64>,
+    magnetic_field: Vec<[f64; 3]>,
+    cleaning_phi: Vec<f64>,
+    cleaning_grad_phi: Vec<[f64; 3]>,
+    divergence_of_magnetic_field: Vec<f64>,
+    box_lengths: [f64; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum InitializedProfile {
     Hydro(InitializedSoundwave),
     Mhd(InitializedMhdWave),
+    BrioWu(InitializedBrioWu),
 }
 
 impl InitializedProfile {
@@ -1004,6 +1273,7 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.validate_owned_state(),
             Self::Mhd(initialized) => initialized.validate_owned_state(),
+            Self::BrioWu(initialized) => initialized.validate_owned_state(),
         }
     }
 
@@ -1011,7 +1281,146 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.print_initialization(config_sha256),
             Self::Mhd(initialized) => initialized.print_initialization(config_sha256),
+            Self::BrioWu(initialized) => initialized.print_initialization(config_sha256),
         }
+    }
+}
+
+impl InitializedBrioWu {
+    #[allow(clippy::too_many_lines)]
+    fn validate_owned_state(&self) -> Result<(), ApplicationError> {
+        let particle_count = self.positions.len();
+        for (field, actual) in [
+            ("ParticleIDs", self.particle_ids.len()),
+            ("masses", self.masses.len()),
+            ("velocities", self.velocities.len()),
+            (
+                "specific internal energy",
+                self.specific_internal_energy.len(),
+            ),
+            ("density", self.density.len()),
+            ("smoothing lengths", self.smoothing_lengths.len()),
+            ("magnetic field", self.magnetic_field.len()),
+            ("cleaning phi", self.cleaning_phi.len()),
+            ("cleaning grad phi", self.cleaning_grad_phi.len()),
+            (
+                "divergence of magnetic field",
+                self.divergence_of_magnetic_field.len(),
+            ),
+        ] {
+            if actual != particle_count {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "{field} has {actual} entries, expected {particle_count}"
+                )));
+            }
+        }
+        if particle_count != 50_176 {
+            return Err(ApplicationError::StateMismatch(format!(
+                "Brio-Wu fixture has {particle_count} particles, expected 50176"
+            )));
+        }
+        if self.particle_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ApplicationError::StateMismatch(
+                "Brio-Wu ParticleIDs are not strictly sorted".to_owned(),
+            ));
+        }
+        if self.box_lengths.map(f64::to_bits) != [4.0_f64, 0.25_f64, 0.25_f64].map(f64::to_bits)
+            || self.parameters.box_size.to_bits() != 0.25_f64.to_bits()
+        {
+            return Err(ApplicationError::StateMismatch(
+                "Brio-Wu rectangular periodic box must be exactly 4 x 0.25 x 0.25".to_owned(),
+            ));
+        }
+        if self.positions.iter().any(|position| {
+            !position.iter().all(|value| value.is_finite())
+                || !(0.0..self.box_lengths[0]).contains(&position[0])
+                || !(0.0..self.box_lengths[1]).contains(&position[1])
+                || position[2].to_bits() != 0.0_f64.to_bits()
+        }) {
+            return Err(ApplicationError::StateMismatch(
+                "Brio-Wu coordinates do not lie in the exact two-dimensional rectangular box"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .masses
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+            || self
+                .specific_internal_energy
+                .iter()
+                .chain(&self.density)
+                .chain(&self.smoothing_lengths)
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            || self
+                .velocities
+                .iter()
+                .chain(&self.magnetic_field)
+                .flatten()
+                .any(|value| !value.is_finite())
+        {
+            return Err(ApplicationError::StateMismatch(
+                "Brio-Wu fixture contains non-finite or non-positive physical fields".to_owned(),
+            ));
+        }
+        let mut left_count = 0_usize;
+        let mut right_count = 0_usize;
+        for index in 0..particle_count {
+            let left = self.positions[index][0] < 2.0;
+            left_count += usize::from(left);
+            right_count += usize::from(!left);
+            let expected_density: f64 = if left { 1.0 } else { 0.125 };
+            let expected_by: f64 = if left { 1.0 } else { -1.0 };
+            let field = self.magnetic_field[index];
+            if self.density[index].to_bits() != expected_density.to_bits()
+                || field[0].to_bits() != 0.75_f64.to_bits()
+                || field[1].to_bits() != expected_by.to_bits()
+                || field[2].to_bits() != 0.0_f64.to_bits()
+            {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "Brio-Wu particle {} does not match its x-selected density/magnetic state",
+                    self.particle_ids[index]
+                )));
+            }
+        }
+        if (left_count, right_count) != (25_088, 25_088) {
+            return Err(ApplicationError::StateMismatch(format!(
+                "Brio-Wu state partition is {left_count}/{right_count}, expected 25088/25088"
+            )));
+        }
+        if self
+            .cleaning_phi
+            .iter()
+            .chain(&self.divergence_of_magnetic_field)
+            .any(|value| value.to_bits() != 0.0_f64.to_bits())
+            || self
+                .cleaning_grad_phi
+                .iter()
+                .flatten()
+                .any(|value| value.to_bits() != 0.0_f64.to_bits())
+        {
+            return Err(ApplicationError::StateMismatch(
+                "Brio-Wu restart-only cleaning diagnostics were not reset".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn print_initialization(&self, config_sha256: &str) {
+        let left = self
+            .positions
+            .iter()
+            .filter(|position| position[0] < 2.0)
+            .count();
+        println!("{{");
+        println!("  \"config_sha256\": \"{config_sha256}\",");
+        println!("  \"profile\": \"Brio-Wu\",");
+        println!("  \"particles\": {},", self.positions.len());
+        println!("  \"box_lengths\": [4, 0.25, 0.25],");
+        println!("  \"gamma\": 2,");
+        println!("  \"left_particles\": {left},");
+        println!("  \"cleaning_diagnostics_initialized_to_zero\": true");
+        println!("}}");
     }
 }
 
@@ -1198,6 +1607,7 @@ fn evolve_profile(initialized: InitializedProfile) -> Result<(), ApplicationErro
     match initialized {
         InitializedProfile::Hydro(initialized) => evolve_hydro_profile(initialized),
         InitializedProfile::Mhd(initialized) => evolve_mhd_wave(initialized),
+        InitializedProfile::BrioWu(initialized) => evolve_briowu(&initialized),
     }
 }
 
@@ -1401,6 +1811,189 @@ fn evolve_mhd_wave(mut initialized: InitializedMhdWave) -> Result<(), Applicatio
          wrote {snapshot_number} snapshots"
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError> {
+    let output_dir = PathBuf::from(&initialized.parameters.output_dir);
+    fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
+    let positions: Vec<_> = initialized
+        .positions
+        .iter()
+        .map(|position| Vector2::new(position[0], position[1]))
+        .collect();
+    let domain = Box2d::new(initialized.box_lengths[0], initialized.box_lengths[1])
+        .map_err(ApplicationError::Geometry2d)?;
+    let mut smoothing_lengths = initialized.smoothing_lengths.clone();
+    // Restart flag zero reaches density three times before the public C code
+    // writes snapshot 000. Repeating independently bracketed passes preserves
+    // that initialization schedule.
+    for _ in 0..3 {
+        smoothing_lengths = solve_public_c_smoothing_lengths_from_seeds_2d(
+            &positions,
+            &initialized.masses,
+            &smoothing_lengths,
+            domain,
+            initialized.parameters.desired_num_neighbors,
+            initialized.parameters.max_neighbor_deviation,
+        )
+        .map_err(ApplicationError::Geometry2d)?
+        .into_iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    }
+    let velocities: Vec<_> = initialized
+        .velocities
+        .iter()
+        .map(|value| Vector3::new(value[0], value[1], value[2]))
+        .collect();
+    let magnetic: Vec<_> = initialized
+        .magnetic_field
+        .iter()
+        .map(|value| Vector3::new(value[0], value[1], value[2]))
+        .collect();
+    let controls = DivergenceControl2d {
+        hyperbolic_sigma: initialized
+            .parameters
+            .divb_cleaning_hyperbolic_sigma
+            .unwrap_or(1.0),
+        parabolic_sigma: initialized
+            .parameters
+            .divb_cleaning_parabolic_sigma
+            .unwrap_or(1.0),
+        ..Default::default()
+    };
+    let mut state = MhdMfmState2d::from_primitive(
+        positions,
+        initialized.masses.clone(),
+        velocities,
+        initialized.specific_internal_energy.clone(),
+        smoothing_lengths,
+        &magnetic,
+        &initialized.cleaning_phi,
+        domain,
+        2.0,
+    )
+    .map_err(ApplicationError::MhdEvolution2d)?;
+    let mut rates =
+        mhd_mfm_spatial_rates_2d(&state, controls).map_err(ApplicationError::MhdEvolution2d)?;
+    let mut time = 0.0_f64;
+    let mut snapshot_number = 0_u32;
+    let mut step_count = 0_u64;
+    write_briowu_snapshot(
+        initialized,
+        &state,
+        &rates,
+        output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+        time,
+    )?;
+    snapshot_number += 1;
+
+    for output_index in 1..=2_u32 {
+        let output_time = if output_index == 2 {
+            initialized.parameters.time_max
+        } else {
+            f64::from(output_index) * initialized.parameters.time_between_snapshots
+        };
+        while time < output_time {
+            let cfl = global_mhd_courant_timestep_2d(
+                &state,
+                &rates,
+                initialized.parameters.courant_factor,
+            )
+            .map_err(ApplicationError::MhdEvolution2d)?;
+            let timestep = cfl
+                .min(initialized.parameters.max_timestep)
+                .min(output_time - time);
+            let result = advance_mhd_kdk_adaptive_2d(
+                &state,
+                &rates,
+                timestep,
+                0.0,
+                controls,
+                initialized.parameters.desired_num_neighbors,
+                initialized.parameters.max_neighbor_deviation,
+            )
+            .map_err(ApplicationError::MhdEvolution2d)?;
+            state = result.state;
+            rates = result.rates;
+            time += timestep;
+            let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
+            if (time - output_time).abs() <= tolerance {
+                time = output_time;
+            }
+            step_count = step_count.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("2-D MHD step count overflow".to_owned())
+            })?;
+        }
+        write_briowu_snapshot(
+            initialized,
+            &state,
+            &rates,
+            output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+            output_time,
+        )?;
+        snapshot_number += 1;
+    }
+    eprintln!(
+        "completed {step_count} synchronized 2-D MHD KDK steps to t={time:.17e}; \
+         wrote {snapshot_number} snapshots (the public C run uses hierarchical time bins)"
+    );
+    Ok(())
+}
+
+fn write_briowu_snapshot(
+    initialized: &InitializedBrioWu,
+    state: &MhdMfmState2d,
+    rates: &MhdMfmRates2d,
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let primitive = state
+        .primitive_columns()
+        .map_err(ApplicationError::MhdEvolution2d)?;
+    let coordinates: Vec<[f64; 3]> = state
+        .positions
+        .iter()
+        .map(|position| [position.x, position.y, 0.0])
+        .collect();
+    let velocities: Vec<[f64; 3]> = state
+        .velocities
+        .iter()
+        .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let magnetic_field: Vec<[f64; 3]> = primitive
+        .magnetic
+        .iter()
+        .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let gas_count = u64::try_from(initialized.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u64".to_owned()))?;
+    let header = SnapshotHeader {
+        time,
+        box_size: initialized.parameters.box_size,
+        num_part_total: [gas_count, 0, 0, 0, 0, 0],
+        double_precision: true,
+        effective_kernel_neighbors: Some(initialized.parameters.desired_num_neighbors),
+    };
+    write_mhd_wave(
+        path,
+        MhdWaveWriteView {
+            header: &header,
+            coordinates: &coordinates,
+            velocities: &velocities,
+            magnetic_field: &magnetic_field,
+            ids: &initialized.particle_ids,
+            masses: &state.masses,
+            internal_energy: &state.specific_internal_energy,
+            density: &primitive.density,
+            smoothing_length: &state.smoothing_lengths,
+            cleaning_phi: Some(&primitive.cleaning_scalar),
+            cleaning_grad_phi: None,
+            divergence_of_magnetic_field: Some(&rates.magnetic_divergence),
+        },
+    )
+    .map_err(ApplicationError::Output)
 }
 
 fn write_mhd_snapshot(
@@ -2135,7 +2728,9 @@ enum ApplicationError {
     Output(gizmo_io::OutputError),
     OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
+    Geometry2d(gizmo_hydro::meshless_2d::GeometryError),
     MhdEvolution(gizmo_hydro::mhd_evolution::MhdEvolutionError),
+    MhdEvolution2d(gizmo_hydro::mhd_evolution_2d::MhdEvolution2dError),
     Grain(gizmo_hydro::grain::GrainError),
     UnsupportedConfig(String),
     UnsupportedParameters(String),
@@ -2162,7 +2757,9 @@ impl std::fmt::Display for ApplicationError {
                 )
             }
             Self::Hydro(error) => error.fmt(formatter),
+            Self::Geometry2d(error) => error.fmt(formatter),
             Self::MhdEvolution(error) => error.fmt(formatter),
+            Self::MhdEvolution2d(error) => error.fmt(formatter),
             Self::Grain(error) => error.fmt(formatter),
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
@@ -2217,6 +2814,12 @@ DEVELOPER_MODE
         include_str!("../../../../validation/oracles/mhd_wave/frontier-config.sh");
     const MHD_WAVE_PARAMETERS: &str =
         include_str!("../../../../validation/oracles/mhd_wave/frontier.params");
+    const BRIOWU_CONFIG: &str =
+        include_str!("../../../../validation/oracles/briowu/corrected-c-config.sh");
+    const BRIOWU_PUBLIC_PARAMETERS: &str =
+        include_str!("../../../../validation/oracles/briowu/public.params");
+    const BRIOWU_FRONTIER_PARAMETERS: &str =
+        include_str!("../../../../validation/oracles/briowu/frontier.params");
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -2315,6 +2918,61 @@ ResubmitCommand none
         ] {
             assert!(matches!(
                 read_mhd_wave_parameters(&invalid),
+                Err(ApplicationError::UnsupportedParameters(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_two_dimensional_briowu_config_is_required() {
+        let manifest = ConfigManifest::parse(BRIOWU_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::BrioWu
+        );
+        for invalid in [
+            BRIOWU_CONFIG.replace("BOX_LONG_X=16", "BOX_LONG_X=1"),
+            BRIOWU_CONFIG.replace("BOX_SPATIAL_DIMENSION=2", "BOX_SPATIAL_DIMENSION=1"),
+            BRIOWU_CONFIG.replace("EOS_GAMMA=(2.0)", "EOS_GAMMA=(5.0/3.0)"),
+            BRIOWU_CONFIG.replace("MAGNETIC\n", ""),
+            format!("{BRIOWU_CONFIG}DEVELOPER_MODE=1\n"),
+        ] {
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&invalid).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(_))
+            ));
+        }
+        let exact_public = BRIOWU_CONFIG.replace("OUTPUT_IN_DOUBLEPRECISION\n", "");
+        assert_eq!(
+            validate_strict_config(&ConfigManifest::parse(&exact_public).unwrap()).unwrap(),
+            StrictProfile::BrioWu
+        );
+        let frontier = include_str!("../../../../validation/oracles/briowu/frontier-config.sh");
+        assert_eq!(
+            validate_strict_config(&ConfigManifest::parse(frontier).unwrap()).unwrap(),
+            StrictProfile::BrioWu
+        );
+    }
+
+    #[test]
+    fn exact_public_and_frontier_briowu_parameters_are_accepted() {
+        let public = read_briowu_parameters(BRIOWU_PUBLIC_PARAMETERS).unwrap();
+        assert_eq!(public.init_cond_file, "briowu_ics");
+        assert_eq!(public.desired_num_neighbors.to_bits(), 20.0_f64.to_bits());
+        assert_eq!(public.max_neighbor_deviation.to_bits(), 0.05_f64.to_bits());
+        let frontier = read_briowu_parameters(BRIOWU_FRONTIER_PARAMETERS).unwrap();
+        assert_eq!(frontier.max_memory_mb, Some(2000));
+        assert_eq!(frontier.divb_cleaning_parabolic_sigma, Some(1.0));
+        assert_eq!(frontier.max_neighbor_deviation.to_bits(), 0.1_f64.to_bits());
+        for invalid in [
+            BRIOWU_PUBLIC_PARAMETERS
+                .replace("DesNumNgb                          20", "DesNumNgb 4"),
+            format!("{BRIOWU_PUBLIC_PARAMETERS}CourantFac 0.2\n"),
+            BRIOWU_FRONTIER_PARAMETERS
+                .replace("DivBcleaningHyperbolicSigma", "UnexpectedHyperbolicSigma"),
+        ] {
+            assert!(matches!(
+                read_briowu_parameters(&invalid),
                 Err(ApplicationError::UnsupportedParameters(_))
             ));
         }

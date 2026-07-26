@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 pub mod grain;
+pub mod meshless_2d;
 pub mod mhd;
+pub mod mhd_2d;
 pub mod mhd_evolution;
+pub mod mhd_evolution_2d;
 
 use std::collections::BTreeMap;
 use std::error::Error;

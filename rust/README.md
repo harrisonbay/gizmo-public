@@ -12,7 +12,10 @@ MFM HLLC/KT/exact Riemann flux, including conservative pair orientation and
 lab-frame deboost, face-closure fallback, and the low-contact-speed
 entropic/PdV energy correction. The strict restart-0 CLI evolves that profile
 with synchronized KDK stepping and writes checked, upstream-compatible HDF5
-snapshots. Other physics/configuration profiles fail closed.
+snapshots. The Brio-Wu slice additionally implements rectangular-periodic 2-D
+MFM geometry, adaptive smoothing lengths, limited planar MLS gradients,
+arbitrary-normal HLLD, Powell/Dedner terms, and synchronized 2-D KDK. Other
+physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -20,6 +23,7 @@ validation/oracles/run_rust_shocktube.sh
 validation/oracles/run_rust_interactblast.sh
 validation/oracles/run_rust_dustybox.sh
 validation/oracles/run_rust_dustywave.sh
+validation/oracles/run_rust_briowu_init.sh
 ```
 
 The complete 65,536-step corrected-C differential is intentionally separate
@@ -94,7 +98,7 @@ configuration parsing:
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
   reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact, pair, and
-  entropic/PdV fluxes.
+  entropic/PdV fluxes; it also owns the current two-dimensional MFM/MHD slice.
 - `gizmo-cli`: the strict initialization/evolution compatibility boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From

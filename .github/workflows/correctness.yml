@@ -64,6 +64,9 @@ jobs:
       - name: Run pinned dusty-box analytic evolution oracle
         if: steps.rust.outputs.present == 'true'
         run: validation/oracles/run_rust_dustybox.sh
+      - name: Run pinned Brio-Wu two-dimensional initialization oracle
+        if: steps.rust.outputs.present == 'true'
+        run: validation/oracles/run_rust_briowu_init.sh
       - name: Deny Clippy warnings
         if: steps.rust.outputs.present == 'true'
         working-directory: rust

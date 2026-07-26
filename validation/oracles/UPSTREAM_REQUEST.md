@@ -84,9 +84,13 @@ consistent with gamma `1.4`.
 
 For `brio-wu` and `toth`, please provide the machine-readable exact/reference
 curves used in the published plots; no corresponding tables are present in the
-hosted directory. For `zeldovich`, please document the headerless reference
-table's column transforms and explain why the hosted IC contains 262,208
-particles rather than `64^3`.
+hosted directory. The newer Brio-Wu harness checks only terminal time, finite
+fields, positive density, and a broad density range already satisfied by the
+unevolved IC, so it is not a correctness oracle. A copy/paste request naming
+the exact Brio-Wu artifacts and fixture checksum is in
+`briowu/UPSTREAM_REQUEST.md`. For `zeldovich`, please document the headerless
+reference table's column transforms and explain why the hosted IC contains
+262,208 particles rather than `64^3`.
 
 The most useful delivery is a versioned archive or repository containing the
 generators, configs, analyzers, thresholds, and a checksum manifest. Large raw

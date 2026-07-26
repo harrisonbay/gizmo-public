@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "profile": "public-brio-wu-2d-sheet",
+  "source": {
+    "repository": "https://github.com/harrisonbay/gizmo-public",
+    "commit": "a866e7eb9711e463e8bba79ce93c1c31892711e9",
+    "upstream_repository": "https://github.com/pfhopkins/gizmo-public",
+    "upstream_base_commit": "a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f",
+    "riemann_header_last_modified_commit": "758fbc9f9e45d27bff3b85864669ccc0ffdd7de1",
+    "riemann_header_sha256": "8807762c1efd465ced84646dac3555d87720d9dfbb6780bdda5eab146117e4ba",
+    "run_c_sha256": "ac4746d9d6a331f44d9e33d0d33127554b38abf3d0c2fd262c6e970e3e5abafb",
+    "initial_condition_sha256": "300364564285270ed6e2f435786728683aeccd23c7c1eeb34d11eee9fade6f01",
+    "config_sha256": "3f0026c0f57473aa83423d02b36a2f89e7b996046264091192d5ec836c6b8ccd",
+    "generated_config_sha256": "83085a81962ecbec09e13e69f9209967292ec51cf61465697afcc58d0943cde8",
+    "input_parameters_sha256": "e2667f0b80335b24da4d68d863c079c7d467ded4a8e847cf2bedd5edbcd3a70e",
+    "parameters_usedvalues_sha256": "da5fb1a69a7d3137ba7aa2422cec3f9284495029ca57c1a695043d7469753a37"
+  },
+  "build": {
+    "system_type": "MacBookCellar",
+    "compiler": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "target": "arm64-apple-darwin24.6.0",
+    "output_precision": "double"
+  },
+  "execution": {
+    "command": "mpirun -np 4 ../source/GIZMO-briowu briowu.params",
+    "mpi_ranks": 4,
+    "terminal_step": 2048,
+    "terminal_time": 0.2,
+    "output_times": [0.0, 0.1, 0.2],
+    "output_phase": {
+      "snapshot_000": "after initial force evaluation and first half-kick; zero elapsed drift",
+      "snapshot_001_and_002": "written during drift/output scheduling before the endpoint force evaluation"
+    },
+    "particle_count": 50176,
+    "domain_lengths": [4.0, 0.25, 0.25],
+    "spatial_dimension": 2,
+    "gamma": 2.0
+  },
+  "raw_snapshots": [
+    {
+      "index": 0,
+      "time": 0.0,
+      "size_bytes": 5828608,
+      "sha256": "ddec24d4cabbabdc37aee6d38f87dcfbea6b6872bad2f7e59bd51ec322656fff"
+    },
+    {
+      "index": 1,
+      "time": 0.1,
+      "size_bytes": 5828608,
+      "sha256": "91c25cd6a96088971a1144dd6d08285dc59c6759623461adbd22b45ec22c6f97"
+    },
+    {
+      "index": 2,
+      "time": 0.2,
+      "size_bytes": 5828608,
+      "sha256": "1e2557541ccba28912ed80083b03aa2bddb67722fb0b01d13e2ca4207360a2f6"
+    }
+  ],
+  "semantic_artifacts": {
+    "reducer": {
+      "path": "../reduce_briowu_snapshot.py",
+      "sha256": "ec398782ec35586a5cd2f869dd2423d0f97440d6df14310ce025028b94e91e40",
+      "rank_bins": 896,
+      "particles_per_bin": 56,
+      "sorting_keys": ["x", "y", "particle_id"]
+    },
+    "profiles": [
+      {
+        "path": "evolution_t0.csv.gz",
+        "time": 0.0,
+        "sha256": "d8740d5521a186760ac195c870a634552bf80d41267c6d61c4776ce8a177de26"
+      },
+      {
+        "path": "evolution_t0.1.csv.gz",
+        "time": 0.1,
+        "sha256": "53df8034cce38f17971f56e4463752feeceddf9cb9bee18c917ea7a2ab11552b"
+      },
+      {
+        "path": "evolution_t0.2.csv.gz",
+        "time": 0.2,
+        "sha256": "45216c77a994366f2947f6d1cae853166a74df5ca495ec41e17a5092c499a7a3"
+      }
+    ]
+  },
+  "snapshot_diagnostics": {
+    "energy_definition": "sum(m*u + 0.5*m*|v|^2 + 0.5*(m/rho)*|B|^2); excludes Dedner cleaning-field energy",
+    "samples": [
+      {
+        "time": 0.0,
+        "mass": 0.5617289289416476,
+        "relative_mass_change": 0.0,
+        "momentum": [1.1946878804031151e-17, 2.2946814192437997e-14, 0.0],
+        "kinetic_energy": 1.0743080818504247e-06,
+        "thermal_energy": 0.5492841112604581,
+        "magnetic_energy": 0.7816416600092488,
+        "diagnostic_total_energy": 1.3309268455777887,
+        "relative_diagnostic_total_energy_change": 0.0,
+        "density_range": [0.12476569178438454, 0.9981323026146683],
+        "specific_internal_energy_range": [0.800000011920929, 1.0127602815628052],
+        "all_recorded_fields_finite": true
+      },
+      {
+        "time": 0.1,
+        "mass": 0.5617289289416476,
+        "relative_mass_change": 0.0,
+        "momentum": [-1.0036618675908662e-13, -1.3951059549672618e-13, 0.0],
+        "kinetic_energy": 0.06381540795354879,
+        "thermal_energy": 0.5446087797612893,
+        "magnetic_energy": 0.7211327289505038,
+        "diagnostic_total_energy": 1.329556916665342,
+        "relative_diagnostic_total_energy_change": -0.0010293044407350127,
+        "density_range": [0.11056509493527121, 1.0144252178967528],
+        "specific_internal_energy_range": [0.6418445250834652, 3.702522683512502],
+        "all_recorded_fields_finite": true
+      },
+      {
+        "time": 0.2,
+        "mass": 0.5617289289416476,
+        "relative_mass_change": 0.0,
+        "momentum": [-1.3168229512231355e-09, 1.857129870022698e-10, 0.0],
+        "kinetic_energy": 0.12932734458467463,
+        "thermal_energy": 0.5383451925654605,
+        "magnetic_energy": 0.6619045433661235,
+        "diagnostic_total_energy": 1.3295770805162586,
+        "relative_diagnostic_total_energy_change": -0.001014154208411222,
+        "density_range": [0.11001663180183342, 1.0132192684482537],
+        "specific_internal_energy_range": [0.6137460901124637, 3.721527455894823],
+        "all_recorded_fields_finite": true
+      }
+    ]
+  },
+  "hlld_gamma2_interface_oracle": {
+    "implementation": "../../../hydro/reimann.h",
+    "generator": "generate_hlld_gamma2_oracle.c",
+    "generator_sha256": "0a44770f88fe9171970fe1d17db98dc607c0add015bd6ea689017a99611e2d78",
+    "compile_command": "clang -std=c99 -O2 validation/oracles/briowu/generate_hlld_gamma2_oracle.c -lm -o generate_hlld_gamma2_oracle",
+    "table": "hlld_gamma2_flux_oracle.csv",
+    "table_sha256": "2879052b0ef9c92d89482299e465f5c2b08158a8068ee16f51308ff47dda40e7",
+    "cases": 3,
+    "gamma": 2.0,
+    "flux_frame": "HLLD contact"
+  },
+  "published_figure_reference": {
+    "kind": "approximate vector-figure digitization",
+    "paper": "Hopkins & Raives, Accurate, Meshless Methods for Magnetohydrodynamics",
+    "arxiv": "1505.02783v3",
+    "figure": 3,
+    "time": 0.2,
+    "source_figure": "briowu_TP3.pdf",
+    "source_figure_sha256": "f3354f2e92c6ff44042cef558910f27cef6cf098be66ef84481734e05d31bb3c",
+    "svg_conversion_command": "pdftocairo -svg briowu_TP3.pdf tmp/pdfs/briowu.svg",
+    "svg_converter": "Poppler pdftocairo 26.07.0",
+    "svg_sha256": "64f6160efec9064557c1300d0fd3865bfbe6e8768f0b561fd53e774e8f557fc8",
+    "extractor": "extract_published_exact_curves.py",
+    "extractor_sha256": "f437e1ac747e0a3a9fd2651c9d2a3d32fd4a9a363318f6ed81e5010d290bb51f",
+    "table": "published_exact_figure.csv",
+    "table_sha256": "d6a4de04152f4eca9629d6f2f760cbd2a96716796dd520794b2f5e45730a9bdb",
+    "comparator": "../compare_briowu_profile.py",
+    "comparator_sha256": "574910a99644f87473cebbc9a00a2ea1085e3b37dca6affcc9cea36be77c3bf5",
+    "fields": ["vx", "vy", "bx", "by", "rho", "u", "pressure"],
+    "path_points": 293,
+    "calibration": "two labelled major ticks per axis; separate x calibration for each figure column",
+    "acceptance_role": "independent approximate physics-profile check with explicit tolerances; never a bitwise oracle",
+    "corrected_c_terminal_normalized_l1": {
+      "vx": 0.019590658342794144,
+      "vy": 0.01582606644030979,
+      "bx": 0.004230036509713284,
+      "by": 0.005697490120968617,
+      "rho": 0.008486770322271976,
+      "u": 0.0292426755129157,
+      "pressure": 0.011145767465971585
+    },
+    "maximum_normalized_l1_gate": 0.05
+  },
+  "limitations": [
+    "This is a differential oracle from the corrected C implementation, not an independent exact solution.",
+    "Header time zero in snapshot_000 denotes a post-first-half-kick leapfrog output, not the unevolved initial condition.",
+    "The scalar diagnostic total energy excludes Dedner cleaning-field energy and is recorded as a regression diagnostic, not asserted as a conservation law.",
+    "The 896-bin profiles retain x-order and transverse averages but cannot expose every particle-scale 2-D error.",
+    "The published exact/reference curves are digitized from vector figure paths and are not the authors' original machine-readable numerical table."
+  ]
+}
