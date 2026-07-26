@@ -74,12 +74,15 @@ limiters, CFL length, adaptive-H drift, and the C retry ladder.
 This is not yet a terminal trajectory claim. Rust currently advances every
 particle on a synchronized global step, whereas the C baseline uses
 hierarchical individual-particle time bins. The corrected-C logs establish the
-global synchronization cadence, but do not prove that every particle occupies
-the same bin. Rust also still serializes the wrong leapfrog phase: its
-`snapshot_000` is pre-kick and later snapshots are post-second-kick, while C
-writes the mixed predictor/actual view during drift. The synchronized public
-step currently discards that predictor view between calls, so multi-step
-trajectory parity requires a persistent dual actual/predicted state before a
+global synchronization cadence, but not a common particle bin. The split Rust
+KDK API now exposes and serializes C's mixed drift view: half-kicked actual
+velocity with predicted density, internal energy, H, B, and phi before endpoint
+density/force/second-kick work. However, its synchronized `snapshot_000`
+maximum `|vx|` is `0.0090988`, exactly half the corrected-C value near `0.0182`.
+Its maximum `|vy|=0.0263302` already matches corrected C. That split is direct
+evidence that the x-extremum particles begin in a two-times-larger individual
+bin while the y extrema use the minimum bin. Reproducing those bins and
+inactive-particle/deferred-flux semantics is now the principal blocker before a
 Rust `t=0.2` profile can be promoted to the 5% gate.
 
 ## Approximate published-figure reference

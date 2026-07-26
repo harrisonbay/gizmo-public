@@ -8,15 +8,19 @@ use gizmo_hydro::meshless_2d::{
 };
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution_2d::{
-    DivergenceControl2d, MhdMfmState2d, MhdRateContext2d, advance_public_mhd_kdk_adaptive_2d,
-    global_public_mhd_timestep_bound_2d, mhd_mfm_spatial_rates_2d,
-    mhd_mfm_spatial_rates_with_context_2d,
+    DivergenceControl2d, MhdMfmState2d, begin_public_mhd_kdk_adaptive_2d,
+    finish_public_mhd_kdk_adaptive_2d, global_public_mhd_timestep_bound_2d,
+    mhd_mfm_spatial_rates_2d,
 };
 use gizmo_io::read_mhd_wave;
 
 #[test]
 #[ignore = "requires GIZMO_BRIOWU_FIXTURE; evaluates the full 50,176-particle 2-D sheet"]
-#[allow(clippy::too_many_lines, clippy::uninlined_format_args)]
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args
+)]
 fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
     let path = std::env::var_os("GIZMO_BRIOWU_FIXTURE")
         .map(PathBuf::from)
@@ -248,19 +252,9 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
         .unwrap();
     assert_eq!(first_step.duration.to_bits(), (0.2_f64 / 2048.0).to_bits());
     if std::env::var_os("GIZMO_BRIOWU_ADVANCE_ONE_STEP").is_some() {
-        let limited_rates = mhd_mfm_spatial_rates_with_context_2d(
+        let mut step = begin_public_mhd_kdk_adaptive_2d(
             &state,
-            DivergenceControl2d::default(),
-            MhdRateContext2d {
-                previous_stored_magnetic_divergence: None,
-                timestep: Some(first_step.duration),
-                courant_factor: Some(0.2),
-            },
-        )
-        .expect("evaluate the timestep-dependent initial force");
-        let advanced = advance_public_mhd_kdk_adaptive_2d(
-            &state,
-            &limited_rates,
+            &rates,
             first_step.duration,
             0.0,
             DivergenceControl2d::default(),
@@ -268,7 +262,32 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
             0.05,
             0.2,
         )
-        .expect("advance one phase-aware public Brio-Wu KDK step");
+        .expect("apply the context-free initial force in the first half-kick");
+        let initial_output = step
+            .drift_state(0.0)
+            .expect("expose the corrected-C t=0 output phase");
+        let maximum_abs_vx = initial_output
+            .actual_velocities
+            .iter()
+            .map(|velocity| velocity.x.abs())
+            .fold(0.0_f64, f64::max);
+        let maximum_abs_vy = initial_output
+            .actual_velocities
+            .iter()
+            .map(|velocity| velocity.y.abs())
+            .fold(0.0_f64, f64::max);
+        // The x maximum is half the corrected-C value while y already agrees.
+        // This synchronized runner applies the minimum cadence to every
+        // particle; corrected C therefore assigns the x-extremum particles a
+        // two-times-larger individual bin while the y extrema stay in the
+        // minimum bin.
+        assert!(
+            (0.009..0.0092).contains(&maximum_abs_vx),
+            "{maximum_abs_vx}"
+        );
+        assert!((0.026..0.027).contains(&maximum_abs_vy), "{maximum_abs_vy}");
+        let advanced = finish_public_mhd_kdk_adaptive_2d(step)
+            .expect("finish one phase-aware public Brio-Wu KDK step");
         assert!(
             advanced
                 .state

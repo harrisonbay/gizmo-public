@@ -117,6 +117,40 @@ pub struct MhdKdkResult2d {
     pub rates: MhdMfmRates2d,
 }
 
+/// Mixed actual/predicted state serialized by public C during a drift.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicMhdDriftState2d {
+    pub positions: Vec<Vector2>,
+    /// Actual velocity after the first half-kick.
+    pub actual_velocities: Vec<Vector3>,
+    pub predicted_velocities: Vec<Vector3>,
+    pub predicted_specific_internal_energy: Vec<f64>,
+    pub predicted_density: Vec<f64>,
+    pub predicted_smoothing_lengths: Vec<f64>,
+    /// Predicted extensive `V B`.
+    pub predicted_magnetic_volume: Vec<Vector3>,
+    /// Predicted extensive `m phi`.
+    pub predicted_cleaning_mass: Vec<f64>,
+}
+
+/// Prepared first kick and drift predictor for a public synchronized MHD step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicMhdKdkStep2d {
+    start: MhdMfmState2d,
+    old_rates: MhdMfmRates2d,
+    half_internal: Vec<f64>,
+    half_magnetic: Vec<Vector3>,
+    half_cleaning: Vec<f64>,
+    drift: PublicMhdDriftState2d,
+    elapsed: f64,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    controls: DivergenceControl2d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    courant_factor: f64,
+}
+
 #[derive(Debug)]
 pub enum MhdEvolution2dError {
     Geometry(GeometryError),
@@ -1138,7 +1172,7 @@ pub fn advance_public_mhd_kdk_adaptive_2d(
     neighbor_tolerance: f64,
     courant_factor: f64,
 ) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
-    advance_public_mhd_kdk_primitive_2d(
+    let step = begin_public_mhd_kdk_adaptive_2d(
         state,
         old_rates,
         timestep,
@@ -1147,11 +1181,264 @@ pub fn advance_public_mhd_kdk_adaptive_2d(
         desired_neighbors,
         neighbor_tolerance,
         courant_factor,
-    )
+    )?;
+    finish_public_mhd_kdk_adaptive_2d(step)
 }
 
+impl PublicMhdKdkStep2d {
+    /// Advance the predictor monotonically to an elapsed time in this step.
+    ///
+    /// The returned fields match the mixed actual/predicted view used by the
+    /// public snapshot writer before endpoint density and force evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a backward/out-of-step cursor or invalid physics.
+    pub fn drift_state(
+        &mut self,
+        elapsed: f64,
+    ) -> Result<PublicMhdDriftState2d, MhdEvolution2dError> {
+        if !elapsed.is_finite() || elapsed < self.elapsed || elapsed > self.timestep {
+            return Err(invalid(None, "kdk_drift_elapsed", elapsed));
+        }
+        let segment = elapsed - self.elapsed;
+        if segment == 0.0 {
+            return Ok(self.drift.clone());
+        }
+        for i in 0..self.start.positions.len() {
+            let velocity = self.drift.actual_velocities[i];
+            self.drift.positions[i] = self
+                .start
+                .domain
+                .wrap(self.drift.positions[i] + Vector2::new(velocity.x, velocity.y) * segment)?;
+            self.drift.predicted_velocities[i] =
+                self.drift.predicted_velocities[i] + self.old_rates.acceleration[i] * segment;
+            self.drift.predicted_specific_internal_energy[i] = limited_internal_energy_update_2d(
+                self.drift.predicted_specific_internal_energy[i],
+                self.old_rates.specific_internal_energy[i],
+                segment,
+                self.minimum_specific_internal_energy,
+            )?;
+            let divergence_increment =
+                (self.old_rates.velocity_divergence[i] * segment).clamp(-0.3, 0.3);
+            self.drift.predicted_density[i] *= (-divergence_increment).exp();
+            self.drift.predicted_smoothing_lengths[i] *= (0.5 * divergence_increment).exp();
+            self.drift.predicted_magnetic_volume[i] = self.drift.predicted_magnetic_volume[i]
+                + self.old_rates.magnetic_volume[i] * segment;
+            self.drift.predicted_cleaning_mass[i] = predict_cleaning_mass_2d(
+                self.drift.predicted_cleaning_mass[i],
+                self.old_rates.cleaning_mass[i],
+                self.old_rates.cleaning_damping_rate[i],
+                segment,
+            );
+        }
+        self.elapsed = elapsed;
+        Ok(self.drift.clone())
+    }
+
+    #[must_use]
+    pub fn timestep(&self) -> f64 {
+        self.timestep
+    }
+
+    #[must_use]
+    pub fn elapsed(&self) -> f64 {
+        self.elapsed
+    }
+}
+
+/// Apply the public first half-kick and expose the drift-phase predictor.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, rates, integration inputs, or kick
+/// arithmetic.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn advance_public_mhd_kdk_primitive_2d(
+pub fn begin_public_mhd_kdk_adaptive_2d(
+    state: &MhdMfmState2d,
+    old_rates: &MhdMfmRates2d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    controls: DivergenceControl2d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    courant_factor: f64,
+) -> Result<PublicMhdKdkStep2d, MhdEvolution2dError> {
+    state.validate()?;
+    validate_rate_lengths(old_rates, state.positions.len())?;
+    validate_rate_context(
+        state.positions.len(),
+        MhdRateContext2d {
+            previous_stored_magnetic_divergence: Some(&old_rates.stored_magnetic_divergence),
+            timestep: Some(timestep),
+            courant_factor: Some(courant_factor),
+        },
+    )?;
+    if !minimum_specific_internal_energy.is_finite() || minimum_specific_internal_energy < 0.0 {
+        return Err(invalid(
+            None,
+            "minimum_specific_internal_energy",
+            minimum_specific_internal_energy,
+        ));
+    }
+    let primitive = state.primitive_columns()?;
+    let half_timestep = 0.5 * timestep;
+    let count = state.positions.len();
+    let mut effective_old_rates = old_rates.clone();
+    let mut half_velocity = Vec::with_capacity(count);
+    let mut half_internal = Vec::with_capacity(count);
+    let mut half_magnetic = Vec::with_capacity(count);
+    let mut half_cleaning = Vec::with_capacity(count);
+    for i in 0..count {
+        half_velocity.push(state.velocities[i] + old_rates.acceleration[i] * half_timestep);
+        half_internal.push(limited_internal_energy_update_2d(
+            state.specific_internal_energy[i],
+            old_rates.specific_internal_energy[i],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?);
+        half_magnetic.push(state.magnetic_volume[i] + old_rates.magnetic_volume[i] * half_timestep);
+        let cleaning_kick = kick_cleaning_mass_public_2d(
+            state.cleaning_mass[i],
+            state.cleaning_mass[i],
+            old_rates.cleaning_mass[i],
+            old_rates.cleaning_damping_rate[i],
+            half_timestep,
+            state.masses[i],
+            primitive.density[i],
+            primitive.pressure[i],
+            primitive.magnetic[i],
+            state.gamma,
+            old_rates.maximum_signal_speed[i],
+            old_rates.global_fastest_wave_speed,
+        );
+        half_cleaning.push(cleaning_kick.value);
+        effective_old_rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+    }
+    let drift = PublicMhdDriftState2d {
+        positions: state.positions.clone(),
+        actual_velocities: half_velocity,
+        predicted_velocities: state.velocities.clone(),
+        predicted_specific_internal_energy: state.specific_internal_energy.clone(),
+        predicted_density: primitive.density,
+        predicted_smoothing_lengths: state.smoothing_lengths.clone(),
+        predicted_magnetic_volume: state.magnetic_volume.clone(),
+        predicted_cleaning_mass: state.cleaning_mass.clone(),
+    };
+    Ok(PublicMhdKdkStep2d {
+        start: state.clone(),
+        old_rates: effective_old_rates,
+        half_internal,
+        half_magnetic,
+        half_cleaning,
+        drift,
+        elapsed: 0.0,
+        timestep,
+        minimum_specific_internal_energy,
+        controls,
+        desired_neighbors,
+        neighbor_tolerance,
+        courant_factor,
+    })
+}
+
+/// Finish endpoint density/force evaluation and the second public half-kick.
+///
+/// # Errors
+///
+/// Returns an error for invalid endpoint density, force, or kick arithmetic.
+#[allow(clippy::too_many_lines)]
+pub fn finish_public_mhd_kdk_adaptive_2d(
+    mut step: PublicMhdKdkStep2d,
+) -> Result<MhdKdkResult2d, MhdEvolution2dError> {
+    let endpoint = step.drift_state(step.timestep)?;
+    let smoothing_lengths: Vec<f64> = solve_public_c_smoothing_lengths_from_seeds_2d(
+        &endpoint.positions,
+        &step.start.masses,
+        &endpoint.predicted_smoothing_lengths,
+        step.start.domain,
+        step.desired_neighbors,
+        step.neighbor_tolerance,
+    )?
+    .into_iter()
+    .map(|particle| particle.smoothing_length)
+    .collect();
+    let predicted_state = MhdMfmState2d {
+        positions: endpoint.positions.clone(),
+        masses: step.start.masses.clone(),
+        velocities: endpoint.predicted_velocities,
+        specific_internal_energy: endpoint.predicted_specific_internal_energy,
+        smoothing_lengths: smoothing_lengths.clone(),
+        magnetic_volume: endpoint.predicted_magnetic_volume,
+        cleaning_mass: endpoint.predicted_cleaning_mass,
+        domain: step.start.domain,
+        gamma: step.start.gamma,
+    };
+    predicted_state.validate()?;
+    let mut rates = mhd_mfm_spatial_rates_with_context_2d(
+        &predicted_state,
+        step.controls,
+        MhdRateContext2d {
+            previous_stored_magnetic_divergence: Some(&step.old_rates.stored_magnetic_divergence),
+            timestep: Some(step.timestep),
+            courant_factor: Some(step.courant_factor),
+        },
+    )?;
+    let predicted_primitive = predicted_state.primitive_columns()?;
+    let half_timestep = 0.5 * step.timestep;
+    let count = step.start.positions.len();
+    let mut final_velocity = Vec::with_capacity(count);
+    let mut final_internal = Vec::with_capacity(count);
+    let mut final_magnetic = Vec::with_capacity(count);
+    let mut final_cleaning = Vec::with_capacity(count);
+    for i in 0..count {
+        final_velocity.push(endpoint.actual_velocities[i] + rates.acceleration[i] * half_timestep);
+        final_internal.push(limited_internal_energy_update_2d(
+            step.half_internal[i],
+            rates.specific_internal_energy[i],
+            half_timestep,
+            step.minimum_specific_internal_energy,
+        )?);
+        final_magnetic.push(step.half_magnetic[i] + rates.magnetic_volume[i] * half_timestep);
+        let particle_size = (step.start.masses[i] / predicted_primitive.density[i]).sqrt();
+        let damping_rate = step.controls.parabolic_sigma * step.old_rates.global_fastest_wave_speed
+            / particle_size;
+        let cleaning_kick = kick_cleaning_mass_public_2d(
+            step.half_cleaning[i],
+            predicted_state.cleaning_mass[i],
+            rates.cleaning_mass[i],
+            damping_rate,
+            half_timestep,
+            step.start.masses[i],
+            predicted_primitive.density[i],
+            predicted_primitive.pressure[i],
+            predicted_primitive.magnetic[i],
+            step.start.gamma,
+            rates.maximum_signal_speed[i],
+            step.old_rates.global_fastest_wave_speed,
+        );
+        final_cleaning.push(cleaning_kick.value);
+        rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+        rates.cleaning_damping_rate[i] = damping_rate;
+    }
+    let state = MhdMfmState2d {
+        positions: endpoint.positions,
+        masses: step.start.masses,
+        velocities: final_velocity,
+        specific_internal_energy: final_internal,
+        smoothing_lengths,
+        magnetic_volume: final_magnetic,
+        cleaning_mass: final_cleaning,
+        domain: step.start.domain,
+        gamma: step.start.gamma,
+    };
+    state.validate()?;
+    Ok(MhdKdkResult2d { state, rates })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn advance_public_mhd_kdk_legacy_reference_2d(
     state: &MhdMfmState2d,
     old_rates: &MhdMfmRates2d,
     timestep: f64,
@@ -2557,6 +2844,32 @@ mod tests {
                 .iter()
                 .all(|estimate| (estimate.effective_neighbors - 20.0).abs() <= 0.05)
         );
+    }
+
+    #[test]
+    fn public_kdk_split_exposes_c_snapshot_phase_and_matches_reference_step() {
+        let state = sheet(16, 4, true);
+        let controls = no_sources();
+        let rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        let mut step =
+            begin_public_mhd_kdk_adaptive_2d(&state, &rates, 0.001, 0.0, controls, 20.0, 0.05, 0.2)
+                .unwrap();
+        let at_zero = step.drift_state(0.0).unwrap();
+        assert_eq!(at_zero.positions, state.positions);
+        assert_eq!(at_zero.predicted_velocities, state.velocities);
+        assert!(
+            at_zero
+                .actual_velocities
+                .iter()
+                .zip(&state.velocities)
+                .any(|(actual, initial)| *actual != *initial)
+        );
+        let split = finish_public_mhd_kdk_adaptive_2d(step).unwrap();
+        let reference = advance_public_mhd_kdk_legacy_reference_2d(
+            &state, &rates, 0.001, 0.0, controls, 20.0, 0.05, 0.2,
+        )
+        .unwrap();
+        assert_eq!(split, reference);
     }
 
     #[test]

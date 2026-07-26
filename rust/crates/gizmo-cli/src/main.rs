@@ -18,7 +18,8 @@ use gizmo_hydro::mhd_evolution::{
     global_mhd_courant_timestep_1d, mhd_mfm_spatial_rates_1d,
 };
 use gizmo_hydro::mhd_evolution_2d::{
-    DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, advance_public_mhd_kdk_adaptive_2d,
+    DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, PublicMhdDriftState2d,
+    begin_public_mhd_kdk_adaptive_2d, finish_public_mhd_kdk_adaptive_2d,
     global_public_mhd_timestep_bound_2d, mhd_mfm_spatial_rates_2d,
 };
 use gizmo_hydro::{
@@ -1882,14 +1883,6 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
     let mut time = timeline.current_time();
     let mut snapshot_number = 0_u32;
     let mut step_count = 0_u64;
-    write_briowu_snapshot(
-        initialized,
-        &state,
-        &rates,
-        output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
-        time,
-    )?;
-    snapshot_number += 1;
 
     for output_index in 1..=2_u32 {
         let output_time = if output_index == 2 {
@@ -1919,7 +1912,7 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
                      expected {expected_synchronized_timestep:.17e}"
                 )));
             }
-            let result = advance_public_mhd_kdk_adaptive_2d(
+            let mut step = begin_public_mhd_kdk_adaptive_2d(
                 &state,
                 &rates,
                 timestep,
@@ -1930,13 +1923,44 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
                 initialized.parameters.courant_factor,
             )
             .map_err(ApplicationError::MhdEvolution2d)?;
+            if snapshot_number == 0 {
+                let initial_view = step
+                    .drift_state(0.0)
+                    .map_err(ApplicationError::MhdEvolution2d)?;
+                write_briowu_drift_snapshot(
+                    initialized,
+                    &state.masses,
+                    &initial_view,
+                    &rates,
+                    output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                    time,
+                )?;
+                snapshot_number += 1;
+            }
+            let endpoint_view = step
+                .drift_state(timestep)
+                .map_err(ApplicationError::MhdEvolution2d)?;
+            let endpoint_time = time + timestep;
+            let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
+            if (endpoint_time - output_time).abs() <= tolerance {
+                write_briowu_drift_snapshot(
+                    initialized,
+                    &state.masses,
+                    &endpoint_view,
+                    &rates,
+                    output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                    output_time,
+                )?;
+                snapshot_number += 1;
+            }
+            let result = finish_public_mhd_kdk_adaptive_2d(step)
+                .map_err(ApplicationError::MhdEvolution2d)?;
             state = result.state;
             rates = result.rates;
             timeline
                 .advance(synchronized)
                 .map_err(ApplicationError::Hydro)?;
             time = timeline.current_time();
-            let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
             if (time - output_time).abs() <= tolerance {
                 time = output_time;
             }
@@ -1944,14 +1968,6 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
                 ApplicationError::StateMismatch("2-D MHD step count overflow".to_owned())
             })?;
         }
-        write_briowu_snapshot(
-            initialized,
-            &state,
-            &rates,
-            output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
-            output_time,
-        )?;
-        snapshot_number += 1;
     }
     eprintln!(
         "completed {step_count} synchronized 2-D MHD KDK steps to t={time:.17e}; \
@@ -1960,30 +1976,37 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
     Ok(())
 }
 
-fn write_briowu_snapshot(
+fn write_briowu_drift_snapshot(
     initialized: &InitializedBrioWu,
-    state: &MhdMfmState2d,
+    masses: &[f64],
+    drift: &PublicMhdDriftState2d,
     rates: &MhdMfmRates2d,
     path: PathBuf,
     time: f64,
 ) -> Result<(), ApplicationError> {
-    let primitive = state
-        .primitive_columns()
-        .map_err(ApplicationError::MhdEvolution2d)?;
-    let coordinates: Vec<[f64; 3]> = state
+    let coordinates: Vec<[f64; 3]> = drift
         .positions
         .iter()
         .map(|position| [position.x, position.y, 0.0])
         .collect();
-    let velocities: Vec<[f64; 3]> = state
-        .velocities
+    let velocities: Vec<[f64; 3]> = drift
+        .actual_velocities
         .iter()
         .map(|value| [value.x, value.y, value.z])
         .collect();
-    let magnetic_field: Vec<[f64; 3]> = primitive
-        .magnetic
+    let magnetic_field: Vec<[f64; 3]> = drift
+        .predicted_magnetic_volume
         .iter()
+        .zip(&drift.predicted_density)
+        .zip(masses)
+        .map(|((&value, &density), &mass)| value * (density / mass))
         .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let cleaning_phi: Vec<f64> = drift
+        .predicted_cleaning_mass
+        .iter()
+        .zip(masses)
+        .map(|(&value, &mass)| value / mass)
         .collect();
     let gas_count = u64::try_from(initialized.particle_ids.len())
         .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u64".to_owned()))?;
@@ -2002,11 +2025,11 @@ fn write_briowu_snapshot(
             velocities: &velocities,
             magnetic_field: &magnetic_field,
             ids: &initialized.particle_ids,
-            masses: &state.masses,
-            internal_energy: &state.specific_internal_energy,
-            density: &primitive.density,
-            smoothing_length: &state.smoothing_lengths,
-            cleaning_phi: Some(&primitive.cleaning_scalar),
+            masses,
+            internal_energy: &drift.predicted_specific_internal_energy,
+            density: &drift.predicted_density,
+            smoothing_length: &drift.predicted_smoothing_lengths,
+            cleaning_phi: Some(&cleaning_phi),
             cleaning_grad_phi: None,
             divergence_of_magnetic_field: Some(&rates.magnetic_divergence),
         },
