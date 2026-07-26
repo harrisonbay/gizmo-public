@@ -36,8 +36,8 @@
   "timeline": {
     "time_begin": 0.0,
     "time_max": 1.5,
-    "timebase_ticks": 536870912,
-    "shared_step_ticks": 8192,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 17592186044416,
     "shared_step": 2.288818359375e-05,
     "steps": 65536,
     "all_particles_remained_in_timebin": 44

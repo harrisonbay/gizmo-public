@@ -1579,10 +1579,10 @@ pub fn select_public_soundwave_timestep_1d(
     Ok(selection)
 }
 
-pub const LEGACY_TIMEBASE_TICKS: u64 = 1_u64 << 29;
+pub const LEGACY_TIMEBASE_TICKS: u64 = 1_u64 << 60;
 
-/// Integer power-of-two timeline for the default (non-`LONG_INTEGER_TIME`)
-/// synchronized GIZMO integration mode.
+/// Integer power-of-two timeline for GIZMO's default `LONG_INTEGER_TIME`
+/// synchronized integration mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SynchronizedTimeline1d {
     time_begin: f64,
@@ -1729,6 +1729,243 @@ impl SynchronizedTimeline1d {
     }
 }
 
+/// State during the drift portion of a synchronized MFM KDK step.
+///
+/// Legacy snapshots write the conserved half-kicked velocity, but predicted
+/// internal energy, density, and smoothing length. Both velocity phases are
+/// retained explicitly so callers cannot silently serialize the wrong one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MfmDriftState1d {
+    pub positions: Vec<f64>,
+    pub conserved_velocities: Vec<f64>,
+    pub predicted_velocities: Vec<f64>,
+    pub predicted_specific_internal_energy: Vec<f64>,
+    pub predicted_density: Vec<f64>,
+    pub predicted_smoothing_lengths: Vec<f64>,
+}
+
+/// Prepared first kick and drift predictor for one synchronized MFM step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MfmKdkStep1d {
+    start: MfmEvolvingState1d,
+    start_density: Vec<f64>,
+    half_velocity: Vec<f64>,
+    half_internal_energy: Vec<f64>,
+    acceleration: Vec<f64>,
+    specific_internal_energy_rate: Vec<f64>,
+    particle_divergence: Vec<f64>,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+}
+
+impl MfmKdkStep1d {
+    /// Materialize the legacy predictor state at an elapsed drift time.
+    ///
+    /// This is non-mutating, so scheduled output inside a force step can be
+    /// emitted before the endpoint force and second kick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the elapsed time lies outside this step or any
+    /// predicted field becomes invalid.
+    pub fn drift_state(&self, elapsed: f64) -> Result<MfmDriftState1d, HydroError> {
+        if !elapsed.is_finite() || elapsed < 0.0 || elapsed > self.timestep {
+            return Err(HydroError::InvalidRiemannParameter {
+                field: "kdk_drift_elapsed",
+                value: elapsed,
+            });
+        }
+        let particle_count = self.start.positions.len();
+        let mut positions = Vec::with_capacity(particle_count);
+        let mut predicted_velocities = Vec::with_capacity(particle_count);
+        let mut predicted_specific_internal_energy = Vec::with_capacity(particle_count);
+        let mut predicted_density = Vec::with_capacity(particle_count);
+        let mut predicted_smoothing_lengths = Vec::with_capacity(particle_count);
+        for index in 0..particle_count {
+            let position = (self.start.positions[index] + elapsed * self.half_velocity[index])
+                .rem_euclid(self.start.box_size);
+            let predicted_velocity =
+                self.start.velocities[index] + elapsed * self.acceleration[index];
+            let predicted_internal_energy = limited_internal_energy_update(
+                self.start.specific_internal_energy[index],
+                self.specific_internal_energy_rate[index],
+                elapsed,
+                self.minimum_specific_internal_energy,
+            )?;
+            let divergence_increment = (self.particle_divergence[index] * elapsed).clamp(-0.3, 0.3);
+            let density = self.start_density[index] * (-divergence_increment).exp();
+            let smoothing_length = self.start.smoothing_lengths[index] * divergence_increment.exp();
+            if !position.is_finite()
+                || !predicted_velocity.is_finite()
+                || !density.is_finite()
+                || density <= 0.0
+                || !smoothing_length.is_finite()
+                || smoothing_length <= 0.0
+            {
+                return Err(HydroError::NonFiniteRiemannResult {
+                    field: "kdk_drift_predictor",
+                    value: f64::NAN,
+                });
+            }
+            positions.push(position);
+            predicted_velocities.push(predicted_velocity);
+            predicted_specific_internal_energy.push(predicted_internal_energy);
+            predicted_density.push(density);
+            predicted_smoothing_lengths.push(smoothing_length);
+        }
+        Ok(MfmDriftState1d {
+            positions,
+            conserved_velocities: self.half_velocity.clone(),
+            predicted_velocities,
+            predicted_specific_internal_energy,
+            predicted_density,
+            predicted_smoothing_lengths,
+        })
+    }
+
+    #[must_use]
+    pub fn timestep(&self) -> f64 {
+        self.timestep
+    }
+}
+
+/// Apply the first half-kick and prepare a synchronized MFM drift.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, rates, timestep, or energy floor.
+pub fn begin_mfm_kdk_1d(
+    state: &MfmEvolvingState1d,
+    old_rates: &MfmRates1d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+) -> Result<MfmKdkStep1d, HydroError> {
+    let particle_count = state.positions.len();
+    validate_rate_columns(old_rates, particle_count)?;
+    validate_evolving_state(state)?;
+    if !timestep.is_finite() || timestep <= 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "timestep",
+            value: timestep,
+        });
+    }
+    if !minimum_specific_internal_energy.is_finite() || minimum_specific_internal_energy < 0.0 {
+        return Err(HydroError::InvalidRiemannParameter {
+            field: "minimum_specific_internal_energy",
+            value: minimum_specific_internal_energy,
+        });
+    }
+
+    let half_timestep = 0.5 * timestep;
+    let mut half_velocity = Vec::with_capacity(particle_count);
+    let mut half_internal_energy = Vec::with_capacity(particle_count);
+    for index in 0..particle_count {
+        let velocity = state.velocities[index] + half_timestep * old_rates.acceleration[index];
+        let internal_energy = limited_internal_energy_update(
+            state.specific_internal_energy[index],
+            old_rates.specific_internal_energy[index],
+            half_timestep,
+            minimum_specific_internal_energy,
+        )?;
+        if !velocity.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "kdk_first_kick",
+                value: velocity,
+            });
+        }
+        half_velocity.push(velocity);
+        half_internal_energy.push(internal_energy);
+    }
+    let start_density = density_at_hsml_1d(
+        &state.positions,
+        &state.masses,
+        &state.smoothing_lengths,
+        state.box_size,
+    )?
+    .into_iter()
+    .map(|estimate| estimate.density)
+    .collect();
+    Ok(MfmKdkStep1d {
+        start: state.clone(),
+        start_density,
+        half_velocity,
+        half_internal_energy,
+        acceleration: old_rates.acceleration.clone(),
+        specific_internal_energy_rate: old_rates.specific_internal_energy.clone(),
+        particle_divergence: old_rates.particle_divergence.clone(),
+        timestep,
+        minimum_specific_internal_energy,
+    })
+}
+
+/// Finish a prepared MFM step with endpoint density, force, and second kick.
+///
+/// # Errors
+///
+/// Returns an error for smoothing-length failure or invalid endpoint physics.
+/// No caller-owned state is mutated on failure.
+pub fn finish_mfm_kdk_1d(
+    step: MfmKdkStep1d,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+) -> Result<(MfmEvolvingState1d, MfmRates1d), HydroError> {
+    let endpoint = step.drift_state(step.timestep)?;
+    let solved = solve_smoothing_lengths_1d(
+        &endpoint.positions,
+        &step.start.masses,
+        &endpoint.predicted_smoothing_lengths,
+        step.start.box_size,
+        desired_neighbors,
+        neighbor_tolerance,
+    )?;
+    let endpoint_smoothing_lengths: Vec<f64> = solved
+        .iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    let new_rates = mfm_spatial_rates_1d(MfmState1d {
+        positions: &endpoint.positions,
+        masses: &step.start.masses,
+        velocities: &endpoint.predicted_velocities,
+        specific_internal_energy: &endpoint.predicted_specific_internal_energy,
+        smoothing_lengths: &endpoint_smoothing_lengths,
+        box_size: step.start.box_size,
+        gamma: step.start.gamma,
+    })?;
+
+    let half_timestep = 0.5 * step.timestep;
+    let mut endpoint_velocity = Vec::with_capacity(step.start.positions.len());
+    let mut endpoint_internal_energy = Vec::with_capacity(step.start.positions.len());
+    for index in 0..step.start.positions.len() {
+        let velocity = step.half_velocity[index] + half_timestep * new_rates.acceleration[index];
+        let internal_energy = limited_internal_energy_update(
+            step.half_internal_energy[index],
+            new_rates.specific_internal_energy[index],
+            half_timestep,
+            step.minimum_specific_internal_energy,
+        )?;
+        if !velocity.is_finite() {
+            return Err(HydroError::NonFiniteRiemannResult {
+                field: "kdk_second_kick",
+                value: velocity,
+            });
+        }
+        endpoint_velocity.push(velocity);
+        endpoint_internal_energy.push(internal_energy);
+    }
+    Ok((
+        MfmEvolvingState1d {
+            positions: endpoint.positions,
+            masses: step.start.masses,
+            velocities: endpoint_velocity,
+            specific_internal_energy: endpoint_internal_energy,
+            smoothing_lengths: endpoint_smoothing_lengths,
+            box_size: step.start.box_size,
+            gamma: step.start.gamma,
+        },
+        new_rates,
+    ))
+}
+
 /// Advance one synchronized kick-drift-kick step of the default 1-D MFM path.
 ///
 /// Endpoint forces use full-step old-RHS predictions for velocity and internal
@@ -1750,108 +1987,9 @@ pub fn advance_mfm_kdk_1d(
     neighbor_tolerance: f64,
     minimum_specific_internal_energy: f64,
 ) -> Result<MfmRates1d, HydroError> {
-    let particle_count = state.positions.len();
-    validate_rate_columns(old_rates, particle_count)?;
-    if !timestep.is_finite() || timestep <= 0.0 {
-        return Err(HydroError::InvalidRiemannParameter {
-            field: "timestep",
-            value: timestep,
-        });
-    }
-    if !minimum_specific_internal_energy.is_finite() || minimum_specific_internal_energy < 0.0 {
-        return Err(HydroError::InvalidRiemannParameter {
-            field: "minimum_specific_internal_energy",
-            value: minimum_specific_internal_energy,
-        });
-    }
-
-    validate_evolving_state(state)?;
-    let half_timestep = 0.5 * timestep;
-    let mut endpoint_positions = Vec::with_capacity(particle_count);
-    let mut half_velocity = Vec::with_capacity(particle_count);
-    let mut half_internal_energy = Vec::with_capacity(particle_count);
-    let mut predicted_velocity = Vec::with_capacity(particle_count);
-    let mut predicted_internal_energy = Vec::with_capacity(particle_count);
-    for index in 0..particle_count {
-        let velocity_half = state.velocities[index] + half_timestep * old_rates.acceleration[index];
-        let internal_energy_half = limited_internal_energy_update(
-            state.specific_internal_energy[index],
-            old_rates.specific_internal_energy[index],
-            half_timestep,
-            minimum_specific_internal_energy,
-        )?;
-        let position =
-            (state.positions[index] + timestep * velocity_half).rem_euclid(state.box_size);
-        let velocity_predicted = state.velocities[index] + timestep * old_rates.acceleration[index];
-        let internal_energy_predicted = limited_internal_energy_update(
-            state.specific_internal_energy[index],
-            old_rates.specific_internal_energy[index],
-            timestep,
-            minimum_specific_internal_energy,
-        )?;
-        if !velocity_half.is_finite() || !position.is_finite() || !velocity_predicted.is_finite() {
-            return Err(HydroError::NonFiniteRiemannResult {
-                field: "kdk_predictor",
-                value: f64::NAN,
-            });
-        }
-        endpoint_positions.push(position);
-        half_velocity.push(velocity_half);
-        half_internal_energy.push(internal_energy_half);
-        predicted_velocity.push(velocity_predicted);
-        predicted_internal_energy.push(internal_energy_predicted);
-    }
-    let predicted_smoothing_lengths: Vec<f64> = state
-        .smoothing_lengths
-        .iter()
-        .zip(&old_rates.particle_divergence)
-        .map(|(&hsml, &divergence)| hsml * (divergence * timestep).clamp(-0.3, 0.3).exp())
-        .collect();
-    let solved = solve_smoothing_lengths_1d(
-        &endpoint_positions,
-        &state.masses,
-        &predicted_smoothing_lengths,
-        state.box_size,
-        desired_neighbors,
-        neighbor_tolerance,
-    )?;
-    let endpoint_smoothing_lengths: Vec<f64> = solved
-        .iter()
-        .map(|particle| particle.smoothing_length)
-        .collect();
-    let new_rates = mfm_spatial_rates_1d(MfmState1d {
-        positions: &endpoint_positions,
-        masses: &state.masses,
-        velocities: &predicted_velocity,
-        specific_internal_energy: &predicted_internal_energy,
-        smoothing_lengths: &endpoint_smoothing_lengths,
-        box_size: state.box_size,
-        gamma: state.gamma,
-    })?;
-
-    let mut endpoint_velocity = Vec::with_capacity(particle_count);
-    let mut endpoint_internal_energy = Vec::with_capacity(particle_count);
-    for index in 0..particle_count {
-        let velocity = half_velocity[index] + half_timestep * new_rates.acceleration[index];
-        let internal_energy = limited_internal_energy_update(
-            half_internal_energy[index],
-            new_rates.specific_internal_energy[index],
-            half_timestep,
-            minimum_specific_internal_energy,
-        )?;
-        if !velocity.is_finite() {
-            return Err(HydroError::NonFiniteRiemannResult {
-                field: "kdk_velocity",
-                value: velocity,
-            });
-        }
-        endpoint_velocity.push(velocity);
-        endpoint_internal_energy.push(internal_energy);
-    }
-    state.positions = endpoint_positions;
-    state.velocities = endpoint_velocity;
-    state.specific_internal_energy = endpoint_internal_energy;
-    state.smoothing_lengths = endpoint_smoothing_lengths;
+    let step = begin_mfm_kdk_1d(state, old_rates, timestep, minimum_specific_internal_energy)?;
+    let (endpoint, new_rates) = finish_mfm_kdk_1d(step, desired_neighbors, neighbor_tolerance)?;
+    *state = endpoint;
     Ok(new_rates)
 }
 
@@ -3953,8 +4091,26 @@ mod tests {
         let timestep = global_courant_timestep_1d(state.as_view(), &rates, 0.05).unwrap();
         assert_close(timestep, 0.00625);
         let initial_positions = state.positions.clone();
+        let phase = begin_mfm_kdk_1d(&state, &rates, timestep, 0.0).unwrap();
+        let at_start = phase.drift_state(0.0).unwrap();
+        let at_midpoint = phase.drift_state(0.5 * timestep).unwrap();
+        for (index, &initial_position) in initial_positions.iter().enumerate() {
+            assert_close(at_start.positions[index], initial_positions[index]);
+            assert_close(at_start.conserved_velocities[index], 2.0);
+            assert_close(at_start.predicted_velocities[index], 2.0);
+            assert_close(at_start.predicted_specific_internal_energy[index], 0.9);
+            assert_close(at_start.predicted_density[index], 1.0);
+            assert_close(at_start.predicted_smoothing_lengths[index], 0.25);
+            assert_close(
+                at_midpoint.positions[index],
+                (initial_position + timestep).rem_euclid(1.0),
+            );
+        }
+        let (split_state, split_rates) = finish_mfm_kdk_1d(phase, 4.0, 1.0e-12).unwrap();
         let new_rates =
             advance_mfm_kdk_1d(&mut state, &rates, timestep, 4.0, 1.0e-12, 0.0).unwrap();
+        assert_eq!(state, split_state);
+        assert_eq!(new_rates, split_rates);
         for (index, &position) in state.positions.iter().enumerate() {
             assert_close(
                 position,
@@ -4070,22 +4226,23 @@ mod tests {
 
     #[test]
     fn synchronized_timeline_matches_legacy_power_of_two_bins() {
+        let shared_step_ticks = 1_u64 << 44;
         let mut timeline = SynchronizedTimeline1d::new(0.0, 1.5).unwrap();
         let initial = timeline.select_step(3.0e-5, 1.0e-3).unwrap();
-        assert_eq!(initial.ticks, 8192);
+        assert_eq!(initial.ticks, shared_step_ticks);
         assert_close(initial.duration, 2.288_818_359_375e-5);
         timeline.advance(initial).unwrap();
 
         let blocked_increase = timeline.select_step(5.0e-5, 1.0e-3).unwrap();
-        assert_eq!(blocked_increase.ticks, 8192);
+        assert_eq!(blocked_increase.ticks, shared_step_ticks);
         timeline.advance(blocked_increase).unwrap();
         let synchronized_increase = timeline.select_step(5.0e-5, 1.0e-3).unwrap();
-        assert_eq!(synchronized_increase.ticks, 16_384);
+        assert_eq!(synchronized_increase.ticks, shared_step_ticks << 1);
 
         let mut ending = SynchronizedTimeline1d::new(0.0, 1.5).unwrap();
-        ending.current_tick = LEGACY_TIMEBASE_TICKS - 8192;
+        ending.current_tick = LEGACY_TIMEBASE_TICKS - shared_step_ticks;
         let final_step = ending.select_step(1.0e-3, 1.0e-3).unwrap();
-        assert_eq!(final_step.ticks, 8192);
+        assert_eq!(final_step.ticks, shared_step_ticks);
         ending.advance(final_step).unwrap();
         assert!(ending.is_finished());
         assert_close(ending.current_time(), 1.5);

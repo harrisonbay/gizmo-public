@@ -76,13 +76,13 @@ The hydro crate also contains the first synchronized evolution slice: exact
 unordered-pair accumulation into extensive momentum/total-energy rates,
 conversion to acceleration and specific-internal-energy rate, the raw legacy
 Courant estimate, and the noncosmological kick-drift-kick predictor ordering
-with the half-loss energy limiter. The non-`LONG_INTEGER_TIME` synchronized
+with the half-loss energy limiter. The default `LONG_INTEGER_TIME` synchronized
 power-of-two timeline is also ported; it maps the fixture's raw
-`3.6621e-5` Courant bound to the same initial `8192`-tick,
+`3.6621e-5` Courant bound to the same initial `2^44`-tick,
 `2.288818359375e-5` step seen in the C run. This is not yet wired to normal CLI
 execution. Before evolved snapshots can be called C-parity results, the
 remaining acceleration/displacement timestep bounds must be proven inactive
 or ported and the Rust result checked against the named-commit C evolution
 tables in `validation/oracles/soundwave/evolution-manifest.json`. The baseline
-run confirms all particles remain in the same `8192`-tick bin through all
+run confirms all particles remain in the same `2^44`-tick bin through all
 65,536 steps, so global synchronized stepping is valid for this fixture.

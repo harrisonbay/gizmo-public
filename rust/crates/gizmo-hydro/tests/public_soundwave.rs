@@ -232,7 +232,7 @@ fn assert_corrected_c_first_step() {
         gamma: 5.0 / 3.0,
     };
     let old_rates = mfm_spatial_rates_1d(state.as_view()).expect("initial Rust RHS must be valid");
-    let timestep = 8192.0 * 1.5 / 536_870_912.0;
+    let timestep = 1.5 / 65_536.0;
     let rust_half_velocity: Vec<f64> = initial_velocities
         .iter()
         .zip(&old_rates.acceleration)
@@ -567,5 +567,5 @@ fn assert_public_pair_fluxes(
     assert_eq!(rates.entropic_pair_count, rates.pair_count);
     assert!(net_momentum_rate.abs() < 1.0e-12);
     assert!(net_energy_rate.abs() < 1.0e-12);
-    assert_eq!(timeline_step.ticks, 8192);
+    assert_eq!(timeline_step.ticks, 1_u64 << 44);
 }

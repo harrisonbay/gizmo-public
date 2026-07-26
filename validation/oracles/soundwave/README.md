@@ -24,7 +24,7 @@ validation/oracles/run_rust_soundwave_init.sh
 
 `evolution-manifest.json` pins a fresh corrected-C run from commit
 `f408a498ec42990fa6b3cc413ded2223f3d33dc2`. The run used one MPI rank,
-completed all 65,536 shared `8192`-tick steps to `t=1.5`, and kept every gas
+completed all 65,536 shared `2^44`-tick steps to `t=1.5`, and kept every gas
 particle in timebin 44. ID-sorted semantic tables at `t=0`, `0.1`, and `1.5`
 contain position, velocity, density, specific internal energy, smoothing
 length, and mass. Raw snapshots are identified by checksum but omitted.
@@ -43,7 +43,7 @@ and second kick, and `io.c` warns that their velocity is staggered. Therefore
 `post-kick-snapshot.patch`, which writes one additional snapshot immediately
 after the first `do_second_halfstep_kick()`. The patch only observes state and
 is checksum-pinned in the manifest. The ignored Rust integration test compares
-this completed 8192-tick state against the original IC. Position, density,
+this completed `2^44`-tick state against the original IC. Position, density,
 internal energy, both half-kicks, and the predicted smoothing lengths are
 strict gates. GZ-0009 records why predicting `Hsml` from the density-loop
 particle divergence is essential: changes near machine precision can alter
