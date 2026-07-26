@@ -1960,6 +1960,18 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
         step_count = step_count.checked_add(1).ok_or_else(|| {
             ApplicationError::StateMismatch("2-D MHD step count overflow".to_owned())
         })?;
+        if step_count % 64 == 0 || terminal_sync {
+            let active_count = hierarchy
+                .active_mask()
+                .iter()
+                .filter(|&&is_active| is_active)
+                .count();
+            eprintln!(
+                "Brio-Wu hierarchy progress: event={step_count} tick={} time={:.17e} active={active_count}",
+                hierarchy.current_tick(),
+                hierarchy.current_time()
+            );
+        }
         if terminal_sync {
             break;
         }

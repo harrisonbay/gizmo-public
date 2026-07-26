@@ -35,6 +35,7 @@ const LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION: f64 = 0.25;
 const MIN_REAL_NUMBER: f64 = 1.0e-56;
 const EPSILON_ENTROPIC_BIG: f64 = 0.5;
 const EPSILON_ENTROPIC_SMALL: f64 = 1.0e-3;
+const MAX_ACTIVE_TARGET_WORKERS: usize = 64;
 // allvars.h raises CONDITION_NUMBER_DANGER to 1e7 for the non-cooling MHD
 // build used by Brio-Wu.
 const CONDITION_NUMBER_DANGER_SQUARED: f64 = 1.0e14;
@@ -203,6 +204,7 @@ pub struct PublicMhdInitialHierarchy2d {
     face_closure_cache: Vec<FaceClosure2d>,
     minimum_specific_internal_energy: f64,
     awaiting_second_kick: bool,
+    refreshed_cache_tick: Option<u64>,
     pending_wakeup: Vec<bool>,
 }
 
@@ -538,6 +540,22 @@ struct TargetPairRates2d {
     selected_entropic: bool,
     face_area_vector: Vector2,
     face_area: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ActiveTargetPairBatch2d {
+    target: usize,
+    momentum: Vector3,
+    total_energy: f64,
+    magnetic_volume: Vector3,
+    dedner_jump: Vector3,
+    magnetic_divergence_volume: f64,
+    maximum_signal_speed: f64,
+    face_area_vector: Vector2,
+    summed_face_area: f64,
+    directed_pair_count: usize,
+    entropic_pair_count: usize,
+    wakeup_neighbors: Vec<usize>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -959,6 +977,166 @@ fn evaluate_target_pair_2d(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_active_target_pair_batch_2d(
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    gradients: &MhdPrimitiveGradients2d,
+    moments: &[InverseMoment2d],
+    face_closure: &[FaceClosure2d],
+    retained: &MhdMfmRates2d,
+    active: &[bool],
+    target: usize,
+    neighbors: &[(usize, usize)],
+    initial_signal_speed: f64,
+    controls: DivergenceControl2d,
+) -> Result<ActiveTargetPairBatch2d, (usize, MhdEvolution2dError)> {
+    let mut batch = ActiveTargetPairBatch2d {
+        target,
+        momentum: Vector3::ZERO,
+        total_energy: 0.0,
+        magnetic_volume: Vector3::ZERO,
+        dedner_jump: Vector3::ZERO,
+        magnetic_divergence_volume: 0.0,
+        maximum_signal_speed: initial_signal_speed,
+        face_area_vector: Vector2::ZERO,
+        summed_face_area: 0.0,
+        directed_pair_count: 0,
+        entropic_pair_count: 0,
+        wakeup_neighbors: Vec::new(),
+    };
+    for &(neighbor, ordinal) in neighbors {
+        let contribution = evaluate_target_pair_2d(
+            state,
+            primitive,
+            gradients,
+            moments,
+            face_closure,
+            target,
+            neighbor,
+            controls,
+        )
+        .map_err(|error| (ordinal, error))?;
+        batch.directed_pair_count += 1;
+        batch.entropic_pair_count += usize::from(contribution.selected_entropic);
+        batch.momentum = batch.momentum + contribution.momentum;
+        batch.total_energy += contribution.total_energy;
+        batch.magnetic_volume = batch.magnetic_volume + contribution.magnetic_volume;
+        batch.dedner_jump = batch.dedner_jump + contribution.dedner_jump;
+        batch.magnetic_divergence_volume += contribution.magnetic_divergence_volume;
+        batch.face_area_vector += contribution.face_area_vector;
+        batch.summed_face_area += contribution.face_area;
+        batch.maximum_signal_speed = batch.maximum_signal_speed.max(contribution.signal_speed);
+        if !active[neighbor]
+            && contribution.signal_speed > 4.1 * retained.maximum_signal_speed[neighbor]
+        {
+            batch.wakeup_neighbors.push(neighbor);
+        }
+    }
+    Ok(batch)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_active_target_pair_batches_2d(
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    gradients: &MhdPrimitiveGradients2d,
+    moments: &[InverseMoment2d],
+    face_closure: &[FaceClosure2d],
+    retained: &MhdMfmRates2d,
+    active: &[bool],
+    controls: DivergenceControl2d,
+    pairs: &[InteractionPair2d],
+    requested_workers: usize,
+) -> Result<Vec<ActiveTargetPairBatch2d>, MhdEvolution2dError> {
+    let mut neighbors = vec![Vec::new(); state.positions.len()];
+    let mut directed_ordinal = 0_usize;
+    for pair in pairs {
+        for (target, neighbor) in [(pair.i, pair.j), (pair.j, pair.i)] {
+            if active[target] {
+                neighbors[target].push((neighbor, directed_ordinal));
+                directed_ordinal += 1;
+            }
+        }
+    }
+    let active_targets: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_active)| is_active.then_some(index))
+        .collect();
+    if active_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = requested_workers.max(1).min(active_targets.len());
+    let chunk_size = active_targets.len().div_ceil(worker_count);
+    let chunks = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        let neighbor_lists = &neighbors;
+        for targets in active_targets.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                targets
+                    .iter()
+                    .map(|&target| {
+                        evaluate_active_target_pair_batch_2d(
+                            state,
+                            primitive,
+                            gradients,
+                            moments,
+                            face_closure,
+                            retained,
+                            active,
+                            target,
+                            &neighbor_lists[target],
+                            fast_magnetosonic_speed(
+                                primitive_at(state, primitive, target),
+                                state.gamma,
+                            )
+                            .map_err(|error| (usize::MAX, MhdEvolution2dError::from(error)))?,
+                            controls,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        handles
+            .into_iter()
+            .map(std::thread::ScopedJoinHandle::join)
+            .collect::<Vec<_>>()
+    });
+    let mut batches = Vec::with_capacity(active_targets.len());
+    let mut earliest_failure: Option<(usize, MhdEvolution2dError)> = None;
+    for chunk in chunks {
+        let chunk =
+            chunk.map_err(|_| invalid(None, "active_target_force_worker_panicked", f64::NAN))?;
+        for batch in chunk {
+            match batch {
+                Ok(batch) => batches.push(batch),
+                Err((ordinal, error)) => {
+                    if earliest_failure
+                        .as_ref()
+                        .is_none_or(|(earliest, _)| ordinal < *earliest)
+                    {
+                        earliest_failure = Some((ordinal, error));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, error)) = earliest_failure {
+        return Err(error);
+    }
+    Ok(batches)
+}
+
+fn active_target_worker_count() -> usize {
+    std::env::var("GIZMO_ACTIVE_TARGET_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&workers| workers > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+        .min(MAX_ACTIVE_TARGET_WORKERS)
+}
+
 /// Evaluate public-MFM rates as ordered active targets while retaining every
 /// inactive target field.
 ///
@@ -1067,38 +1245,33 @@ pub fn mhd_mfm_active_target_rates_with_cache_2d(
     let mut directed_pair_count = 0_usize;
     let mut entropic_pair_count = 0_usize;
     let mut wakeup = vec![false; count];
-    for pair in &pairs {
-        for (target, neighbor) in [(pair.i, pair.j), (pair.j, pair.i)] {
-            if !active[target] {
-                continue;
-            }
-            let contribution = evaluate_target_pair_2d(
-                state,
-                primitive,
-                gradients,
-                moments,
-                face_closure,
-                target,
-                neighbor,
-                controls,
-            )?;
-            directed_pair_count += 1;
-            entropic_pair_count += usize::from(contribution.selected_entropic);
-            updated.momentum[target] = updated.momentum[target] + contribution.momentum;
-            updated.total_energy[target] += contribution.total_energy;
-            updated.magnetic_volume[target] =
-                updated.magnetic_volume[target] + contribution.magnetic_volume;
-            dedner_jump[target] = dedner_jump[target] + contribution.dedner_jump;
-            magnetic_divergence_volume[target] += contribution.magnetic_divergence_volume;
-            current_face_closure[target].net_area_vector += contribution.face_area_vector;
-            current_face_closure[target].summed_face_area += contribution.face_area;
-            updated.maximum_signal_speed[target] =
-                updated.maximum_signal_speed[target].max(contribution.signal_speed);
-            if !active[neighbor]
-                && contribution.signal_speed > 4.1 * retained.maximum_signal_speed[neighbor]
-            {
-                wakeup[neighbor] = true;
-            }
+    let workers = active_target_worker_count();
+    let batches = evaluate_active_target_pair_batches_2d(
+        state,
+        primitive,
+        gradients,
+        moments,
+        face_closure,
+        retained,
+        active,
+        controls,
+        &pairs,
+        workers,
+    )?;
+    for batch in batches {
+        let target = batch.target;
+        directed_pair_count += batch.directed_pair_count;
+        entropic_pair_count += batch.entropic_pair_count;
+        updated.momentum[target] = batch.momentum;
+        updated.total_energy[target] = batch.total_energy;
+        updated.magnetic_volume[target] = batch.magnetic_volume;
+        dedner_jump[target] = batch.dedner_jump;
+        magnetic_divergence_volume[target] = batch.magnetic_divergence_volume;
+        current_face_closure[target].net_area_vector = batch.face_area_vector;
+        current_face_closure[target].summed_face_area = batch.summed_face_area;
+        updated.maximum_signal_speed[target] = batch.maximum_signal_speed;
+        for neighbor in batch.wakeup_neighbors {
+            wakeup[neighbor] = true;
         }
     }
 
@@ -2120,6 +2293,7 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
         face_closure_cache,
         minimum_specific_internal_energy,
         awaiting_second_kick: false,
+        refreshed_cache_tick: None,
         pending_wakeup: vec![false; count],
     })
 }
@@ -2173,6 +2347,7 @@ impl PublicMhdInitialHierarchy2d {
             }
         }
         self.awaiting_second_kick = true;
+        self.refreshed_cache_tick = None;
         Ok(PublicMhdHierarchySync2d {
             tick: self.timeline.current_tick(),
             time: self.timeline.current_time(),
@@ -2323,11 +2498,13 @@ impl PublicMhdInitialHierarchy2d {
                 self.timeline.current_time(),
             ));
         }
+        self.refreshed_cache_tick = None;
         let active = self.timeline.active_mask();
         let count = self.start.positions.len();
         for _ in 0..=count {
             self.drift_required_active_neighbors_to_current(&active)?;
             let mut state = self.projected_search_state_at_current()?;
+            let search_supports = state.smoothing_lengths.clone();
             refresh_mhd_active_target_caches_2d(
                 &mut state,
                 &mut self.primitive_cache,
@@ -2345,7 +2522,11 @@ impl PublicMhdInitialHierarchy2d {
                     self.drift.predicted_smoothing_lengths[i] = state.smoothing_lengths[i];
                 }
             }
-            if !self.has_stale_required_active_neighbor(&active)? {
+            let support_expanded = active.iter().enumerate().any(|(i, &is_active)| {
+                is_active && state.smoothing_lengths[i] > search_supports[i]
+            });
+            if !support_expanded || !self.has_stale_required_active_neighbor(&active)? {
+                self.refreshed_cache_tick = Some(self.timeline.current_tick());
                 return Ok(());
             }
         }
@@ -2376,10 +2557,10 @@ impl PublicMhdInitialHierarchy2d {
             ));
         }
         let active = self.timeline.active_mask();
-        if self.has_stale_required_active_neighbor(&active)? {
+        if self.refreshed_cache_tick != Some(self.timeline.current_tick()) {
             return Err(invalid(
                 None,
-                "hierarchy_stale_force_neighbor",
+                "hierarchy_unrefreshed_active_cache",
                 self.timeline.current_time(),
             ));
         }
@@ -2552,6 +2733,7 @@ impl PublicMhdInitialHierarchy2d {
         self.old_rates = endpoint.rates.clone();
         self.pending_wakeup.clone_from(&endpoint.wakeup);
         self.awaiting_second_kick = false;
+        self.refreshed_cache_tick = None;
         Ok(PublicMhdHierarchyKickResult2d {
             state,
             rates: endpoint.rates,
@@ -2669,6 +2851,7 @@ impl PublicMhdInitialHierarchy2d {
             }
         }
         self.awaiting_second_kick = true;
+        self.refreshed_cache_tick = None;
         Ok(PublicMhdHierarchySync2d {
             tick: self.timeline.current_tick(),
             time: self.timeline.current_time(),
@@ -4976,6 +5159,19 @@ mod tests {
         hierarchy
             .refresh_arriving_active_caches(20.0, 0.05)
             .unwrap();
+        assert!(
+            hierarchy
+                .refresh_arriving_active_caches(20.0, 20.0)
+                .is_err()
+        );
+        assert!(
+            hierarchy
+                .evaluate_arriving_active_rates(controls, 0.2)
+                .is_err()
+        );
+        hierarchy
+            .refresh_arriving_active_caches(20.0, 0.05)
+            .unwrap();
         let endpoint = hierarchy
             .evaluate_arriving_active_rates(controls, 0.2)
             .unwrap();
@@ -5347,6 +5543,40 @@ mod tests {
         };
         let full = mhd_mfm_spatial_rates_with_context_2d(&state, controls, context).unwrap();
         let all_active = vec![true; state.positions.len()];
+        let active_pairs = interacting_pairs_for_targets_2d(
+            &state.positions,
+            &state.smoothing_lengths,
+            state.domain,
+            &all_active,
+        )
+        .unwrap();
+        let serial_batches = evaluate_active_target_pair_batches_2d(
+            &state,
+            &primitive,
+            &gradients,
+            &moments,
+            &closure,
+            &full,
+            &all_active,
+            controls,
+            &active_pairs,
+            1,
+        )
+        .unwrap();
+        let parallel_batches = evaluate_active_target_pair_batches_2d(
+            &state,
+            &primitive,
+            &gradients,
+            &moments,
+            &closure,
+            &full,
+            &all_active,
+            controls,
+            &active_pairs,
+            4,
+        )
+        .unwrap();
+        assert_eq!(parallel_batches, serial_batches);
         let timesteps = vec![timestep; state.positions.len()];
         let ordered = mhd_mfm_active_target_rates_with_cache_2d(
             &state,

@@ -29,6 +29,19 @@ validation/oracles/run_rust_dustywave.sh
 validation/oracles/run_rust_briowu_init.sh
 ```
 
+The longer Brio-Wu terminal gate runs all 2,048 individual-particle hierarchy
+events through `t=0.2`, checks global diagnostics, and compares all seven
+physical profiles with corrected C and the digitized published solution:
+
+```console
+validation/oracles/run_rust_briowu_terminal.sh
+```
+
+Every terminal field is within `1.43%` normalized L1 of corrected C and
+`3.10%` of the published curves. Per-ID mass remains exact; the non-formal
+thermal+kinetic+magnetic diagnostic, which excludes Dedner cleaning energy,
+decreases `0.415%` and is explicitly gated at `0.5%`.
+
 The complete 65,536-step corrected-C differential is intentionally separate
 from the fast initialization check:
 

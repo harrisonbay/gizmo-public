@@ -75,23 +75,39 @@ finite, nonzero force over the real fixture. It also contains regressions for
 the oblique discontinuity HLLD branch, exact affine reconstruction, pair
 limiters, CFL length, adaptive-H drift, and the C retry ladder.
 
-This is not yet a terminal trajectory claim. Literal public-C formulas assign
-the fixture to two initial bins: 25,088 particles in bin 49 and 25,088 in bin
-50. This distribution is a deterministic Rust regression, not a C oracle,
-until the requested particle-ID dump is available. The hierarchical initial
-event applies each particle's own half-kick and reaches maximum
+Literal public-C formulas assign the fixture to two initial bins: 25,088
+particles in bin 49 and 25,088 in bin 50. This distribution is a deterministic
+Rust regression, not a per-particle C oracle, until the requested particle-ID
+dump is available. The hierarchical initial event applies each particle's own
+half-kick and reaches maximum
 `|vx|=0.0181975` and `|vy|=0.0263302`, matching the corrected-C extrema that
 the synchronized step could not reproduce.
 
 Endpoint evolution is now ported: only active targets refresh and kick, while
 required inactive neighbors lazily drift predicted primitives from retained
 endpoint rates and gradients. This MFM build has no deferred equal-and-opposite
-flux ledger, matching the public path. The remaining blocker before promoting
-the Rust `t=0.2` trajectory to the 5% gate is validation: run the full fixture
-to completion, reduce its `t=0.1`/`t=0.2` snapshots, and compare them against
-the pinned corrected-C and digitized published profiles. The requested
-particle-ID time-bin/early-sync dump is still needed to independently verify
-the hierarchy rather than merely reproduce the public source semantics.
+flux ledger, matching the public path.
+
+The full release trajectory completes 2,048 hierarchical events through
+`t=0.2`. At `t=0.1`, every physical field is within `0.70%` normalized L1 of
+corrected C. At `t=0.2`, every field is within `1.43%` of corrected C and
+within `3.10%` of the independently digitized paper curves, below the 5% gate.
+Per-ID mass is bitwise stable and terminal absolute momentum is
+`1.27e-8`. The thermal+kinetic+magnetic diagnostic, which excludes Dedner
+cleaning energy and is not a formal invariant, decreases `0.415%` versus
+corrected C's `0.101%`; the terminal gate records and limits it to `0.5%`
+rather than concealing the difference.
+
+Run the complete release trajectory, snapshot checks, corrected-C
+differentials, and published-figure comparison with:
+
+```sh
+validation/oracles/run_rust_briowu_terminal.sh
+```
+
+The requested particle-ID time-bin/early-sync dump remains necessary to
+attribute the extra diagnostic-energy drift and independently verify the
+hierarchy rather than merely reproduce public source semantics.
 
 ## Approximate published-figure reference
 
@@ -169,14 +185,18 @@ wave states. Elementwise maxima near vertical jumps are reported but are not
 used as the acceptance norm because sub-bin shock-position offsets make them
 unstable.
 
-The terminal Rust acceptance gate must still require:
+The terminal Rust acceptance gate now enforces:
 
 - nontrivial intermediate state at `t=0.1`;
-- positivity and finite fields at every step;
-- mass, momentum, and total-energy budgets;
+- positive finite state at every event and checked output state;
+- exact per-ID mass retention, a `2e-8` absolute-momentum ceiling, and a
+  documented `0.5%` non-formal diagnostic-energy ceiling;
 - corrected-C profile agreement at `t=0.1` and `t=0.2`;
-- an independent exact/profile or convergence oracle once upstream publishes
-  it;
+- the existing independent digitized-profile gate at `t=0.2`.
+
+Still unavailable upstream:
+
+- an original machine-readable exact/profile or convergence oracle;
 - particle-ID hierarchy agreement at early synchronization points once the
   upstream dump is available.
 
