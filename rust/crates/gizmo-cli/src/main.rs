@@ -17,7 +17,10 @@ use gizmo_hydro::hydro_evolution_2d::{
     public_hydro_particle_timestep_bounds_from_primitive_2d,
     quantize_public_hydro_initial_timebins_2d,
 };
-use gizmo_hydro::meshless_2d::{Box2d, Vector2, solve_public_c_smoothing_lengths_from_seeds_2d};
+use gizmo_hydro::meshless_2d::{
+    Box2d, KernelFunction2d, Vector2, solve_public_c_initial_smoothing_lengths_with_kernel_2d,
+    solve_public_c_smoothing_lengths_from_seeds_2d,
+};
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution::{
     DivergenceControl1d, MhdMfmRates1d, MhdMfmState1d, advance_mhd_kdk_1d,
@@ -103,6 +106,7 @@ enum StrictProfile {
     MhdWave,
     BrioWu,
     Gresho,
+    KhMcnally,
     EqualMassShocktube,
     InteractingBlast,
     Dustywave,
@@ -111,8 +115,8 @@ enum StrictProfile {
 impl StrictProfile {
     const fn gamma(self) -> f64 {
         match self {
-            Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
             Self::BrioWu => 2.0,
+            Self::KhMcnally | Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
             Self::Gresho | Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
@@ -123,6 +127,7 @@ impl StrictProfile {
             Self::MhdWave => "MHD wave",
             Self::BrioWu => "Brio-Wu",
             Self::Gresho => "Gresho vortex",
+            Self::KhMcnally => "McNally Kelvin-Helmholtz",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
             Self::Dustywave => "dusty wave",
@@ -135,6 +140,7 @@ impl StrictProfile {
             | Self::MhdWave
             | Self::BrioWu
             | Self::Gresho
+            | Self::KhMcnally
             | Self::EqualMassShocktube
             | Self::Dustywave => BoundaryMode1d::Periodic,
             Self::InteractingBlast => BoundaryMode1d::Reflective,
@@ -266,7 +272,7 @@ fn validate_planar_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "BOX_PERIODIC",
         "SELFGRAVITY_OFF",
     ];
-    const ALLOWED: [&str; 11] = [
+    const ALLOWED: [&str; 12] = [
         "HYDRO_MESHLESS_FINITE_MASS",
         "BOX_PERIODIC",
         "BOX_LONG_X",
@@ -275,6 +281,7 @@ fn validate_planar_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "BOX_SPATIAL_DIMENSION",
         "EOS_GAMMA",
         "MAGNETIC",
+        "KERNEL_FUNCTION",
         "SELFGRAVITY_OFF",
         "OUTPUT_IN_DOUBLEPRECISION",
         "DEVELOPER_MODE",
@@ -312,6 +319,9 @@ fn validate_planar_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         .and_then(|option| option.value.as_deref());
     let developer_mode = manifest.get("DEVELOPER_MODE").is_some();
     let output_double = manifest.get("OUTPUT_IN_DOUBLEPRECISION").is_some();
+    let kernel_function = manifest
+        .get("KERNEL_FUNCTION")
+        .and_then(|option| option.value.as_deref());
     match (
         gamma,
         magnetic,
@@ -320,17 +330,22 @@ fn validate_planar_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         box_long_z,
         developer_mode,
         output_double,
+        kernel_function,
     ) {
-        (Some("(2.0)"), true, Some("16"), Some("1"), Some("1"), _, _) => {
+        (Some("(2.0)"), true, Some("16"), Some("1"), Some("1"), _, _, None) => {
             require_config_flag(manifest, "MAGNETIC")?;
             Ok(StrictProfile::BrioWu)
         }
-        (Some("(1.4)"), false, None, None, None, false, false) => Ok(StrictProfile::Gresho),
+        (Some("(1.4)"), false, None, None, None, false, false, None) => Ok(StrictProfile::Gresho),
+        (Some("(5.0/3.0)"), false, None, None, None, false, false, Some("5")) => {
+            Ok(StrictProfile::KhMcnally)
+        }
         _ => Err(ApplicationError::UnsupportedConfig(format!(
             "configuration does not exactly match a ported two-dimensional profile: \
              EOS_GAMMA={gamma:?}, MAGNETIC={magnetic}, BOX_LONG_X={box_long_x:?}, \
              BOX_LONG_Y={box_long_y:?}, BOX_LONG_Z={box_long_z:?}, \
-             DEVELOPER_MODE={developer_mode}, OUTPUT_IN_DOUBLEPRECISION={output_double}"
+             DEVELOPER_MODE={developer_mode}, OUTPUT_IN_DOUBLEPRECISION={output_double}, \
+             KERNEL_FUNCTION={kernel_function:?}"
         ))),
     }
 }
@@ -376,7 +391,11 @@ fn initialize_profile(
         return initialize_briowu(&fixture_path, parameters).map(InitializedProfile::BrioWu);
     }
     if profile == StrictProfile::Gresho {
-        return initialize_gresho(&fixture_path, parameters).map(InitializedProfile::Gresho);
+        return initialize_gresho(&fixture_path, parameters).map(InitializedProfile::PlanarHydro);
+    }
+    if profile == StrictProfile::KhMcnally {
+        return initialize_kh_mcnally(&fixture_path, parameters)
+            .map(InitializedProfile::PlanarHydro);
     }
     if profile == StrictProfile::MhdWave {
         return initialize_mhd_wave(&fixture_path, parameters).map(InitializedProfile::Mhd);
@@ -484,7 +503,7 @@ fn initialize_profile(
 fn initialize_gresho(
     fixture_path: &Path,
     parameters: SoundwaveParameters,
-) -> Result<InitializedGresho, ApplicationError> {
+) -> Result<InitializedPlanarHydro, ApplicationError> {
     let snapshot = read_soundwave(fixture_path).map_err(ApplicationError::Input)?;
     if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
         return Err(ApplicationError::StateMismatch(format!(
@@ -508,7 +527,7 @@ fn initialize_gresho(
         .density
         .as_deref()
         .ok_or(ApplicationError::MissingDataset("Density"))?;
-    let initial_smoothing_lengths = snapshot
+    snapshot
         .gas
         .smoothing_length
         .as_deref()
@@ -536,23 +555,20 @@ fn initialize_gresho(
         .iter()
         .map(|value| Vector2::new(value[0], value[1]))
         .collect();
-    let mut smoothing_lengths = initial_smoothing_lengths.to_vec();
-    // Restart flag zero follows the public initialization's repeated density
-    // schedule rather than accepting restart-derived H and density verbatim.
-    for _ in 0..3 {
-        smoothing_lengths = solve_public_c_smoothing_lengths_from_seeds_2d(
-            &positions,
-            &snapshot.gas.masses,
-            &smoothing_lengths,
-            domain,
-            parameters.desired_num_neighbors,
-            parameters.max_neighbor_deviation,
-        )
-        .map_err(ApplicationError::Geometry2d)?
-        .into_iter()
-        .map(|particle| particle.smoothing_length)
-        .collect();
-    }
+    // Restart flag zero ignores stored H unless INPUT_READ_HSML is compiled.
+    // Reproduce the public gravity-tree seed and all three density passes.
+    let smoothing_lengths = solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+        &positions,
+        &snapshot.gas.masses,
+        domain,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+        KernelFunction2d::Cubic,
+    )
+    .map_err(ApplicationError::Geometry2d)?
+    .into_iter()
+    .map(|particle| particle.smoothing_length)
+    .collect();
     let velocities = snapshot
         .gas
         .velocities
@@ -569,11 +585,174 @@ fn initialize_gresho(
         StrictProfile::Gresho.gamma(),
     )
     .map_err(ApplicationError::HydroEvolution2d)?;
-    Ok(InitializedGresho {
+    Ok(InitializedPlanarHydro {
+        profile: StrictProfile::Gresho,
         parameters,
         particle_ids: snapshot.gas.ids,
         state,
+        fixture_density_range: None,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn initialize_kh_mcnally(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+) -> Result<InitializedPlanarHydro, ApplicationError> {
+    let snapshot = read_soundwave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    if snapshot.header.double_precision {
+        return Err(ApplicationError::StateMismatch(
+            "the pinned public McNally KH initial condition must use float32 HDF5 fields"
+                .to_owned(),
+        ));
+    }
+    let count = snapshot.gas.len();
+    if count != 66_868 {
+        return Err(ApplicationError::StateMismatch(format!(
+            "McNally KH fixture has {count} particles, expected 66868"
+        )));
+    }
+    let density = snapshot
+        .gas
+        .density
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("Density"))?;
+    snapshot
+        .gas
+        .smoothing_length
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("SmoothingLength"))?;
+    let fixture_density_range = density.iter().copied().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+    );
+    let (mass_total, mass_minimum, mass_maximum, id_weighted_mass) =
+        snapshot.gas.masses.iter().enumerate().fold(
+            (0.0_f64, f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
+            |(total, minimum, maximum, weighted), (index, &mass)| {
+                (
+                    total + mass,
+                    minimum.min(mass),
+                    maximum.max(mass),
+                    weighted
+                        + mass
+                            * f64::from(
+                                u32::try_from(index + 1)
+                                    .expect("McNally fixture particle count fits u32"),
+                            ),
+                )
+            },
+        );
+    if (mass_total - 1.500_475_515_686_048_3).abs() > 1.0e-12
+        || (mass_minimum - 2.141_293_953_172_862_5e-5).abs() > f64::EPSILON
+        || (mass_maximum - 2.384_453_182_457_946_2e-5).abs() > f64::EPSILON
+        || (id_weighted_mass - 50_269.277_904_424_99).abs() > 1.0e-8
+    {
+        return Err(ApplicationError::StateMismatch(format!(
+            "McNally KH fixture masses do not match the pinned per-ID distribution: \
+             total={mass_total:.17e}, range=[{mass_minimum:.17e},{mass_maximum:.17e}], \
+             id_weighted={id_weighted_mass:.17e}"
+        )));
+    }
+    for (i, &particle_density) in density.iter().enumerate() {
+        validate_kh_mcnally_particle(
+            snapshot.gas.ids[i],
+            snapshot.gas.coordinates[i],
+            snapshot.gas.velocities[i],
+            particle_density,
+            snapshot.gas.internal_energy[i],
+        )?;
+    }
+    let domain = Box2d::new(1.0, 1.0).map_err(ApplicationError::Geometry2d)?;
+    let positions: Vec<_> = snapshot
+        .gas
+        .coordinates
+        .iter()
+        .map(|value| Vector2::new(value[0], value[1]))
+        .collect();
+    // Restart flag zero ignores stored H unless INPUT_READ_HSML is compiled.
+    // Reproduce the public gravity-tree seed and all three quintic passes.
+    let smoothing_lengths = solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+        &positions,
+        &snapshot.gas.masses,
+        domain,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+        KernelFunction2d::Quintic,
+    )
+    .map_err(ApplicationError::Geometry2d)?
+    .into_iter()
+    .map(|particle| particle.smoothing_length)
+    .collect();
+    let state = HydroMfmState2d::from_primitive_with_kernel(
+        positions,
+        snapshot.gas.masses,
+        snapshot
+            .gas
+            .velocities
+            .iter()
+            .map(|value| Vector3::new(value[0], value[1], value[2]))
+            .collect(),
+        snapshot.gas.internal_energy,
+        smoothing_lengths,
+        domain,
+        StrictProfile::KhMcnally.gamma(),
+        KernelFunction2d::Quintic,
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    Ok(InitializedPlanarHydro {
+        profile: StrictProfile::KhMcnally,
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        state,
+        fixture_density_range: Some(fixture_density_range),
+    })
+}
+
+fn validate_kh_mcnally_particle(
+    particle_id: u64,
+    [x, y, z]: [f64; 3],
+    [velocity_x, velocity_y, velocity_z]: [f64; 3],
+    density: f64,
+    internal_energy: f64,
+) -> Result<(), ApplicationError> {
+    if z.to_bits() != 0.0_f64.to_bits() || velocity_z.to_bits() != 0.0_f64.to_bits() {
+        return Err(ApplicationError::StateMismatch(
+            "McNally KH fixture must be exactly two-dimensional".to_owned(),
+        ));
+    }
+    let smooth_layer = |outer: f64, inner: f64| {
+        let midpoint = 0.5 * (outer - inner);
+        if y < 0.25 {
+            outer - midpoint * ((y - 0.25) / 0.025).exp()
+        } else if y < 0.5 {
+            inner + midpoint * ((0.25 - y) / 0.025).exp()
+        } else if y < 0.75 {
+            inner + midpoint * ((y - 0.75) / 0.025).exp()
+        } else {
+            outer - midpoint * ((0.75 - y) / 0.025).exp()
+        }
+    };
+    let expected_density = smooth_layer(2.0, 1.0);
+    let expected_velocity_x = smooth_layer(-0.5, 0.5);
+    let expected_velocity_y = 0.01 * (4.0 * std::f64::consts::PI * x).sin();
+    let pressure = (StrictProfile::KhMcnally.gamma() - 1.0) * density * internal_energy;
+    if (density - expected_density).abs() > 1.0e-7
+        || (velocity_x - expected_velocity_x).abs() > 1.0e-7
+        || (velocity_y - expected_velocity_y).abs() > 3.0e-9
+        || (pressure - 2.5).abs() > 2.0e-5
+    {
+        return Err(ApplicationError::StateMismatch(format!(
+            "McNally KH particle {particle_id} does not match the public smooth shear layer"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_gresho_particle(
@@ -932,6 +1111,9 @@ fn read_profile_parameters(
     if profile == StrictProfile::Gresho {
         return read_gresho_parameters(&input);
     }
+    if profile == StrictProfile::KhMcnally {
+        return read_kh_mcnally_parameters(&input);
+    }
     if profile == StrictProfile::MhdWave {
         return read_mhd_wave_parameters(&input);
     }
@@ -1091,6 +1273,123 @@ fn read_profile_parameters(
                 parameters.init_cond_file
             )));
         }
+    }
+    Ok(parameters)
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_kh_mcnally_parameters(input: &str) -> Result<SoundwaveParameters, ApplicationError> {
+    const REQUIRED_TAGS: [&str; 14] = [
+        "InitCondFile",
+        "OutputDir",
+        "TimeMax",
+        "BoxSize",
+        "TimeBetSnapshot",
+        "MaxSizeTimestep",
+        "DesNumNgb",
+        "BiniX",
+        "BiniY",
+        "BiniZ",
+        "ConductionCoeff",
+        "ShearViscosityCoeff",
+        "BulkViscosityCoeff",
+        "CourantFac",
+    ];
+    // The strict hydro build has no MAGNETIC/MHD_B_SET_IN_PARAMS,
+    // CONDUCTION, VISCOSITY, or DEVELOPER_MODE flags. Public C therefore
+    // parses none of these hosted prompts into active runtime controls.
+    const INERT_CONTROLS: [(&str, &str); 7] = [
+        ("BiniX", "0.07"),
+        ("BiniY", "1.0e0"),
+        ("BiniZ", "1.0e0"),
+        ("ConductionCoeff", "0.0002"),
+        ("ShearViscosityCoeff", "0.0002"),
+        ("BulkViscosityCoeff", "0.0"),
+        ("CourantFac", "0.1"),
+    ];
+    let mut retained = Vec::new();
+    let mut actual_tags = BTreeSet::new();
+    let mut inert_tags = BTreeSet::new();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let definition = raw_line
+            .split_once('%')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if definition.is_empty() {
+            retained.push(raw_line);
+            continue;
+        }
+        let mut tokens = definition.split_whitespace();
+        let tag = tokens.next().unwrap_or_default();
+        if !actual_tags.insert(tag) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "line {}: duplicate McNally KH parameter `{tag}`",
+                line_index + 1
+            )));
+        }
+        if let Some((_, expected)) = INERT_CONTROLS
+            .iter()
+            .find(|(candidate, _)| *candidate == tag)
+        {
+            if tokens.next() != Some(*expected) || tokens.next().is_some() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: inert `{tag}` must equal `{expected}` in the public McNally KH profile",
+                    line_index + 1
+                )));
+            }
+            inert_tags.insert(tag);
+        } else {
+            retained.push(raw_line);
+        }
+    }
+    let expected_tags: BTreeSet<_> = REQUIRED_TAGS.into_iter().collect();
+    if actual_tags != expected_tags || inert_tags.len() != INERT_CONTROLS.len() {
+        let missing: Vec<_> = expected_tags.difference(&actual_tags).copied().collect();
+        let unexpected: Vec<_> = actual_tags.difference(&expected_tags).copied().collect();
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "McNally KH requires the exact public parameter vocabulary; \
+             missing={missing:?}, unexpected={unexpected:?}"
+        )));
+    }
+    let parameters = SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    let required_scalars: [(&str, f64, f64); 4] = [
+        ("BoxSize", parameters.box_size, 1.0),
+        ("TimeBetSnapshot", parameters.time_between_snapshots, 0.1),
+        ("MaxSizeTimestep", parameters.max_timestep, 0.02),
+        ("DesNumNgb", parameters.desired_num_neighbors, 40.0),
+    ];
+    for (field, actual, expected) in required_scalars {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "McNally KH requires `{field} {expected}`, found `{actual}`"
+            )));
+        }
+    }
+    if parameters.time_max.to_bits() != 10.0_f64.to_bits()
+        && parameters.time_max.to_bits() != 1.5_f64.to_bits()
+    {
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "McNally KH requires public `TimeMax 10` or pinned reference-interval \
+             `TimeMax 1.5`, found `{}`",
+            parameters.time_max
+        )));
+    }
+    if parameters.init_cond_file != "kh_mcnally_2d_ics"
+        || parameters.output_dir != "output"
+        || parameters.min_timestep.is_some()
+        || parameters.divb_cleaning_parabolic_sigma.is_some()
+        || parameters.divb_cleaning_hyperbolic_sigma.is_some()
+        || parameters.grain_internal_density.is_some()
+        || parameters.grain_size_min.is_some()
+        || parameters.grain_size_max.is_some()
+        || parameters.grain_size_spectrum_powerlaw.is_some()
+        || parameters.type3_softening.is_some()
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "McNally KH strings or optional runtime fields differ from the public profile"
+                .to_owned(),
+        ));
     }
     Ok(parameters)
 }
@@ -1558,10 +1857,12 @@ struct InitializedMhdWave {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct InitializedGresho {
+struct InitializedPlanarHydro {
+    profile: StrictProfile,
     parameters: SoundwaveParameters,
     particle_ids: Vec<u64>,
     state: HydroMfmState2d,
+    fixture_density_range: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1585,7 +1886,7 @@ struct InitializedBrioWu {
 enum InitializedProfile {
     Hydro(InitializedSoundwave),
     Mhd(InitializedMhdWave),
-    Gresho(InitializedGresho),
+    PlanarHydro(InitializedPlanarHydro),
     BrioWu(InitializedBrioWu),
 }
 
@@ -1594,7 +1895,7 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.validate_owned_state(),
             Self::Mhd(initialized) => initialized.validate_owned_state(),
-            Self::Gresho(initialized) => initialized.validate_owned_state(),
+            Self::PlanarHydro(initialized) => initialized.validate_owned_state(),
             Self::BrioWu(initialized) => initialized.validate_owned_state(),
         }
     }
@@ -1603,39 +1904,57 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.print_initialization(config_sha256),
             Self::Mhd(initialized) => initialized.print_initialization(config_sha256),
-            Self::Gresho(initialized) => initialized.print_initialization(config_sha256),
+            Self::PlanarHydro(initialized) => initialized.print_initialization(config_sha256),
             Self::BrioWu(initialized) => initialized.print_initialization(config_sha256),
         }
     }
 }
 
-impl InitializedGresho {
+impl InitializedPlanarHydro {
     fn validate_owned_state(&self) -> Result<(), ApplicationError> {
         if self.particle_ids.len() != self.state.positions.len() {
             return Err(ApplicationError::StateMismatch(format!(
-                "Gresho ParticleIDs have {} entries, expected {}",
+                "{} ParticleIDs have {} entries, expected {}",
+                self.profile.name(),
                 self.particle_ids.len(),
                 self.state.positions.len()
             )));
         }
-        if self.particle_ids.len() != 4_092
-            || self
-                .particle_ids
-                .iter()
-                .enumerate()
-                .any(|(index, &id)| id != u64::try_from(index).expect("4092 fits u64"))
+        let expected_count = match self.profile {
+            StrictProfile::Gresho => 4_092,
+            StrictProfile::KhMcnally => 66_868,
+            _ => {
+                return Err(ApplicationError::StateMismatch(
+                    "non-planar profile stored in planar hydro runtime".to_owned(),
+                ));
+            }
+        };
+        let first_id = u64::from(self.profile == StrictProfile::KhMcnally);
+        if self.particle_ids.len() != expected_count
+            || self.particle_ids.iter().enumerate().any(|(index, &id)| {
+                id != u64::try_from(index).expect("planar fixture count fits u64") + first_id
+            })
         {
-            return Err(ApplicationError::StateMismatch(
-                "Gresho ParticleIDs must be exactly 0..4091".to_owned(),
-            ));
+            return Err(ApplicationError::StateMismatch(format!(
+                "{} ParticleIDs do not match the pinned contiguous range",
+                self.profile.name()
+            )));
         }
         if self.state.domain.lengths() != Vector2::new(1.0, 1.0)
-            || self.state.gamma.to_bits() != StrictProfile::Gresho.gamma().to_bits()
+            || self.state.gamma.to_bits() != self.profile.gamma().to_bits()
             || self.parameters.box_size.to_bits() != 1.0_f64.to_bits()
+            || (self.profile == StrictProfile::KhMcnally) != self.fixture_density_range.is_some()
+            || self.state.kernel
+                != if self.profile == StrictProfile::KhMcnally {
+                    KernelFunction2d::Quintic
+                } else {
+                    KernelFunction2d::Cubic
+                }
         {
-            return Err(ApplicationError::StateMismatch(
-                "Gresho runtime bundle must use the unit periodic box and gamma=1.4".to_owned(),
-            ));
+            return Err(ApplicationError::StateMismatch(format!(
+                "{} runtime bundle must use its unit periodic planar profile",
+                self.profile.name()
+            )));
         }
         self.state
             .validate()
@@ -1643,24 +1962,29 @@ impl InitializedGresho {
     }
 
     fn print_initialization(&self, config_sha256: &str) {
-        let primitive = self
+        let density = self
             .state
             .primitive_columns()
-            .expect("validated Gresho state has valid primitive columns");
-        let density_range = primitive.density.iter().copied().fold(
+            .expect("validated planar state has valid primitive columns")
+            .density;
+        let density_range = density.iter().copied().fold(
             (f64::INFINITY, f64::NEG_INFINITY),
             |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
         );
         println!("{{");
         println!("  \"config_sha256\": \"{config_sha256}\",");
-        println!("  \"profile\": \"Gresho vortex\",");
+        println!("  \"profile\": \"{}\",", self.profile.name());
         println!("  \"particles\": {},", self.state.positions.len());
         println!("  \"box_lengths\": [1, 1, 1],");
-        println!("  \"gamma\": 1.4,");
+        println!("  \"gamma\": {},", self.profile.gamma());
         println!(
-            "  \"density_range_after_public_initialization\": [{:.17e}, {:.17e}]",
+            "  \"density_range_after_public_initialization\": [{:.17e}, {:.17e}],",
             density_range.0, density_range.1
         );
+        if let Some((minimum, maximum)) = self.fixture_density_range {
+            println!("  \"fixture_density_range\": [{minimum:.17e}, {maximum:.17e}],");
+        }
+        println!("  \"kernel_function\": {}", self.state.kernel as u8);
         println!("}}");
     }
 }
@@ -1986,15 +2310,33 @@ fn evolve_profile(initialized: InitializedProfile) -> Result<(), ApplicationErro
     match initialized {
         InitializedProfile::Hydro(initialized) => evolve_hydro_profile(initialized),
         InitializedProfile::Mhd(initialized) => evolve_mhd_wave(initialized),
-        InitializedProfile::Gresho(initialized) => evolve_gresho(&initialized),
+        InitializedProfile::PlanarHydro(initialized) => evolve_planar_hydro(&initialized),
         InitializedProfile::BrioWu(initialized) => evolve_briowu(&initialized),
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError> {
-    const OUTPUT_COUNT: u32 = 6;
-    const EXPECTED_EVENTS: u64 = 8_192;
+fn evolve_planar_hydro(initialized: &InitializedPlanarHydro) -> Result<(), ApplicationError> {
+    let (output_count, expected_events) = match initialized.profile {
+        StrictProfile::Gresho => (6_u32, Some(8_192_u64)),
+        StrictProfile::KhMcnally
+            if initialized.parameters.time_max.to_bits() == 1.5_f64.to_bits() =>
+        {
+            (15, Some(2_048_u64))
+        }
+        StrictProfile::KhMcnally
+            if initialized.parameters.time_max.to_bits() == 10.0_f64.to_bits() =>
+        {
+            (100, None)
+        }
+        _ => {
+            return Err(ApplicationError::StateMismatch(format!(
+                "unsupported planar hydro runtime profile `{}` at t_max={}",
+                initialized.profile.name(),
+                initialized.parameters.time_max
+            )));
+        }
+    };
     let output_dir = PathBuf::from(&initialized.parameters.output_dir);
     fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
     let rates = hydro_mfm_directed_spatial_rates_2d(&initialized.state)
@@ -2024,7 +2366,7 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
     .map_err(ApplicationError::HydroEvolution2d)?;
     let mut snapshot_number = 0_u32;
     let mut step_count = 0_u64;
-    write_gresho_drift_snapshot(
+    write_planar_hydro_drift_snapshot(
         initialized,
         &initialized.state.masses,
         hierarchy.current_drift_state(),
@@ -2037,6 +2379,16 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
         .drift_to_first_sync()
         .map_err(ApplicationError::HydroEvolution2d)?;
     loop {
+        if step_count < 8 {
+            let active_count = sync.active.iter().filter(|&&is_active| is_active).count();
+            eprintln!(
+                "{} hierarchy event starting: event={} tick={} time={:.17e} active={active_count}",
+                initialized.profile.name(),
+                step_count + 1,
+                hierarchy.current_tick(),
+                hierarchy.current_time()
+            );
+        }
         hierarchy
             .refresh_arriving_active_caches(
                 initialized.parameters.desired_num_neighbors,
@@ -2050,13 +2402,17 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
             .finish_arriving_active_kicks(endpoint)
             .map_err(ApplicationError::HydroEvolution2d)?;
         step_count = step_count.checked_add(1).ok_or_else(|| {
-            ApplicationError::StateMismatch("Gresho hierarchy event count overflow".to_owned())
+            ApplicationError::StateMismatch(format!(
+                "{} hierarchy event count overflow",
+                initialized.profile.name()
+            ))
         })?;
         let terminal_sync = hierarchy.current_tick() >= LEGACY_TIMEBASE_TICKS;
         if step_count % 256 == 0 || terminal_sync {
             let active_count = sync.active.iter().filter(|&&is_active| is_active).count();
             eprintln!(
-                "Gresho hierarchy progress: event={step_count} tick={} time={:.17e} active={active_count}",
+                "{} hierarchy progress: event={step_count} tick={} time={:.17e} active={active_count}",
+                initialized.profile.name(),
                 hierarchy.current_tick(),
                 hierarchy.current_time()
             );
@@ -2084,13 +2440,13 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
         let next_sync_tick = hierarchy
             .prepare_next_drift(&active_bounds)
             .map_err(ApplicationError::HydroEvolution2d)?;
-        while next_output_index <= OUTPUT_COUNT {
-            let requested_output_time = if next_output_index == OUTPUT_COUNT {
+        while next_output_index <= output_count {
+            let requested_output_time = if next_output_index == output_count {
                 initialized.parameters.time_max
             } else {
                 f64::from(next_output_index) * initialized.parameters.time_between_snapshots
             };
-            let terminal = next_output_index == OUTPUT_COUNT;
+            let terminal = next_output_index == output_count;
             let output_tick = hierarchy
                 .output_time_to_integer_tick(requested_output_time, terminal)
                 .map_err(ApplicationError::HydroEvolution2d)?;
@@ -2099,7 +2455,8 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
             }
             if output_tick < hierarchy.current_tick() {
                 return Err(ApplicationError::StateMismatch(format!(
-                    "hierarchical Gresho schedule passed output tick {output_tick}"
+                    "hierarchical {} schedule passed output tick {output_tick}",
+                    initialized.profile.name()
                 )));
             }
             let drift = hierarchy
@@ -2108,7 +2465,7 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
             let output_time = hierarchy
                 .output_physical_time_at_tick(output_tick)
                 .map_err(ApplicationError::HydroEvolution2d)?;
-            write_gresho_drift_snapshot(
+            write_planar_hydro_drift_snapshot(
                 initialized,
                 &initialized.state.masses,
                 &drift,
@@ -2122,15 +2479,18 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
             .finish_prepared_next_sync()
             .map_err(ApplicationError::HydroEvolution2d)?;
     }
-    if snapshot_number != OUTPUT_COUNT + 1 {
+    if snapshot_number != output_count + 1 {
         return Err(ApplicationError::StateMismatch(format!(
-            "hierarchical Gresho wrote {snapshot_number} snapshots, expected {}",
-            OUTPUT_COUNT + 1
+            "hierarchical {} wrote {snapshot_number} snapshots, expected {}",
+            initialized.profile.name(),
+            output_count + 1
         )));
     }
-    if step_count != EXPECTED_EVENTS {
+    if expected_events.is_some_and(|expected| step_count != expected) {
         return Err(ApplicationError::StateMismatch(format!(
-            "hierarchical Gresho completed {step_count} events, expected {EXPECTED_EVENTS}"
+            "hierarchical {} completed {step_count} events, expected {}",
+            initialized.profile.name(),
+            expected_events.expect("checked above")
         )));
     }
     let time = hierarchy.current_time();
@@ -2141,8 +2501,8 @@ fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError
     Ok(())
 }
 
-fn write_gresho_drift_snapshot(
-    initialized: &InitializedGresho,
+fn write_planar_hydro_drift_snapshot(
+    initialized: &InitializedPlanarHydro,
     masses: &[f64],
     drift: &PublicHydroDriftState2d,
     path: PathBuf,
@@ -3487,6 +3847,10 @@ ArtCondConstant                    0.25
 ViscosityAMin                      0.025
 ViscosityAMax                      2
 ";
+    const KH_MCNALLY_CONFIG: &str =
+        include_str!("../../../../validation/oracles/kh_mcnally/public-config.sh");
+    const KH_MCNALLY_PARAMETERS: &str =
+        include_str!("../../../../validation/oracles/kh_mcnally/public.params");
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -3658,6 +4022,56 @@ ResubmitCommand none
         ] {
             assert!(matches!(
                 read_gresho_parameters(&invalid),
+                Err(ApplicationError::UnsupportedParameters(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_public_kh_mcnally_profile_preserves_inert_parameter_semantics() {
+        let manifest = ConfigManifest::parse(KH_MCNALLY_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::KhMcnally
+        );
+        for invalid in [
+            KH_MCNALLY_CONFIG.replace("KERNEL_FUNCTION=5\n", ""),
+            KH_MCNALLY_CONFIG.replace("KERNEL_FUNCTION=5", "KERNEL_FUNCTION=3"),
+            KH_MCNALLY_CONFIG.replace("EOS_GAMMA=(5.0/3.0)", "EOS_GAMMA=(5./3.)"),
+            format!("{KH_MCNALLY_CONFIG}MAGNETIC\n"),
+        ] {
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&invalid).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(_))
+            ));
+        }
+
+        let parameters = read_kh_mcnally_parameters(KH_MCNALLY_PARAMETERS).unwrap();
+        assert_eq!(parameters.time_max.to_bits(), 10.0_f64.to_bits());
+        assert_eq!(
+            parameters.time_between_snapshots.to_bits(),
+            0.1_f64.to_bits()
+        );
+        assert_eq!(parameters.max_timestep.to_bits(), 0.02_f64.to_bits());
+        assert_eq!(
+            parameters.desired_num_neighbors.to_bits(),
+            40.0_f64.to_bits()
+        );
+        assert_eq!(
+            parameters.integration_accuracy.to_bits(),
+            0.02_f64.to_bits()
+        );
+        assert_eq!(parameters.courant_factor.to_bits(), 0.4_f64.to_bits());
+        for invalid in [
+            KH_MCNALLY_PARAMETERS.replace(
+                "BiniX                              0.07",
+                "BiniX                              0.08",
+            ),
+            KH_MCNALLY_PARAMETERS.replace("ConductionCoeff                    0.0002\n", ""),
+            format!("{KH_MCNALLY_PARAMETERS}MaxNumNgbDeviation 0.1\n"),
+        ] {
+            assert!(matches!(
+                read_kh_mcnally_parameters(&invalid),
                 Err(ApplicationError::UnsupportedParameters(_))
             ));
         }

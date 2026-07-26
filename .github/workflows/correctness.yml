@@ -88,3 +88,20 @@ jobs:
         env:
           GIZMO_ACTIVE_TARGET_THREADS: "4"
         run: validation/oracles/run_rust_gresho.sh
+
+  kh-mcnally:
+    name: Full Rust McNally KH trajectory
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install trajectory-analysis dependencies
+        run: python -m pip install h5py==3.15.1 numpy==2.4.0
+      - name: Run published-curve and corrected-C trajectory gates
+        env:
+          GIZMO_ACTIVE_TARGET_THREADS: "4"
+        run: validation/oracles/run_rust_kh_mcnally.sh

@@ -1,12 +1,13 @@
 //! Two-dimensional rectangular-periodic meshless geometry.
 //!
-//! The formulas in this module are the `NUMDIMS == 2`,
-//! `KERNEL_FUNCTION == 3` specializations of the pinned public C baseline:
-//! `kernel.h` supplies the compact cubic kernel, `hydro/density.c` supplies
+//! The formulas in this module are the `NUMDIMS == 2` specializations of the
+//! pinned public C baseline for `KERNEL_FUNCTION == 3` and `5`: `kernel.h`
+//! supplies the compact cubic and quintic kernels, `hydro/density.c` supplies
 //! density and the MLS moment matrix, and
 //! `hydro/compute_finitevol_faces.h` supplies the MFM face vector.  Smoothing
 //! lengths are full compact-support radii, as in the C code.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::f64::consts::PI;
 use std::fmt;
@@ -16,7 +17,29 @@ use crate::{AdaptiveDensityEstimate, DensityEstimate, KernelValue};
 
 /// Exact normalization of GIZMO's default cubic spline in two dimensions.
 pub const CUBIC_2D_NORMALIZATION: f64 = 40.0 / (7.0 * PI);
+/// Exact normalization of GIZMO's `KERNEL_FUNCTION == 5` spline in two dimensions.
+pub const QUINTIC_2D_NORMALIZATION: f64 = 46_875.0 / (2_398.0 * PI);
 const MOMENT_CONDITION_LIMIT: f64 = 1.0e4;
+
+/// Compact-support kernel selected by the public C `KERNEL_FUNCTION` switch.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KernelFunction2d {
+    #[default]
+    Cubic = 3,
+    Quintic = 5,
+}
+
+impl KernelFunction2d {
+    /// Literal public-C `KERNEL_CORE_SIZE` for the selected kernel.
+    #[must_use]
+    pub const fn core_size(self) -> f64 {
+        match self {
+            Self::Cubic => 0.5,
+            Self::Quintic => 1.0 / 3.0,
+        }
+    }
+}
 
 /// A finite Cartesian vector in the simulated plane.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -291,6 +314,71 @@ pub fn cubic_kernel_2d(radius: f64, hsml: f64) -> Result<KernelValue, GeometryEr
         return Err(GeometryError::NonFiniteKernelResult { radius, hsml });
     }
     Ok(result)
+}
+
+/// Value and physical radial derivative of the public-C quintic kernel.
+///
+/// # Errors
+///
+/// Returns an error for invalid inputs or non-finite arithmetic.
+pub fn quintic_kernel_2d(radius: f64, hsml: f64) -> Result<KernelValue, GeometryError> {
+    if !radius.is_finite() || !hsml.is_finite() || radius < 0.0 || hsml <= 0.0 {
+        return Err(GeometryError::InvalidKernelInput { radius, hsml });
+    }
+    let u = radius / hsml;
+    if u >= 1.0 {
+        return Ok(KernelValue {
+            weight: 0.0,
+            radial_derivative: 0.0,
+        });
+    }
+
+    // Keep the branch structure and operation ordering literal to kernel.h.
+    let t1 = 1.0 - u;
+    let t2 = t1 * t1;
+    let mut derivative_shape = -4.0 * t2 * t1;
+    let mut shape = t2 * t2;
+    if u < 0.6 {
+        let t1 = 0.6 - u;
+        let t2 = t1 * t1;
+        derivative_shape += 20.0 * t2 * t1;
+        shape -= 5.0 * t2 * t2;
+    }
+    if u < 0.2 {
+        let t1 = 0.2 - u;
+        let t2 = t1 * t1;
+        derivative_shape -= 40.0 * t2 * t1;
+        shape += 10.0 * t2 * t2;
+    }
+    let inverse_h = hsml.recip();
+    let result = KernelValue {
+        weight: shape * QUINTIC_2D_NORMALIZATION * inverse_h * inverse_h,
+        radial_derivative: derivative_shape
+            * QUINTIC_2D_NORMALIZATION
+            * inverse_h
+            * inverse_h
+            * inverse_h,
+    };
+    if !result.weight.is_finite() || !result.radial_derivative.is_finite() {
+        return Err(GeometryError::NonFiniteKernelResult { radius, hsml });
+    }
+    Ok(result)
+}
+
+/// Dispatch a two-dimensional public-C kernel without perturbing cubic arithmetic.
+///
+/// # Errors
+///
+/// Returns the selected kernel's input or arithmetic error.
+pub fn kernel_2d(
+    function: KernelFunction2d,
+    radius: f64,
+    hsml: f64,
+) -> Result<KernelValue, GeometryError> {
+    match function {
+        KernelFunction2d::Cubic => cubic_kernel_2d(radius, hsml),
+        KernelFunction2d::Quintic => quintic_kernel_2d(radius, hsml),
+    }
 }
 
 /// Exact cell-list index for periodic radial queries.
@@ -595,6 +683,23 @@ pub fn density_at_hsml_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<DensityEstimate>, GeometryError> {
+    density_at_hsml_with_kernel_2d(
+        positions,
+        masses,
+        smoothing_lengths,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn density_at_hsml_with_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<DensityEstimate>, GeometryError> {
     validate_particle_columns(positions, masses, smoothing_lengths, domain)?;
     if positions.is_empty() {
         return Ok(Vec::new());
@@ -607,7 +712,7 @@ pub fn density_at_hsml_2d(
         let mut derivative_sum = 0.0;
         for neighbor in index.neighbors_within(position, hsml)? {
             let radius = domain.displacement(position, positions[neighbor])?.norm();
-            let kernel = cubic_kernel_2d(radius, hsml)?;
+            let kernel = kernel_2d(kernel_function, radius, hsml)?;
             kernel_sum += kernel.weight;
             derivative_sum +=
                 -(2.0 * kernel.weight / hsml + (radius / hsml) * kernel.radial_derivative);
@@ -660,13 +765,54 @@ pub fn particle_divergence_at_hsml_2d(
     dhsml_factors: &[f64],
     domain: Box2d,
 ) -> Result<Vec<f64>, GeometryError> {
-    particle_divergence_at_hsml_for_targets_2d(
+    particle_divergence_at_hsml_with_kernel_2d(
+        positions,
+        velocities,
+        smoothing_lengths,
+        dhsml_factors,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn particle_divergence_at_hsml_with_kernel_2d(
+    positions: &[Vector2],
+    velocities: &[Vector2],
+    smoothing_lengths: &[f64],
+    dhsml_factors: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<f64>, GeometryError> {
+    particle_divergence_at_hsml_for_targets_with_kernel_2d(
         positions,
         velocities,
         smoothing_lengths,
         dhsml_factors,
         domain,
         &vec![true; positions.len()],
+        kernel_function,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn particle_divergence_at_hsml_for_targets_with_kernel_2d(
+    positions: &[Vector2],
+    velocities: &[Vector2],
+    smoothing_lengths: &[f64],
+    dhsml_factors: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<f64>, GeometryError> {
+    particle_divergence_at_hsml_for_targets_impl_2d(
+        positions,
+        velocities,
+        smoothing_lengths,
+        dhsml_factors,
+        domain,
+        targets,
+        kernel_function,
     )
 }
 
@@ -684,6 +830,26 @@ pub fn particle_divergence_at_hsml_for_targets_2d(
     dhsml_factors: &[f64],
     domain: Box2d,
     targets: &[bool],
+) -> Result<Vec<f64>, GeometryError> {
+    particle_divergence_at_hsml_for_targets_impl_2d(
+        positions,
+        velocities,
+        smoothing_lengths,
+        dhsml_factors,
+        domain,
+        targets,
+        KernelFunction2d::Cubic,
+    )
+}
+
+fn particle_divergence_at_hsml_for_targets_impl_2d(
+    positions: &[Vector2],
+    velocities: &[Vector2],
+    smoothing_lengths: &[f64],
+    dhsml_factors: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
 ) -> Result<Vec<f64>, GeometryError> {
     validate_geometry_columns(positions, smoothing_lengths, domain)?;
     if velocities.len() != positions.len() {
@@ -728,7 +894,7 @@ pub fn particle_divergence_at_hsml_for_targets_2d(
         for neighbor in neighbors.neighbors_within(position, hsml)? {
             let displacement = domain.displacement(position, positions[neighbor])?;
             let radius = displacement.norm();
-            let kernel = cubic_kernel_2d(radius, hsml)?;
+            let kernel = kernel_2d(kernel_function, radius, hsml)?;
             kernel_sum += kernel.weight;
             if radius > 0.0 {
                 let velocity_difference = velocities[particle] - velocities[neighbor];
@@ -753,6 +919,206 @@ pub fn particle_divergence_at_hsml_for_targets_2d(
     Ok(output)
 }
 
+/// Reproduce public-C restart-0 gravitational-tree smoothing-length seeds.
+///
+/// The gravity tree is an oct-tree even for `NUMDIMS == 2`: particles have
+/// `z=0`, while the root cube is set by the largest populated x/y extent.
+/// Starting at each particle leaf, this ascends until the enclosing node has
+/// at least `2 * desired_neighbors * particle_mass`, then applies the literal
+/// two-dimensional seed expression from `setup_smoothinglengths()`.
+///
+/// Periodicity affects validation but not the tree extent or ancestry; this is
+/// also how the C initializer constructs its gravity tree.
+///
+/// # Errors
+///
+/// Returns an error for invalid columns, an empty or degenerate tree extent,
+/// or non-finite seed arithmetic.
+pub fn public_c_tree_smoothing_length_seeds_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+) -> Result<Vec<f64>, GeometryError> {
+    const TREE_BITS: u32 = 42;
+
+    validate_positions(positions, domain)?;
+    if masses.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "masses",
+            expected: positions.len(),
+            actual: masses.len(),
+        });
+    }
+    for (index, &mass) in masses.iter().enumerate() {
+        if !mass.is_finite() || mass <= 0.0 {
+            return Err(GeometryError::InvalidPoint {
+                index: Some(index),
+                field: "mass",
+                value: mass,
+            });
+        }
+    }
+    if !desired_neighbors.is_finite() || desired_neighbors <= 0.0 {
+        return Err(GeometryError::InvalidNeighborConstraint {
+            desired: desired_neighbors,
+            tolerance: 0.0,
+        });
+    }
+
+    let mut minimum = Vector2::new(f64::INFINITY, f64::INFINITY);
+    let mut maximum = Vector2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &position in positions {
+        minimum.x = minimum.x.min(position.x);
+        minimum.y = minimum.y.min(position.y);
+        maximum.x = maximum.x.max(position.x);
+        maximum.y = maximum.y.max(position.y);
+    }
+    let maximum_extent = (maximum.x - minimum.x).max(maximum.y - minimum.y);
+    let domain_length = 1.001 * maximum_extent;
+    if !domain_length.is_finite() || domain_length <= 0.0 {
+        return Err(GeometryError::DegenerateTreeDomain { minimum, maximum });
+    }
+    let center = (minimum + maximum) * 0.5;
+    let corner = Vector2::new(
+        center.x - 0.5 * domain_length,
+        center.y - 0.5 * domain_length,
+    );
+    // The absent third coordinate is exactly zero in a 2-D GIZMO snapshot.
+    let corner_z = -0.5 * domain_length;
+    let keys: Vec<u128> = positions
+        .iter()
+        .map(|&position| {
+            legacy_octtree_key_2d(position, corner, corner_z, domain_length, TREE_BITS)
+        })
+        .collect();
+
+    let mut levels = vec![BTreeMap::<u128, f64>::new(); (TREE_BITS + 1) as usize];
+    for (&key, &mass) in keys.iter().zip(masses) {
+        *levels[TREE_BITS as usize].entry(key).or_insert(0.0) += mass;
+    }
+    for depth in (0..TREE_BITS).rev() {
+        let (parents, children) = levels.split_at_mut((depth + 1) as usize);
+        let parent_level = &mut parents[depth as usize];
+        for (&child, &mass) in &children[0] {
+            *parent_level.entry(child >> 3).or_insert(0.0) += mass;
+        }
+    }
+
+    keys.iter()
+        .zip(masses)
+        .enumerate()
+        .map(|(index, (&key, &particle_mass))| {
+            let threshold = 2.0 * desired_neighbors * particle_mass;
+            let mut selected_depth = 0;
+            let mut selected_mass = levels[0][&0];
+            for depth in (0..=TREE_BITS).rev() {
+                let shift = 3 * (TREE_BITS - depth);
+                let prefix = key >> shift;
+                let node_mass = levels[depth as usize][&prefix];
+                selected_depth = depth;
+                selected_mass = node_mass;
+                if node_mass >= threshold {
+                    break;
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let node_length = domain_length / (1_u64 << selected_depth) as f64;
+            let seed =
+                (1.0 / PI * desired_neighbors * particle_mass / selected_mass).sqrt() * node_length;
+            if !seed.is_finite() || seed <= 0.0 {
+                return Err(GeometryError::NonFiniteResult {
+                    index,
+                    field: "tree smoothing-length seed",
+                    value: seed,
+                });
+            }
+            Ok(seed)
+        })
+        .collect()
+}
+
+fn legacy_octtree_key_2d(
+    position: Vector2,
+    corner: Vector2,
+    corner_z: f64,
+    domain_length: f64,
+    bits: u32,
+) -> u128 {
+    const MANTISSA_MASK: u64 = (1_u64 << 52) - 1;
+    let coordinate = |value: f64, origin: f64| {
+        let normalized = (value - origin) / domain_length + 1.0;
+        (normalized.to_bits() & MANTISSA_MASK) >> (52 - bits)
+    };
+    let x = coordinate(position.x, corner.x);
+    let y = coordinate(position.y, corner.y);
+    let z = coordinate(0.0, corner_z);
+    let mut key = 0_u128;
+    for bit in (0..bits).rev() {
+        let octant = ((x >> bit) & 1) | (((y >> bit) & 1) << 1) | (((z >> bit) & 1) << 2);
+        key = (key << 3) | u128::from(octant);
+    }
+    key
+}
+
+/// Run the public-C restart-0 smoothing-length schedule from tree seeds.
+///
+/// # Errors
+///
+/// Returns an error for invalid tree geometry, neighbor constraints, or a
+/// density pass that fails to converge.
+pub fn solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+    tolerance: f64,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<AdaptiveDensityEstimate>, GeometryError> {
+    let mut seeds =
+        public_c_tree_smoothing_length_seeds_2d(positions, masses, domain, desired_neighbors)?;
+    let mut solved = Vec::new();
+    for _ in 0..3 {
+        solved = solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d(
+            positions,
+            masses,
+            &seeds,
+            domain,
+            desired_neighbors,
+            tolerance,
+            kernel_function,
+        )?;
+        seeds = solved
+            .iter()
+            .map(|particle| particle.smoothing_length)
+            .collect();
+    }
+    Ok(solved)
+}
+
+/// Cubic compatibility wrapper for the public-C restart-0 schedule.
+///
+/// # Errors
+///
+/// Returns the same errors as
+/// [`solve_public_c_initial_smoothing_lengths_with_kernel_2d`].
+pub fn solve_public_c_initial_smoothing_lengths_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+    tolerance: f64,
+) -> Result<Vec<AdaptiveDensityEstimate>, GeometryError> {
+    solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+        positions,
+        masses,
+        domain,
+        desired_neighbors,
+        tolerance,
+        KernelFunction2d::Cubic,
+    )
+}
+
 /// Run one public-C two-dimensional density/smoothing-length pass.
 ///
 /// This is the `NUMDIMS == 2` specialization of the bracketed Newton-like
@@ -775,8 +1141,30 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_2d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, GeometryError> {
+    solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d(
+        positions,
+        masses,
+        seeds,
+        domain,
+        desired_neighbors,
+        tolerance,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::missing_errors_doc)]
+pub fn solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    seeds: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+    tolerance: f64,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<AdaptiveDensityEstimate>, GeometryError> {
     let targets = vec![true; positions.len()];
-    solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+    solve_public_c_smoothing_lengths_from_seeds_for_targets_with_kernel_2d(
         positions,
         masses,
         seeds,
@@ -784,6 +1172,7 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_2d(
         desired_neighbors,
         tolerance,
         &targets,
+        kernel_function,
     )?
     .into_iter()
     .enumerate()
@@ -816,6 +1205,30 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
     desired_neighbors: f64,
     tolerance: f64,
     targets: &[bool],
+) -> Result<Vec<Option<AdaptiveDensityEstimate>>, GeometryError> {
+    solve_public_c_smoothing_lengths_from_seeds_for_targets_with_kernel_2d(
+        positions,
+        masses,
+        seeds,
+        domain,
+        desired_neighbors,
+        tolerance,
+        targets,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::missing_errors_doc)]
+pub fn solve_public_c_smoothing_lengths_from_seeds_for_targets_with_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    seeds: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+    tolerance: f64,
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
 ) -> Result<Vec<Option<AdaptiveDensityEstimate>>, GeometryError> {
     validate_positions(positions, domain)?;
     validate_target_column_lengths(positions.len(), masses.len(), "masses", targets)?;
@@ -875,6 +1288,7 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
                 tolerance,
                 seed,
                 &neighbor_index,
+                kernel_function,
             )?);
         }
     }
@@ -891,6 +1305,7 @@ fn solve_public_c_particle_from_seed_2d(
     base_tolerance: f64,
     seed: f64,
     neighbor_index: &CellList2d,
+    kernel_function: KernelFunction2d,
 ) -> Result<AdaptiveDensityEstimate, GeometryError> {
     let mut hsml = seed;
     let mut lower = 0.0_f64;
@@ -902,6 +1317,7 @@ fn solve_public_c_particle_from_seed_2d(
         hsml,
         domain,
         neighbor_index,
+        kernel_function,
     )?;
 
     for iteration in 0..=128 {
@@ -949,6 +1365,7 @@ fn solve_public_c_particle_from_seed_2d(
             hsml,
             domain,
             neighbor_index,
+            kernel_function,
         )?;
     }
 
@@ -973,6 +1390,7 @@ fn estimate_public_c_density_geometry_2d(
     hsml: f64,
     domain: Box2d,
     neighbor_index: &CellList2d,
+    kernel_function: KernelFunction2d,
 ) -> Result<PublicCDensityGeometry2d, GeometryError> {
     let position = positions[index];
     let mut kernel_sum = 0.0;
@@ -984,7 +1402,7 @@ fn estimate_public_c_density_geometry_2d(
     for neighbor in neighbor_index.neighbors_within(position, hsml)? {
         let displacement = domain.displacement(position, positions[neighbor])?;
         let radius = displacement.norm();
-        let kernel = cubic_kernel_2d(radius, hsml)?;
+        let kernel = kernel_2d(kernel_function, radius, hsml)?;
         kernel_sum += kernel.weight;
         derivative_sum +=
             -(2.0 * kernel.weight / hsml + (radius / hsml) * kernel.radial_derivative);
@@ -1155,18 +1573,39 @@ pub fn inverse_moments_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<InverseMoment2d>, GeometryError> {
+    inverse_moments_with_kernel_2d(
+        positions,
+        smoothing_lengths,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn inverse_moments_with_kernel_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<InverseMoment2d>, GeometryError> {
     let targets = vec![true; positions.len()];
-    inverse_moments_for_targets_2d(positions, smoothing_lengths, domain, &targets)?
-        .into_iter()
-        .enumerate()
-        .map(|(index, moment)| {
-            moment.ok_or(GeometryError::NonFiniteResult {
-                index,
-                field: "missing all-target inverse moment",
-                value: f64::NAN,
-            })
+    inverse_moments_for_targets_with_kernel_2d(
+        positions,
+        smoothing_lengths,
+        domain,
+        &targets,
+        kernel_function,
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(index, moment)| {
+        moment.ok_or(GeometryError::NonFiniteResult {
+            index,
+            field: "missing all-target inverse moment",
+            value: f64::NAN,
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// Build and invert MLS moments for selected targets only.
@@ -1183,6 +1622,23 @@ pub fn inverse_moments_for_targets_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
     targets: &[bool],
+) -> Result<Vec<Option<InverseMoment2d>>, GeometryError> {
+    inverse_moments_for_targets_with_kernel_2d(
+        positions,
+        smoothing_lengths,
+        domain,
+        targets,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn inverse_moments_for_targets_with_kernel_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
 ) -> Result<Vec<Option<InverseMoment2d>>, GeometryError> {
     validate_positions(positions, domain)?;
     validate_target_column_lengths(
@@ -1211,7 +1667,7 @@ pub fn inverse_moments_for_targets_2d(
             if radius == 0.0 {
                 continue;
             }
-            let weight = cubic_kernel_2d(radius, hsml)?.weight;
+            let weight = kernel_2d(kernel_function, radius, hsml)?.weight;
             xx += weight * displacement.x * displacement.x;
             xy += weight * displacement.x * displacement.y;
             yy += weight * displacement.y * displacement.y;
@@ -1287,11 +1743,33 @@ pub fn scalar_gradients_at_hsml_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<Vector2>, GeometryError> {
+    scalar_gradients_at_hsml_with_kernel_2d(
+        positions,
+        values,
+        smoothing_lengths,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn scalar_gradients_at_hsml_with_kernel_2d(
+    positions: &[Vector2],
+    values: &[f64],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<Vector2>, GeometryError> {
     validate_values(values, positions.len(), "scalar_values")?;
-    let moments = inverse_moments_2d(positions, smoothing_lengths, domain)?;
-    gradient_numerators(positions, smoothing_lengths, domain, |center, neighbor| {
-        Vector2::new(values[neighbor] - values[center], 0.0)
-    })?
+    let moments =
+        inverse_moments_with_kernel_2d(positions, smoothing_lengths, domain, kernel_function)?;
+    gradient_numerators(
+        positions,
+        smoothing_lengths,
+        domain,
+        kernel_function,
+        |center, neighbor| Vector2::new(values[neighbor] - values[center], 0.0),
+    )?
     .into_iter()
     .zip(moments)
     .enumerate()
@@ -1325,14 +1803,34 @@ pub fn scalar_gradients_batch_with_moments_2d(
     domain: Box2d,
     moments: &[InverseMoment2d],
 ) -> Result<Vec<Vec<Vector2>>, GeometryError> {
+    scalar_gradients_batch_with_moments_and_kernel_2d(
+        positions,
+        fields,
+        smoothing_lengths,
+        domain,
+        moments,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn scalar_gradients_batch_with_moments_and_kernel_2d(
+    positions: &[Vector2],
+    fields: &[&[f64]],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<Vec<Vector2>>, GeometryError> {
     let targets = vec![true; positions.len()];
-    scalar_gradients_batch_with_moments_for_targets_2d(
+    scalar_gradients_batch_with_moments_for_targets_and_kernel_2d(
         positions,
         fields,
         smoothing_lengths,
         domain,
         moments,
         &targets,
+        kernel_function,
     )?
     .into_iter()
     .map(|field| {
@@ -1369,6 +1867,28 @@ pub fn scalar_gradients_batch_with_moments_for_targets_2d(
     domain: Box2d,
     moments: &[InverseMoment2d],
     targets: &[bool],
+) -> Result<Vec<Vec<Option<Vector2>>>, GeometryError> {
+    scalar_gradients_batch_with_moments_for_targets_and_kernel_2d(
+        positions,
+        fields,
+        smoothing_lengths,
+        domain,
+        moments,
+        targets,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::missing_errors_doc)]
+pub fn scalar_gradients_batch_with_moments_for_targets_and_kernel_2d(
+    positions: &[Vector2],
+    fields: &[&[f64]],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
 ) -> Result<Vec<Vec<Option<Vector2>>>, GeometryError> {
     validate_positions(positions, domain)?;
     validate_target_column_lengths(
@@ -1415,7 +1935,7 @@ pub fn scalar_gradients_batch_with_moments_for_targets_2d(
                 continue;
             }
             let displacement = domain.displacement(position, positions[neighbor])?;
-            let weight = cubic_kernel_2d(displacement.norm(), hsml)?.weight;
+            let weight = kernel_2d(kernel_function, displacement.norm(), hsml)?.weight;
             for (field_index, values) in fields.iter().enumerate() {
                 validate_scalar_value(values[neighbor], neighbor, "scalar_values")?;
                 let delta = values[neighbor] - values[center];
@@ -1468,6 +1988,25 @@ pub fn legacy_face_closure_for_targets_with_moments_2d(
     moments: &[InverseMoment2d],
     targets: &[bool],
 ) -> Result<Vec<Option<f64>>, GeometryError> {
+    legacy_face_closure_for_targets_with_moments_and_kernel_2d(
+        positions,
+        smoothing_lengths,
+        domain,
+        moments,
+        targets,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn legacy_face_closure_for_targets_with_moments_and_kernel_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<Option<f64>>, GeometryError> {
     validate_positions(positions, domain)?;
     validate_target_column_lengths(
         positions.len(),
@@ -1499,7 +2038,7 @@ pub fn legacy_face_closure_for_targets_with_moments_2d(
         for neighbor in index.neighbors_within(position, hsml)? {
             let displacement = domain.displacement(position, positions[neighbor])?;
             let radius = displacement.norm();
-            let kernel = cubic_kernel_2d(radius, hsml)?;
+            let kernel = kernel_2d(kernel_function, radius, hsml)?;
             kernel_sum += kernel.weight;
             if radius > 0.0 {
                 first_moment += displacement * kernel.weight;
@@ -1544,6 +2083,23 @@ pub fn vector_gradients_at_hsml_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<Matrix2>, GeometryError> {
+    vector_gradients_at_hsml_with_kernel_2d(
+        positions,
+        values,
+        smoothing_lengths,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn vector_gradients_at_hsml_with_kernel_2d(
+    positions: &[Vector2],
+    values: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<Matrix2>, GeometryError> {
     if values.len() != positions.len() {
         return Err(GeometryError::MismatchedLength {
             field: "vector_values",
@@ -1560,10 +2116,15 @@ pub fn vector_gradients_at_hsml_2d(
             });
         }
     }
-    let moments = inverse_moments_2d(positions, smoothing_lengths, domain)?;
-    gradient_numerators(positions, smoothing_lengths, domain, |center, neighbor| {
-        values[neighbor] - values[center]
-    })?
+    let moments =
+        inverse_moments_with_kernel_2d(positions, smoothing_lengths, domain, kernel_function)?;
+    gradient_numerators(
+        positions,
+        smoothing_lengths,
+        domain,
+        kernel_function,
+        |center, neighbor| values[neighbor] - values[center],
+    )?
     .into_iter()
     .zip(moments)
     .enumerate()
@@ -1592,6 +2153,7 @@ fn gradient_numerators(
     positions: &[Vector2],
     smoothing_lengths: &[f64],
     domain: Box2d,
+    kernel_function: KernelFunction2d,
     delta: impl Fn(usize, usize) -> Vector2,
 ) -> Result<Vec<Matrix2>, GeometryError> {
     validate_geometry_columns(positions, smoothing_lengths, domain)?;
@@ -1608,7 +2170,7 @@ fn gradient_numerators(
                 continue;
             }
             let displacement = domain.displacement(position, positions[neighbor])?;
-            let weight = cubic_kernel_2d(displacement.norm(), hsml)?.weight;
+            let weight = kernel_2d(kernel_function, displacement.norm(), hsml)?.weight;
             let value_delta = delta(center, neighbor);
             // C uses (x_j-x_i) * (f_j-f_i); displacement is x_i-x_j.
             numerator.xx -= weight * displacement.x * value_delta.x;
@@ -1673,6 +2235,16 @@ pub fn meshless_face_geometry_2d(
     j: MeshlessPoint2d,
     domain: Box2d,
 ) -> Result<MeshlessFace2d, GeometryError> {
+    meshless_face_geometry_with_kernel_2d(i, j, domain, KernelFunction2d::Cubic)
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn meshless_face_geometry_with_kernel_2d(
+    i: MeshlessPoint2d,
+    j: MeshlessPoint2d,
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<MeshlessFace2d, GeometryError> {
     validate_meshless_point("i", i, domain)?;
     validate_meshless_point("j", j, domain)?;
     let displacement = domain.displacement(i.position, j.position)?;
@@ -1684,8 +2256,8 @@ pub fn meshless_face_geometry_2d(
             hsml_j: j.smoothing_length,
         });
     }
-    let kernel_i = cubic_kernel_2d(distance, i.smoothing_length)?;
-    let kernel_j = cubic_kernel_2d(distance, j.smoothing_length)?;
+    let kernel_i = kernel_2d(kernel_function, distance, i.smoothing_length)?;
+    let kernel_j = kernel_2d(kernel_function, distance, j.smoothing_length)?;
     let volume_i = i.mass / i.density;
     let volume_j = j.mass / j.density;
     let relative_volume_jump_per_dimension =
@@ -1760,38 +2332,147 @@ pub fn face_closure_diagnostics_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<FaceClosure2d>, GeometryError> {
+    face_closure_diagnostics_with_kernel_2d(
+        positions,
+        masses,
+        smoothing_lengths,
+        domain,
+        KernelFunction2d::Cubic,
+    )
+}
+
+#[allow(clippy::missing_errors_doc)]
+pub fn face_closure_diagnostics_with_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<FaceClosure2d>, GeometryError> {
     validate_particle_columns(positions, masses, smoothing_lengths, domain)?;
     if positions.is_empty() {
         return Ok(Vec::new());
     }
-    let density = density_at_hsml_2d(positions, masses, smoothing_lengths, domain)?;
-    let moments = inverse_moments_2d(positions, smoothing_lengths, domain)?;
-    let mut diagnostics = vec![FaceClosure2d::default(); positions.len()];
-    for pair in interacting_pairs_2d(positions, smoothing_lengths, domain)? {
+    let density = density_at_hsml_with_kernel_2d(
+        positions,
+        masses,
+        smoothing_lengths,
+        domain,
+        kernel_function,
+    )?;
+    let moments =
+        inverse_moments_with_kernel_2d(positions, smoothing_lengths, domain, kernel_function)?;
+    face_closure_diagnostics_for_targets_with_geometry_and_kernel_2d(
+        positions,
+        masses,
+        smoothing_lengths,
+        domain,
+        &density
+            .iter()
+            .map(|estimate| estimate.density)
+            .collect::<Vec<_>>(),
+        &moments,
+        &vec![true; positions.len()],
+        kernel_function,
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(index, diagnostic)| {
+        diagnostic.ok_or(GeometryError::NonFiniteResult {
+            index,
+            field: "missing all-target face closure",
+            value: f64::NAN,
+        })
+    })
+    .collect()
+}
+
+/// Compute closure only for selected targets using caller-supplied geometry.
+///
+/// `density` and `moments` are full particle columns. Only pairs incident on
+/// at least one target are enumerated, and inactive output entries are
+/// [`None`]. Pair order and target-local accumulation order are identical to
+/// [`face_closure_diagnostics_with_kernel_2d`].
+///
+/// # Errors
+///
+/// Returns an error for invalid or mismatched columns, a target neighborhood
+/// with invalid closure moments, or non-finite face arithmetic.
+#[allow(clippy::too_many_arguments)]
+pub fn face_closure_diagnostics_for_targets_with_geometry_and_kernel_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    density: &[f64],
+    moments: &[InverseMoment2d],
+    targets: &[bool],
+    kernel_function: KernelFunction2d,
+) -> Result<Vec<Option<FaceClosure2d>>, GeometryError> {
+    validate_particle_columns(positions, masses, smoothing_lengths, domain)?;
+    for (field, actual) in [
+        ("density", density.len()),
+        ("inverse_moments", moments.len()),
+        ("targets", targets.len()),
+    ] {
+        if actual != positions.len() {
+            return Err(GeometryError::MismatchedLength {
+                field,
+                expected: positions.len(),
+                actual,
+            });
+        }
+    }
+    let mut diagnostics = vec![None; positions.len()];
+    if positions.is_empty() || !targets.iter().any(|&target| target) {
+        return Ok(diagnostics);
+    }
+    for (index, &is_target) in targets.iter().enumerate() {
+        if is_target {
+            diagnostics[index] = Some(FaceClosure2d::default());
+        }
+    }
+    for pair in interacting_pairs_for_targets_2d(positions, smoothing_lengths, domain, targets)? {
         let point = |index: usize| MeshlessPoint2d {
             position: positions[index],
             mass: masses[index],
-            density: density[index].density,
+            density: density[index],
             smoothing_length: smoothing_lengths[index],
             inverse_moment: moments[index].matrix,
             condition_number: moments[index].condition_number,
         };
-        let face = meshless_face_geometry_2d(point(pair.i), point(pair.j), domain)?;
-        diagnostics[pair.i].net_area_vector += face.area_vector;
-        diagnostics[pair.j].net_area_vector -= face.area_vector;
-        diagnostics[pair.i].summed_face_area += face.area;
-        diagnostics[pair.j].summed_face_area += face.area;
+        let face = meshless_face_geometry_with_kernel_2d(
+            point(pair.i),
+            point(pair.j),
+            domain,
+            kernel_function,
+        )?;
+        if let Some(diagnostic) = &mut diagnostics[pair.i] {
+            diagnostic.net_area_vector += face.area_vector;
+            diagnostic.summed_face_area += face.area;
+        }
+        if let Some(diagnostic) = &mut diagnostics[pair.j] {
+            diagnostic.net_area_vector -= face.area_vector;
+            diagnostic.summed_face_area += face.area;
+        }
     }
 
     let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
     let index = CellList2d::new(positions, domain, maximum_support)?;
     for particle in 0..positions.len() {
+        if !targets[particle] {
+            continue;
+        }
         let mut kernel_sum = 0.0;
         let mut first_moment = Vector2::ZERO;
         let mut second_moment_trace = 0.0;
         for neighbor in index.neighbors_within(positions[particle], smoothing_lengths[particle])? {
             let displacement = domain.displacement(positions[particle], positions[neighbor])?;
-            let kernel = cubic_kernel_2d(displacement.norm(), smoothing_lengths[particle])?;
+            let kernel = kernel_2d(
+                kernel_function,
+                displacement.norm(),
+                smoothing_lengths[particle],
+            )?;
             kernel_sum += kernel.weight;
             if displacement.squared_norm() > 0.0 {
                 first_moment += displacement * kernel.weight;
@@ -1808,10 +2489,17 @@ pub fn face_closure_diagnostics_2d(
         let volume = kernel_sum.recip();
         let characteristic_length = (volume * second_moment_trace).sqrt();
         let one_sided = moments[particle].matrix.mul_vector(first_moment) * (2.0 * volume);
-        diagnostics[particle].legacy_dimensionless_leak =
+        let diagnostic = diagnostics[particle]
+            .as_mut()
+            .ok_or(GeometryError::NonFiniteResult {
+                index: particle,
+                field: "missing target face closure",
+                value: f64::NAN,
+            })?;
+        diagnostic.legacy_dimensionless_leak =
             (one_sided.x.abs() + one_sided.y.abs()) / (8.0 * characteristic_length);
-        diagnostics[particle].relative_net_area = if diagnostics[particle].summed_face_area > 0.0 {
-            diagnostics[particle].net_area_vector.norm() / diagnostics[particle].summed_face_area
+        diagnostic.relative_net_area = if diagnostic.summed_face_area > 0.0 {
+            diagnostic.net_area_vector.norm() / diagnostic.summed_face_area
         } else {
             0.0
         };
@@ -2023,6 +2711,10 @@ pub enum GeometryError {
         desired: f64,
         tolerance: f64,
     },
+    DegenerateTreeDomain {
+        minimum: Vector2,
+        maximum: Vector2,
+    },
     SmoothingLengthDidNotConverge {
         index: usize,
         lower: Option<f64>,
@@ -2089,6 +2781,10 @@ impl fmt::Display for GeometryError {
             Self::InvalidNeighborConstraint { desired, tolerance } => write!(
                 formatter,
                 "invalid 2-D neighbor constraint desired={desired}, tolerance={tolerance}"
+            ),
+            Self::DegenerateTreeDomain { minimum, maximum } => write!(
+                formatter,
+                "degenerate 2-D tree domain from {minimum:?} to {maximum:?}"
             ),
             Self::SmoothingLengthDidNotConverge {
                 index,
@@ -2169,6 +2865,172 @@ mod tests {
         }
         assert!((integral - 1.0).abs() < 2.0e-10, "{integral}");
         assert!(cubic_kernel_2d(hsml, hsml).unwrap().weight.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quintic_kernel_matches_public_c_piecewise_values() {
+        let hsml = 2.0;
+        for (u, shape, derivative_shape) in [
+            (0.0, 0.368, 0.0),
+            (0.2, 0.2816, -0.768),
+            (0.6, 0.0256, -0.256),
+            (0.8, 0.0016, -0.032),
+            (1.0, 0.0, 0.0),
+        ] {
+            let value = quintic_kernel_2d(u * hsml, hsml).unwrap();
+            let recovered_shape = value.weight * hsml * hsml / QUINTIC_2D_NORMALIZATION;
+            let recovered_derivative =
+                value.radial_derivative * hsml * hsml * hsml / QUINTIC_2D_NORMALIZATION;
+            assert!((recovered_shape - shape).abs() < 2.0e-15, "u={u}");
+            assert!(
+                (recovered_derivative - derivative_shape).abs() < 3.0e-15,
+                "u={u}"
+            );
+        }
+    }
+
+    #[test]
+    fn quintic_kernel_has_exact_2d_normalization() {
+        let hsml = 2.7;
+        let bins = 200_000;
+        let dr = hsml / f64::from(bins);
+        let mut integral = 0.0;
+        for bin in 0..bins {
+            let radius = (f64::from(bin) + 0.5) * dr;
+            integral += 2.0 * PI * radius * quintic_kernel_2d(radius, hsml).unwrap().weight * dr;
+        }
+        assert!((integral - 1.0).abs() < 2.0e-10, "{integral}");
+    }
+
+    #[test]
+    fn cubic_dispatch_is_bitwise_identical_to_legacy_entrypoint() {
+        for (radius, hsml) in [(0.0, 0.4), (0.1, 0.4), (0.2, 0.4), (0.39, 0.4), (0.4, 0.4)] {
+            let legacy = cubic_kernel_2d(radius, hsml).unwrap();
+            let selected = kernel_2d(KernelFunction2d::Cubic, radius, hsml).unwrap();
+            assert_eq!(legacy.weight.to_bits(), selected.weight.to_bits());
+            assert_eq!(
+                legacy.radial_derivative.to_bits(),
+                selected.radial_derivative.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn public_c_2d_tree_seed_matches_root_node_formula() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let positions = [
+            Vector2::new(0.25, 0.25),
+            Vector2::new(0.75, 0.25),
+            Vector2::new(0.25, 0.75),
+            Vector2::new(0.75, 0.75),
+        ];
+        let seeds =
+            public_c_tree_smoothing_length_seeds_2d(&positions, &[1.0; 4], domain, 2.0).unwrap();
+        let expected = (2.0 / (4.0 * PI)).sqrt() * (1.001 * 0.5);
+        for seed in seeds {
+            assert_eq!(seed.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn public_c_2d_tree_extent_does_not_minimum_image_periodic_seam() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let positions = [Vector2::new(0.01, 0.5), Vector2::new(0.99, 0.5)];
+        let seeds =
+            public_c_tree_smoothing_length_seeds_2d(&positions, &[1.0; 2], domain, 1.0).unwrap();
+        let expected = (1.0 / (2.0 * PI)).sqrt() * (1.001 * 0.98);
+        assert_eq!(seeds[0].to_bits(), expected.to_bits());
+        assert_eq!(seeds[1].to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn public_c_2d_tree_seeds_are_particle_order_invariant() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let positions = [
+            Vector2::new(0.07, 0.11),
+            Vector2::new(0.19, 0.83),
+            Vector2::new(0.31, 0.29),
+            Vector2::new(0.44, 0.67),
+            Vector2::new(0.58, 0.41),
+            Vector2::new(0.69, 0.93),
+            Vector2::new(0.83, 0.17),
+            Vector2::new(0.94, 0.55),
+        ];
+        let masses = [0.8, 1.1, 0.9, 1.2, 0.7, 1.3, 1.05, 0.95];
+        let expected =
+            public_c_tree_smoothing_length_seeds_2d(&positions, &masses, domain, 2.0).unwrap();
+        let permutation = [5, 1, 7, 3, 0, 6, 2, 4];
+        let permuted_positions: Vec<_> =
+            permutation.iter().map(|&index| positions[index]).collect();
+        let permuted_masses: Vec<_> = permutation.iter().map(|&index| masses[index]).collect();
+        let permuted = public_c_tree_smoothing_length_seeds_2d(
+            &permuted_positions,
+            &permuted_masses,
+            domain,
+            2.0,
+        )
+        .unwrap();
+        for (permuted_index, &original_index) in permutation.iter().enumerate() {
+            assert_eq!(
+                permuted[permuted_index].to_bits(),
+                expected[original_index].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn public_c_2d_tree_seed_rejects_degenerate_extent() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        assert!(matches!(
+            public_c_tree_smoothing_length_seeds_2d(
+                &[Vector2::new(0.5, 0.5); 2],
+                &[1.0; 2],
+                domain,
+                4.0,
+            ),
+            Err(GeometryError::DegenerateTreeDomain {
+                minimum: Vector2 { x: 0.5, y: 0.5 },
+                maximum: Vector2 { x: 0.5, y: 0.5 },
+            })
+        ));
+    }
+
+    #[test]
+    fn public_c_2d_initial_wrapper_runs_three_quintic_density_passes() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let (positions, masses, _) = square_lattice(16, domain);
+        let desired = 20.0;
+        let tolerance = 0.05;
+        let wrapped = solve_public_c_initial_smoothing_lengths_with_kernel_2d(
+            &positions,
+            &masses,
+            domain,
+            desired,
+            tolerance,
+            KernelFunction2d::Quintic,
+        )
+        .unwrap();
+
+        let mut seeds =
+            public_c_tree_smoothing_length_seeds_2d(&positions, &masses, domain, desired).unwrap();
+        let mut manual = Vec::new();
+        for _ in 0..3 {
+            manual = solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d(
+                &positions,
+                &masses,
+                &seeds,
+                domain,
+                desired,
+                tolerance,
+                KernelFunction2d::Quintic,
+            )
+            .unwrap();
+            seeds = manual
+                .iter()
+                .map(|particle| particle.smoothing_length)
+                .collect();
+        }
+        assert_eq!(wrapped, manual);
     }
 
     #[test]
@@ -2507,6 +3369,74 @@ mod tests {
                 selected_closure[index],
                 is_target.then_some(diagnostics[index].legacy_dimensionless_leak)
             );
+        }
+    }
+
+    #[test]
+    fn target_face_closure_with_cached_geometry_is_bitwise_full_parity() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let (mut positions, masses, mut hsml) = square_lattice(9, domain);
+        positions[7].x += 0.013;
+        positions[38].y -= 0.009;
+        hsml[4] *= 1.3;
+        hsml[63] *= 0.8;
+
+        let masks = [
+            vec![false; positions.len()],
+            (0..positions.len()).map(|index| index == 37).collect(),
+            (0..positions.len()).map(|index| index % 17 == 3).collect(),
+            vec![true; positions.len()],
+        ];
+        for kernel_function in [KernelFunction2d::Cubic, KernelFunction2d::Quintic] {
+            let density =
+                density_at_hsml_with_kernel_2d(&positions, &masses, &hsml, domain, kernel_function)
+                    .unwrap()
+                    .into_iter()
+                    .map(|estimate| estimate.density)
+                    .collect::<Vec<_>>();
+            let moments =
+                inverse_moments_with_kernel_2d(&positions, &hsml, domain, kernel_function).unwrap();
+            let full = face_closure_diagnostics_with_kernel_2d(
+                &positions,
+                &masses,
+                &hsml,
+                domain,
+                kernel_function,
+            )
+            .unwrap();
+            for targets in &masks {
+                let selected = face_closure_diagnostics_for_targets_with_geometry_and_kernel_2d(
+                    &positions,
+                    &masses,
+                    &hsml,
+                    domain,
+                    &density,
+                    &moments,
+                    targets,
+                    kernel_function,
+                )
+                .unwrap();
+                for (index, &is_target) in targets.iter().enumerate() {
+                    let Some(actual) = selected[index] else {
+                        assert!(!is_target);
+                        continue;
+                    };
+                    assert!(is_target);
+                    let expected = full[index];
+                    for (actual, expected) in [
+                        (actual.net_area_vector.x, expected.net_area_vector.x),
+                        (actual.net_area_vector.y, expected.net_area_vector.y),
+                        (actual.summed_face_area, expected.summed_face_area),
+                        (actual.relative_net_area, expected.relative_net_area),
+                        (
+                            actual.legacy_dimensionless_leak,
+                            expected.legacy_dimensionless_leak,
+                        ),
+                    ] {
+                        assert_eq!(actual.to_bits(), expected.to_bits());
+                    }
+                }
+            }
         }
     }
 

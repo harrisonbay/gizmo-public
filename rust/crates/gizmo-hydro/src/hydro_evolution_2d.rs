@@ -10,13 +10,16 @@ use std::fmt;
 
 use crate::individual_timeline::{IndividualParticleTimeline, IndividualTimelineError};
 use crate::meshless_2d::{
-    Box2d, FaceClosure2d, GeometryError, InteractionPair2d, InverseMoment2d, MeshlessFace2d,
-    MeshlessPoint2d, Vector2, cubic_kernel_2d, density_at_hsml_2d, face_closure_diagnostics_2d,
-    interacting_pairs_2d, interacting_pairs_for_targets_2d, inverse_moments_2d,
-    meshless_face_geometry_2d, particle_divergence_at_hsml_2d,
-    particle_divergence_at_hsml_for_targets_2d, scalar_gradients_batch_with_moments_2d,
-    solve_public_c_smoothing_lengths_from_seeds_2d,
-    solve_public_c_smoothing_lengths_from_seeds_for_targets_2d,
+    Box2d, FaceClosure2d, GeometryError, InteractionPair2d, InverseMoment2d, KernelFunction2d,
+    MeshlessFace2d, MeshlessPoint2d, Vector2, density_at_hsml_with_kernel_2d,
+    face_closure_diagnostics_for_targets_with_geometry_and_kernel_2d,
+    face_closure_diagnostics_with_kernel_2d, interacting_pairs_2d,
+    interacting_pairs_for_targets_2d, inverse_moments_with_kernel_2d, kernel_2d,
+    meshless_face_geometry_with_kernel_2d, particle_divergence_at_hsml_for_targets_with_kernel_2d,
+    particle_divergence_at_hsml_with_kernel_2d, scalar_gradients_batch_with_moments_and_kernel_2d,
+    scalar_gradients_batch_with_moments_for_targets_and_kernel_2d,
+    solve_public_c_smoothing_lengths_from_seeds_for_targets_with_kernel_2d,
+    solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d,
 };
 use crate::mhd::Vector3;
 use crate::{
@@ -61,6 +64,7 @@ pub struct HydroMfmState2d {
     pub smoothing_lengths: Vec<f64>,
     pub domain: Box2d,
     pub gamma: f64,
+    pub kernel: KernelFunction2d,
 }
 
 /// Density-loop primitive fields recovered from [`HydroMfmState2d`].
@@ -256,6 +260,34 @@ impl HydroMfmState2d {
         domain: Box2d,
         gamma: f64,
     ) -> Result<Self, HydroEvolution2dError> {
+        Self::from_primitive_with_kernel(
+            positions,
+            masses,
+            velocities,
+            specific_internal_energy,
+            smoothing_lengths,
+            domain,
+            gamma,
+            KernelFunction2d::Cubic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Construct a state with an explicit public-C kernel selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::validate`].
+    pub fn from_primitive_with_kernel(
+        positions: Vec<Vector2>,
+        masses: Vec<f64>,
+        velocities: Vec<Vector3>,
+        specific_internal_energy: Vec<f64>,
+        smoothing_lengths: Vec<f64>,
+        domain: Box2d,
+        gamma: f64,
+        kernel: KernelFunction2d,
+    ) -> Result<Self, HydroEvolution2dError> {
         let state = Self {
             positions,
             masses,
@@ -264,6 +296,7 @@ impl HydroMfmState2d {
             smoothing_lengths,
             domain,
             gamma,
+            kernel,
         };
         state.validate()?;
         Ok(state)
@@ -324,11 +357,12 @@ impl HydroMfmState2d {
     /// Returns an error if the state or density geometry is invalid.
     pub fn primitive_columns(&self) -> Result<HydroPrimitiveColumns2d, HydroEvolution2dError> {
         self.validate()?;
-        let estimates = density_at_hsml_2d(
+        let estimates = crate::meshless_2d::density_at_hsml_with_kernel_2d(
             &self.positions,
             &self.masses,
             &self.smoothing_lengths,
             self.domain,
+            self.kernel,
         )?;
         let density: Vec<_> = estimates.iter().map(|value| value.density).collect();
         let dhsml_factor = estimates.iter().map(|value| value.dhsml_factor).collect();
@@ -460,7 +494,9 @@ pub fn public_hydro_particle_timestep_bounds_from_primitive_2d(
     for i in 0..state.positions.len() {
         let acceleration = rates.acceleration[i].squared_norm().sqrt().max(1.0e-30);
         let acceleration_bound =
-            (integration_accuracy * state.smoothing_lengths[i] / acceleration).sqrt();
+            (2.0 * integration_accuracy * state.kernel.core_size() * state.smoothing_lengths[i]
+                / acceleration)
+                .sqrt();
         let effective_neighbor_root =
             (std::f64::consts::PI * state.smoothing_lengths[i].powi(2) * primitive.density[i]
                 / state.masses[i])
@@ -856,12 +892,18 @@ pub fn hydro_mfm_spatial_rates_2d(
 ) -> Result<HydroMfmRates2d, HydroEvolution2dError> {
     state.validate()?;
     let primitive = state.primitive_columns()?;
-    let moments = inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
-    let closure = face_closure_diagnostics_2d(
+    let moments = inverse_moments_with_kernel_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        state.kernel,
+    )?;
+    let closure = face_closure_diagnostics_with_kernel_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.domain,
+        state.kernel,
     )?;
     let gradients = primitive_gradients(state, &primitive, &moments)?;
     let planar_velocities = state
@@ -869,12 +911,13 @@ pub fn hydro_mfm_spatial_rates_2d(
         .iter()
         .map(|value| Vector2::new(value.x, value.y))
         .collect::<Vec<_>>();
-    let velocity_divergence = particle_divergence_at_hsml_2d(
+    let velocity_divergence = particle_divergence_at_hsml_with_kernel_2d(
         &state.positions,
         &planar_velocities,
         &state.smoothing_lengths,
         &primitive.dhsml_factor,
         state.domain,
+        state.kernel,
     )?;
     let count = state.positions.len();
     let mut momentum = vec![Vector3::ZERO; count];
@@ -894,7 +937,12 @@ pub fn hydro_mfm_spatial_rates_2d(
             inverse_moment: moments[i].matrix,
             condition_number: moments[i].condition_number,
         };
-        let face = meshless_face_geometry_2d(point(pair.i), point(pair.j), state.domain)?;
+        let face = meshless_face_geometry_with_kernel_2d(
+            point(pair.i),
+            point(pair.j),
+            state.domain,
+            state.kernel,
+        )?;
         let flux = solve_pair_with_retries(
             state, &primitive, &gradients, &closure, pair.i, pair.j, face,
         )?;
@@ -977,12 +1025,18 @@ pub fn hydro_mfm_directed_spatial_rates_2d(
     state.validate()?;
     let count = state.positions.len();
     let primitive = state.primitive_columns()?;
-    let moments = inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
-    let closure = face_closure_diagnostics_2d(
+    let moments = inverse_moments_with_kernel_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        state.kernel,
+    )?;
+    let closure = face_closure_diagnostics_with_kernel_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.domain,
+        state.kernel,
     )?;
     let gradients = primitive_gradients(state, &primitive, &moments)?;
     let retained = HydroMfmRates2d {
@@ -1090,13 +1144,14 @@ fn advance_hydro_kdk_impl_2d(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let smoothing_lengths = if let Some((desired, tolerance)) = adaptive_h {
-        solve_public_c_smoothing_lengths_from_seeds_2d(
+        solve_public_c_smoothing_lengths_from_seeds_with_kernel_2d(
             &positions,
             &state.masses,
             &state.smoothing_lengths,
             state.domain,
             desired,
             tolerance,
+            state.kernel,
         )?
         .into_iter()
         .map(|estimate| estimate.smoothing_length)
@@ -1110,6 +1165,7 @@ fn advance_hydro_kdk_impl_2d(
         smoothing_lengths,
         state.domain,
         state.gamma,
+        state.kernel,
         &half_momentum,
         &half_energy,
         minimum_specific_internal_energy,
@@ -1123,6 +1179,7 @@ fn advance_hydro_kdk_impl_2d(
         half_state.smoothing_lengths,
         half_state.domain,
         half_state.gamma,
+        half_state.kernel,
         &final_momentum,
         &final_energy,
         minimum_specific_internal_energy,
@@ -1189,14 +1246,19 @@ pub fn begin_public_hydro_initial_hierarchy_2d(
         }
     }
     let primitive_cache = state.primitive_columns()?;
-    let moment_cache =
-        inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
+    let moment_cache = inverse_moments_with_kernel_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        state.kernel,
+    )?;
     let gradient_cache = primitive_gradients(state, &primitive_cache, &moment_cache)?;
-    let face_closure_cache = face_closure_diagnostics_2d(
+    let face_closure_cache = face_closure_diagnostics_with_kernel_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.domain,
+        state.kernel,
     )?;
     let mut actual_velocities = Vec::with_capacity(state.positions.len());
     let mut actual_internal_energy = Vec::with_capacity(state.positions.len());
@@ -1465,6 +1527,7 @@ impl PublicHydroInitialHierarchy2d {
             smoothing_lengths: self.drift.predicted_smoothing_lengths.clone(),
             domain: self.start.domain,
             gamma: self.start.gamma,
+            kernel: self.start.kernel,
         };
         state.validate()?;
         Ok(state)
@@ -1501,6 +1564,9 @@ impl PublicHydroInitialHierarchy2d {
         &self,
         active: &[bool],
     ) -> Result<Vec<bool>, HydroEvolution2dError> {
+        if active.iter().all(|&is_active| is_active) {
+            return Ok(active.to_vec());
+        }
         let state = self.projected_search_state_at_current()?;
         let pairs = interacting_pairs_for_targets_2d(
             &state.positions,
@@ -1683,6 +1749,7 @@ impl PublicHydroInitialHierarchy2d {
             smoothing_lengths: self.drift.predicted_smoothing_lengths.clone(),
             domain: self.start.domain,
             gamma: self.start.gamma,
+            kernel: self.start.kernel,
         };
         state.validate()?;
         self.old_rates = endpoint.rates.clone();
@@ -1922,7 +1989,7 @@ fn refresh_hydro_active_target_caches_2d(
             ("face_closure", closure.len()),
         ],
     )?;
-    let solved = solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+    let solved = solve_public_c_smoothing_lengths_from_seeds_for_targets_with_kernel_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
@@ -1930,6 +1997,7 @@ fn refresh_hydro_active_target_caches_2d(
         desired_neighbors,
         neighbor_tolerance,
         active,
+        state.kernel,
     )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
@@ -1944,34 +2012,45 @@ fn refresh_hydro_active_target_caches_2d(
     }
     // The dense geometry calls are deterministic references; only active cache
     // slots are committed, preserving inactive retained values bitwise.
-    let fresh_moments =
-        inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
+    let fresh_moments = inverse_moments_with_kernel_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        state.kernel,
+    )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
             moments[i] = fresh_moments[i];
         }
     }
-    let fresh_closure = face_closure_diagnostics_2d(
+    let fresh_density = density_at_hsml_with_kernel_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.domain,
+        state.kernel,
+    )?;
+    let density = fresh_density
+        .iter()
+        .map(|estimate| estimate.density)
+        .collect::<Vec<_>>();
+    let fresh_closure = face_closure_diagnostics_for_targets_with_geometry_and_kernel_2d(
+        &state.positions,
+        &state.masses,
+        &state.smoothing_lengths,
+        state.domain,
+        &density,
+        &fresh_moments,
+        active,
+        state.kernel,
     )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
-            closure[i] = fresh_closure[i];
+            closure[i] = fresh_closure[i]
+                .ok_or_else(|| invalid(Some(i), "missing active face closure", f64::NAN))?;
         }
     }
-    let fresh_gradients = primitive_gradients(state, primitive, moments)?;
-    for (i, &is_active) in active.iter().enumerate() {
-        if is_active {
-            gradients.density[i] = fresh_gradients.density[i];
-            gradients.pressure[i] = fresh_gradients.pressure[i];
-            gradients.velocity_x[i] = fresh_gradients.velocity_x[i];
-            gradients.velocity_y[i] = fresh_gradients.velocity_y[i];
-            gradients.velocity_z[i] = fresh_gradients.velocity_z[i];
-        }
-    }
+    refresh_primitive_gradients_for_targets(state, primitive, moments, gradients, active)?;
     Ok(())
 }
 
@@ -2008,7 +2087,12 @@ fn evaluate_active_hydro_target_batch_2d(
                 inverse_moment: moments[i].matrix,
                 condition_number: moments[i].condition_number,
             };
-            let face = meshless_face_geometry_2d(point(target), point(neighbor), state.domain)?;
+            let face = meshless_face_geometry_with_kernel_2d(
+                point(target),
+                point(neighbor),
+                state.domain,
+                state.kernel,
+            )?;
             let flux = solve_pair_with_retries(
                 state, primitive, gradients, closure, target, neighbor, face,
             )?;
@@ -2181,13 +2265,14 @@ fn hydro_mfm_active_target_rates_with_cache_2d(
         .iter()
         .map(|value| Vector2::new(value.x, value.y))
         .collect::<Vec<_>>();
-    let divergence = particle_divergence_at_hsml_for_targets_2d(
+    let divergence = particle_divergence_at_hsml_for_targets_with_kernel_2d(
         &state.positions,
         &planar,
         &state.smoothing_lengths,
         &primitive.dhsml_factor,
         state.domain,
         active,
+        state.kernel,
     )?;
     let mut updated = retained.clone();
     for (i, &is_active) in active.iter().enumerate() {
@@ -2323,8 +2408,8 @@ fn apply_entropic_pdv_energy_2d(
     let distance = displacement.norm();
     let radial = displacement / distance;
     let relative_radial_velocity = planar_dot(state.velocities[i] - state.velocities[j], radial);
-    let kernel_i = cubic_kernel_2d(distance, state.smoothing_lengths[i])?;
-    let kernel_j = cubic_kernel_2d(distance, state.smoothing_lengths[j])?;
+    let kernel_i = kernel_2d(state.kernel, distance, state.smoothing_lengths[i])?;
+    let kernel_j = kernel_2d(state.kernel, distance, state.smoothing_lengths[j])?;
     let volume_i = state.masses[i] / primitive.density[i];
     let volume_j = state.masses[j] / primitive.density[j];
     let pressure_area = flux.star_pressure * face.area;
@@ -2418,12 +2503,13 @@ fn primitive_gradients(
         &velocity_y,
         &velocity_z,
     ];
-    let raw = scalar_gradients_batch_with_moments_2d(
+    let raw = scalar_gradients_batch_with_moments_and_kernel_2d(
         &state.positions,
         &fields,
         &state.smoothing_lengths,
         state.domain,
         moments,
+        state.kernel,
     )?;
     let pairs = interacting_pairs_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
     let mut maximum_distance = vec![0.0_f64; state.positions.len()];
@@ -2451,6 +2537,126 @@ fn primitive_gradients(
         velocity_y: limit(&velocity_y, raw[3].clone(), false, 0.1),
         velocity_z: limit(&velocity_z, raw[4].clone(), false, 0.1),
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn refresh_primitive_gradients_for_targets(
+    state: &HydroMfmState2d,
+    primitive: &HydroPrimitiveColumns2d,
+    moments: &[InverseMoment2d],
+    retained: &mut PrimitiveGradients2d,
+    targets: &[bool],
+) -> Result<(), HydroEvolution2dError> {
+    let velocity_x = state
+        .velocities
+        .iter()
+        .map(|value| value.x)
+        .collect::<Vec<_>>();
+    let velocity_y = state
+        .velocities
+        .iter()
+        .map(|value| value.y)
+        .collect::<Vec<_>>();
+    let velocity_z = state
+        .velocities
+        .iter()
+        .map(|value| value.z)
+        .collect::<Vec<_>>();
+    let fields: [&[f64]; 5] = [
+        &primitive.density,
+        &primitive.pressure,
+        &velocity_x,
+        &velocity_y,
+        &velocity_z,
+    ];
+    let raw = scalar_gradients_batch_with_moments_for_targets_and_kernel_2d(
+        &state.positions,
+        &fields,
+        &state.smoothing_lengths,
+        state.domain,
+        moments,
+        targets,
+        state.kernel,
+    )?;
+    let pairs = interacting_pairs_for_targets_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        targets,
+    )?;
+    let count = state.positions.len();
+    let mut maximum_distance = vec![0.0_f64; count];
+    let mut minima = vec![vec![0.0_f64; count]; fields.len()];
+    let mut maxima = vec![vec![0.0_f64; count]; fields.len()];
+    for pair in &pairs {
+        if targets[pair.i] {
+            maximum_distance[pair.i] = maximum_distance[pair.i].max(pair.distance);
+        }
+        if targets[pair.j] {
+            maximum_distance[pair.j] = maximum_distance[pair.j].max(pair.distance);
+        }
+        for (field_index, values) in fields.iter().enumerate() {
+            let delta = values[pair.j] - values[pair.i];
+            if targets[pair.i] {
+                minima[field_index][pair.i] = minima[field_index][pair.i].min(delta);
+                maxima[field_index][pair.i] = maxima[field_index][pair.i].max(delta);
+            }
+            if targets[pair.j] {
+                minima[field_index][pair.j] = minima[field_index][pair.j].min(-delta);
+                maxima[field_index][pair.j] = maxima[field_index][pair.j].max(-delta);
+            }
+        }
+    }
+    let policies = [
+        (true, 0.0_f64),
+        (true, 0.1),
+        (false, 0.1),
+        (false, 0.1),
+        (false, 0.1),
+    ];
+    let mut limited = vec![vec![Vector2::ZERO; count]; fields.len()];
+    for (field_index, values) in fields.iter().enumerate() {
+        for (i, &is_target) in targets.iter().enumerate() {
+            if !is_target {
+                continue;
+            }
+            let gradient = raw[field_index][i]
+                .ok_or_else(|| invalid(Some(i), "missing active primitive gradient", f64::NAN))?;
+            let distance_fraction = if moments[i].condition_number > 100.0 {
+                (LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION
+                    + 0.25 * (moments[i].condition_number - 100.0) / 100.0)
+                    .min(0.5)
+            } else {
+                LOCAL_GRADIENT_LIMITER_DISTANCE_FRACTION
+            };
+            let limiting_length = state.smoothing_lengths[i].max(maximum_distance[i]);
+            limited[field_index][i] = local_slope_limiter(
+                gradient,
+                maxima[field_index][i],
+                minima[field_index][i],
+                distance_fraction,
+                limiting_length,
+                policies[field_index].0,
+                values[i],
+                policies[field_index].1,
+            );
+        }
+    }
+    let columns = [
+        &mut retained.density,
+        &mut retained.pressure,
+        &mut retained.velocity_x,
+        &mut retained.velocity_y,
+        &mut retained.velocity_z,
+    ];
+    for (field_index, column) in columns.into_iter().enumerate() {
+        for (i, &is_target) in targets.iter().enumerate() {
+            if is_target {
+                column[i] = limited[field_index][i];
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2778,6 +2984,7 @@ fn recover_state(
     smoothing_lengths: Vec<f64>,
     domain: Box2d,
     gamma: f64,
+    kernel: KernelFunction2d,
     momentum: &[Vector3],
     total_energy: &[f64],
     minimum_specific_internal_energy: f64,
@@ -2808,6 +3015,7 @@ fn recover_state(
         smoothing_lengths,
         domain,
         gamma,
+        kernel,
     };
     state.validate()?;
     Ok(state)
@@ -2885,6 +3093,9 @@ fn invalid(index: Option<usize>, field: &'static str, value: f64) -> HydroEvolut
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meshless_2d::{
+        face_closure_diagnostics_2d, inverse_moments_2d, meshless_face_geometry_2d,
+    };
 
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
         assert!(
@@ -2941,7 +3152,103 @@ mod tests {
             smoothing_lengths: vec![0.32; count],
             domain,
             gamma: 1.4,
+            kernel: KernelFunction2d::Cubic,
         }
+    }
+
+    #[test]
+    fn hydro_state_preserves_and_applies_selected_kernel() {
+        let cubic = lattice_state(6, Vector3::ZERO);
+        let mut quintic = cubic.clone();
+        quintic.kernel = KernelFunction2d::Quintic;
+        let cubic_density = cubic.primitive_columns().unwrap().density;
+        let quintic_density = quintic.primitive_columns().unwrap().density;
+        assert_eq!(cubic.kernel, KernelFunction2d::Cubic);
+        assert_eq!(quintic.kernel, KernelFunction2d::Quintic);
+        assert!(
+            cubic_density
+                .iter()
+                .zip(quintic_density)
+                .any(|(&left, right)| left.to_bits() != right.to_bits())
+        );
+    }
+
+    #[test]
+    fn targeted_primitive_gradient_refresh_matches_full_active_entries_bitwise() {
+        let state = lattice_state(8, Vector3::new(0.2, -0.1, 0.05));
+        let primitive = state.primitive_columns().unwrap();
+        let moments = inverse_moments_with_kernel_2d(
+            &state.positions,
+            &state.smoothing_lengths,
+            state.domain,
+            state.kernel,
+        )
+        .unwrap();
+        let full = primitive_gradients(&state, &primitive, &moments).unwrap();
+        let mut selected = PrimitiveGradients2d {
+            density: vec![Vector2::ZERO; state.positions.len()],
+            pressure: vec![Vector2::ZERO; state.positions.len()],
+            velocity_x: vec![Vector2::ZERO; state.positions.len()],
+            velocity_y: vec![Vector2::ZERO; state.positions.len()],
+            velocity_z: vec![Vector2::ZERO; state.positions.len()],
+        };
+        let targets = (0..state.positions.len())
+            .map(|index| index % 11 == 0)
+            .collect::<Vec<_>>();
+        refresh_primitive_gradients_for_targets(
+            &state,
+            &primitive,
+            &moments,
+            &mut selected,
+            &targets,
+        )
+        .unwrap();
+        for (i, &is_target) in targets.iter().enumerate() {
+            for (actual, expected) in [
+                (selected.density[i], full.density[i]),
+                (selected.pressure[i], full.pressure[i]),
+                (selected.velocity_x[i], full.velocity_x[i]),
+                (selected.velocity_y[i], full.velocity_y[i]),
+                (selected.velocity_z[i], full.velocity_z[i]),
+            ] {
+                if is_target {
+                    assert_eq!(actual, expected);
+                } else {
+                    assert_eq!(actual, Vector2::ZERO);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acceleration_timestep_uses_the_selected_public_kernel_core_size() {
+        let cubic = lattice_state(6, Vector3::ZERO);
+        let mut quintic = cubic.clone();
+        quintic.kernel = KernelFunction2d::Quintic;
+        let mut rates = hydro_mfm_directed_spatial_rates_2d(&cubic).unwrap();
+        rates.acceleration.fill(Vector3::new(3.0, 4.0, 0.0));
+        let integration_accuracy = 0.01;
+
+        let cubic_bound =
+            public_hydro_particle_timestep_bounds_2d(&cubic, &rates, 0.1, integration_accuracy)
+                .unwrap()[0]
+                .acceleration;
+        let quintic_bound =
+            public_hydro_particle_timestep_bounds_2d(&quintic, &rates, 0.1, integration_accuracy)
+                .unwrap()[0]
+                .acceleration;
+
+        assert_close(
+            cubic_bound,
+            (2.0 * integration_accuracy * 0.5 * 0.32 / 5.0).sqrt(),
+            1.0e-15,
+        );
+        assert_close(
+            quintic_bound,
+            (2.0 * integration_accuracy * (1.0 / 3.0) * 0.32 / 5.0).sqrt(),
+            1.0e-15,
+        );
+        assert_close(quintic_bound / cubic_bound, (2.0_f64 / 3.0).sqrt(), 1.0e-15);
     }
 
     #[test]

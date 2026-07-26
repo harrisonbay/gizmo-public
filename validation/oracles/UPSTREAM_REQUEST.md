@@ -87,6 +87,13 @@ non-`DEVELOPER_MODE` public profile, `ErrTolIntAccuracy`, `CourantFac`, and
 `MaxRMSDisplacementFac` in `gresho.params` are not consumed, so the intended
 effective defaults should be stated explicitly.
 
+For `kh_mcnally_2d`, please provide the GIZMO-specific analyzer, acceptance
+thresholds, reproducible reduced trajectory, exact build provenance, and IC
+generator. The benchmark authors' independent curves stop at `t=1.5`, while
+the public GIZMO parameter file runs to `t=10`. A copy/paste request naming the
+exact artifacts and hosted fixture checksum is in
+`kh_mcnally/UPSTREAM_REQUEST.md`.
+
 For `brio-wu` and `toth`, please provide the machine-readable exact/reference
 curves used in the published plots; no corresponding tables are present in the
 hosted directory. The newer Brio-Wu harness checks only terminal time, finite

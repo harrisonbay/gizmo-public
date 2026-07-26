@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "kh_mcnally_2d_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/kh_mcnally_2d_ics.hdf5",
+      "sha256": "55d2a579f8e1710b65feacf1941a65f465b76742037e943e229c1c5ccb215777",
+      "size_bytes": 2948736
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/kh_mcnally_2d.params",
+      "sha256": "21780fc538046c3fa02b357128be698479afb428e8a55f7f73998f2af33a8441",
+      "size_bytes": 2186
+    },
+    {
+      "name": "khmode_rev0.txt",
+      "url": "https://www.colinmcnally.ca/khcomp/khmode_rev0.txt",
+      "sha256": "ce9f36369d5f0178b976e12abb0eb99c95fcd37b01f41bbd77379d13d0fcb340",
+      "size_bytes": 5989
+    },
+    {
+      "name": "khener_rev1.txt",
+      "url": "https://www.colinmcnally.ca/khcomp/khener_rev1.txt",
+      "sha256": "7db4537eec7bcfd703662c014e6556b9105217574fc10fa02a1da4b785407113",
+      "size_bytes": 4048
+    }
+  ]
+}
