@@ -1,25 +1,34 @@
 # GIZMO Rust port
 
 This workspace is the correctness-oriented Rust replacement for GIZMO. It
-currently ports the sound-wave initialization, gradient, and face path: strict
+currently ports the one-dimensional MFM sound-wave path: strict
 configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
 geometry, pairwise primitive reconstruction, and the ideal-gas one-dimensional
 MFM HLLC/KT/exact Riemann flux, including conservative pair orientation and
 lab-frame deboost, face-closure fallback, and the low-contact-speed
-entropic/PdV energy correction. It does not update particle states or evolve a
-simulation yet.
+entropic/PdV energy correction. The strict restart-0 CLI evolves that profile
+with synchronized KDK stepping and writes checked, upstream-compatible HDF5
+snapshots. Other physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
 ```
 
+The complete 65,536-step corrected-C differential is intentionally separate
+from the fast initialization check:
+
+```console
+validation/oracles/run_rust_soundwave_long.sh
+```
+
 Initialization-only mode validates the sound-wave profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive
 `Hsml`, reconstructs density, velocity, and pressure gradients, validates
-one-dimensional face areas, and prints a deterministic JSON summary. Normal
-invocations still exit with an explicit `not yet ported` error before evolution.
+one-dimensional face areas, and prints a deterministic JSON summary. A normal
+restart-0 invocation evolves the same checked state through `TimeMax` and writes
+the configured snapshot sequence.
 
 Crates are layered so that scientific code does not depend on command-line or
 configuration parsing:
@@ -31,12 +40,13 @@ configuration parsing:
 - `gizmo-audit`: finding and provenance records used by correctness tooling.
 - `gizmo-params`: strict typed parsing for the legacy runtime parameters used
   by the first vertical slice.
-- `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment.
+- `gizmo-io`: checked HDF5 sound-wave input with particle-ID alignment and
+  upstream-compatible snapshot output.
 - `gizmo-hydro`: one-dimensional kernel, density, adaptive `Hsml` solve, and
   slope-limited moving-least-squares gradients, MFM faces, and primitive
   reconstruction, plus corrected ideal-gas MFM HLLC/KT/exact, pair, and
   entropic/PdV fluxes.
-- `gizmo-cli`: the compatibility command-line boundary.
+- `gizmo-cli`: the strict initialization/evolution compatibility boundary.
 
 The public sound-wave fixture is byte-pinned outside the Rust workspace. From
 the repository root, run the pinned-data initialization oracle with:
@@ -46,11 +56,14 @@ validation/oracles/run_rust_soundwave_init.sh
 ```
 
 On the pinned fixture, the Rust density sum differs from the stored density by
-at most `1.58e-12` relative. The fixture's producer commit is not published, so
+at most `4.44e-16` relative. The fixture's producer commit is not published, so
 this is pinned-data parity rather than proof of parity with our compiled C
 baseline. The Rust adaptive solver satisfies `N_eff=4` to floating-point
 precision; its smoothing lengths differ by at most `5.0e-4` relative from the
 fixture values accepted under the legacy solver's looser neighbor tolerance.
+For restart-0 compatibility, the CLI also reproduces the public C gravity-tree
+initial guess bit-for-bit and its completed smoothing lengths to `4.45e-16`
+relative against the corrected-C `t=0` table.
 The normalized mean errors of the reconstructed density, velocity, and pressure
 gradients against the fitted analytic wave are respectively `3.99e-6`,
 `9.99e-7`, and `1.09e-6`; adjacent face areas differ from the analytic unit
@@ -70,7 +83,7 @@ integration, lab-frame deboost, and the closure-leak rule that disables
 reconstruction before solving. The entropic/PdV API then preserves the legacy
 strict speed thresholds, condition-number override, independent kernel
 derivatives, and KT-specific energy-delta semantics. Particle state updates and
-CLI evolution remain behind the timestep-selection boundary described below.
+CLI evolution use the complete timestep-selection path described below.
 
 The hydro crate also contains synchronized sound-wave evolution: exact
 unordered-pair accumulation into extensive momentum/total-energy rates,
