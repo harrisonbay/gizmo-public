@@ -1,0 +1,22 @@
+[package]
+name = "gizmo-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+gizmo-config = { path = "../gizmo-config" }
+gizmo-hydro = { path = "../gizmo-hydro" }
+gizmo-io = { path = "../gizmo-io" }
+gizmo-params = { path = "../gizmo-params" }
+
+[dev-dependencies]
+hdf5 = { package = "hdf5-metno", version = "0.14.0", features = ["static"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gizmo"
+path = "src/main.rs"

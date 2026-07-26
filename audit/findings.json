@@ -1,0 +1,467 @@
+{
+  "schema_version": 1,
+  "pinned_revision": {
+    "repository": "https://github.com/pfhopkins/gizmo-public",
+    "sha": "a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f"
+  },
+  "findings": [
+    {
+      "id": "GZ-0001",
+      "title": "Adaptive tree-force decision can skip the gravitational-constant conversion",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "ADAPTIVE_TREEFORCE_UPDATE"
+      ],
+      "summary": "gravity_tree() recomputes needs_new_treeforce() after the walk even though the walk can change inputs to that predicate. A true-to-false flip enters the jerk-only path with newly walked acceleration and continues before multiplying GravAccel and GravJerk by All.G.",
+      "impact": "Acceleration and jerk can be left in inconsistent units for an active particle, producing configuration-dependent dynamics.",
+      "reproduction": "Instrument both needs_new_treeforce() decisions for each active particle and force a walk that lowers min_bh_fb_time across the predicate threshold; observe a pre-walk true and post-walk false followed by the early continue.",
+      "falsification": "Show that every value read by needs_new_treeforce() is immutable from particle selection through final post-processing, or demonstrate that the pre- and post-walk decisions cannot differ over all enabled paths.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Particle selection and post-walk unit conversion must use one stable tree-force decision."
+      },
+      "sources": [
+        {
+          "path": "gravity/gravtree.c",
+          "line_start": 497,
+          "line_end": 508,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/gravtree.c#L497-L508"
+        },
+        {
+          "path": "gravity/gravtree.c",
+          "line_start": 710,
+          "line_end": 715,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/gravtree.c#L710-L715"
+        },
+        {
+          "path": "gravity/forcetree.c",
+          "line_start": 2818,
+          "line_end": 2820,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/forcetree.c#L2818-L2820"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0001.md"
+    },
+    {
+      "id": "GZ-0002",
+      "title": "Radiation input packing destructively resets reinjected photon energy",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "RT_SOURCE_INJECTION",
+        "RT_REINJECT_ACCRETED_PHOTONS"
+      ],
+      "summary": "INPUTFUNCTION_NAME transfers BH_accreted_photon_energy into an outbound input record and immediately zeros the particle accumulator. Input packing is not a commit point and may be repeated or abandoned when exchange buffers retry.",
+      "impact": "Accreted radiation energy can be lost or inconsistently reinjected when a packed interaction is not completed.",
+      "reproduction": "Set a sink's BH_accreted_photon_energy nonzero, invoke input packing, and abort or retry the exchange before evaluation; the particle accumulator is already zero.",
+      "falsification": "Prove input packing is called exactly once only after the corresponding injection is guaranteed to complete, including export-buffer and retry paths.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Packing communication data must not change conserved source state before successful application."
+      },
+      "sources": [
+        {
+          "path": "radiation/rt_source_injection.c",
+          "line_start": 65,
+          "line_end": 68,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/radiation/rt_source_injection.c#L65-L68"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0002.md"
+    },
+    {
+      "id": "GZ-0003",
+      "title": "Unknown chemistry ion reaches the end of a non-void function",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "SIMPLE_STEADYSTATE_CHEMISTRY"
+      ],
+      "summary": "ion_name_to_index() returns an index for known names but has no return or terminating path after the search loop. An unknown name therefore triggers undefined behavior and can index the recombination table arbitrarily.",
+      "impact": "Invalid input can cause out-of-bounds reads, corrupt chemistry rates, or crash depending on compiler optimization and runtime state.",
+      "reproduction": "Build with SIMPLE_STEADYSTATE_CHEMISTRY and UBSan, then call ion_name_to_index() with an unlisted ion such as Xe+.",
+      "falsification": "Demonstrate a checked contract that makes every caller's ion name one of ion_names and that the compiler can enforce this closed set.",
+      "oracle": {
+        "type": "sanitizer",
+        "classification": "dynamic",
+        "rationale": "UBSan or an explicit unknown-ion regression distinguishes a defined failure from fall-through UB."
+      },
+      "sources": [
+        {
+          "path": "cooling/simple_chemistry.c",
+          "line_start": 42,
+          "line_end": 54,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/cooling/simple_chemistry.c#L42-L54"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0003.md"
+    },
+    {
+      "id": "GZ-0004",
+      "title": "SIDM interaction sampling may race under OpenMP",
+      "status": "under_investigation",
+      "confidence": "medium",
+      "affected_flags": [
+        "DM_SIDM",
+        "_OPENMP"
+      ],
+      "summary": "The threaded neighbor loop calls gsl_rng_uniform(random_generator) through a shared-looking RNG object. Neighbor velocity and interaction-count writes are atomic, but no synchronization or per-thread ownership is visible around RNG state.",
+      "impact": "If the RNG is shared, concurrent mutation can create a data race, nondeterministic sampling corruption, or biased interaction statistics.",
+      "reproduction": "Run a dense DM_SIDM case with multiple OpenMP threads under ThreadSanitizer and compare seeded interaction counts against a one-thread run across repeated schedules.",
+      "falsification": "Trace random_generator ownership and show it is thread-local at this call site, or obtain a clean race-detector result with forced concurrent entry and verified instrumentation coverage.",
+      "oracle": {
+        "type": "concurrency_stress",
+        "classification": "dynamic",
+        "rationale": "The hypothesis depends on concurrent ownership and must be tested across threaded schedules."
+      },
+      "sources": [
+        {
+          "path": "sidm/sidm_core_flux_computation.h",
+          "line_start": 1,
+          "line_end": 34,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/sidm/sidm_core_flux_computation.h#L1-L34"
+        },
+        {
+          "path": "gravity/ags_hsml.c",
+          "line_start": 907,
+          "line_end": 907,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/ags_hsml.c#L907"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0004.md"
+    },
+    {
+      "id": "GZ-0005",
+      "title": "Meshless hydro uses an uninitialized target timestep in flux reconstruction",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "HYDRO_SPH"
+      ],
+      "summary": "hydro_force_evaluate() declares dt_hydrostep_i but, after a timestep-field refactor, no longer initializes the local variable before combining it with the neighbor timestep. Meshless solvers use the result in flux limiting, reconstruction, and face prediction; SPH uses it in the artificial-viscosity limiter. The input structure already carries the intended local.dt_hydrostep_i value.",
+      "impact": "Undefined stack data can perturb meshless reconstruction and fluxes or SPH artificial viscosity, making hydrodynamic evolution compiler- and layout-dependent.",
+      "reproduction": "Compile a meshless hydro configuration with Clang warnings enabled; the compiler reports dt_hydrostep_i is uninitialized at the first DMAX use. Trace subsequent inclusion of hydro_core_meshless.h, which consumes the same value during every interacting pair.",
+      "falsification": "Identify a dominating assignment to the local dt_hydrostep_i on every path before the neighbor loop, or prove all uses are removed by preprocessing for every affected meshless configuration.",
+      "oracle": {
+        "type": "static_analysis",
+        "classification": "static",
+        "rationale": "Definite-assignment analysis plus the input-structure producer establishes both the undefined read and intended source value."
+      },
+      "sources": [
+        {
+          "path": "hydro/hydro_evaluate.h",
+          "line_start": 25,
+          "line_end": 25,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_evaluate.h#L25"
+        },
+        {
+          "path": "hydro/hydro_evaluate.h",
+          "line_start": 154,
+          "line_end": 156,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_evaluate.h#L154-L156"
+        },
+        {
+          "path": "hydro/hydro_toplevel.c",
+          "line_start": 192,
+          "line_end": 192,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_toplevel.c#L192"
+        },
+        {
+          "path": "hydro/hydro_toplevel.c",
+          "line_start": 419,
+          "line_end": 419,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_toplevel.c#L419"
+        },
+        {
+          "path": "hydro/hydro_core_sph.h",
+          "line_start": 178,
+          "line_end": 199,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_core_sph.h#L178-L199"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0005.md"
+    },
+    {
+      "id": "GZ-0006",
+      "title": "Ideal-gas HLLC solver declares vacuum far below the physical threshold",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "!MAGNETIC",
+        "!EOS_GENERAL"
+      ],
+      "summary": "The default HLLC pressure-star path classifies a pair as vacuum when the normal velocity jump exceeds max(c_L,c_R). For an ideal gas, the exact solver in the same file uses the two-rarefaction criterion 2(c_L+c_R)/(gamma-1). At gamma=5/3 with equal sound speeds, the legacy shortcut fires at c instead of 6c and replaces the star pressure with MIN_REAL_NUMBER. Three later floors also turn failed non-vacuum estimates into the same positive sentinel, disabling their immediately following fallback checks.",
+      "impact": "Ordinary strong rarefactions can lose nearly all pairwise pressure force across a sharp numerical threshold even though the physical Riemann solution is non-vacuum.",
+      "reproduction": "Evaluate symmetric ideal-gas states with equal density, pressure, and sound speed and v_R-v_L just above c but below 6c. The legacy HLLC guard returns P_M=1e-56 and S_M=0, while the exact vacuum test remains false. Above 2c/gamma, the first approximate pressure is non-positive but is floored to the positive sentinel, preventing the fallback branch from running.",
+      "falsification": "Demonstrate that the max-sound-speed condition is a documented non-vacuum stability switch whose zero-pressure flux converges to the exact solution throughout c < v_R-v_L < 2(c_L+c_R)/(gamma-1), or provide a physical derivation equating the two thresholds.",
+      "oracle": {
+        "type": "reference",
+        "classification": "exact",
+        "rationale": "The exact ideal-gas Riemann vacuum criterion is already implemented independently in the same solver and gives a closed-form threshold."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 533,
+          "line_end": 537,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L533-L537"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 1034,
+          "line_end": 1042,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L1034-L1042"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0006.md"
+    },
+    {
+      "id": "GZ-0007",
+      "title": "Exact MFM Riemann fallback leaves stale approximate fluxes",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "!MAGNETIC",
+        "!EOS_GENERAL",
+        "!COOLING",
+        "!GALSF"
+      ],
+      "summary": "The ideal-gas solver invokes Riemann_solver_exact() after an invalid or pressure-limited approximate solution. In MFM mode the exact sampler updates P_M and S_M but deliberately skips face-state flux evaluation, and the exact wrapper only converts MFV states to fluxes. The returned MFM momentum and energy fluxes therefore remain from the rejected HLLC or KT solution.",
+      "impact": "Whenever the exact fallback is selected, downstream hydro can consume an internally inconsistent result: exact contact pressure and speed alongside stale approximate momentum and energy fluxes. The fallback therefore does not actually correct the primary MFM flux.",
+      "reproduction": "Choose positive ideal-gas states whose final HLLC pressure exceeds press_tot_limiter. HLLC first writes Fluxes from its rejected P_M/S_M, then Riemann_solver_exact() changes P_M/S_M. Before the fix, no non-MFV statement rewrites Fluxes before hydro_core_meshless.h consumes them.",
+      "falsification": "Identify a post-exact MFM conversion that overwrites density, momentum, and energy fluxes from the final P_M/S_M before hydro_core_meshless.h reads Riemann_out.Fluxes, or prove the exact and rejected approximate star states are identical for every fallback-triggering input.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "For MFM in the contact frame, the returned flux must be mass=0, momentum=P_M*n, and energy=P_M*S_M using the same final star state."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 350,
+          "line_end": 370,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L350-L370"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 695,
+          "line_end": 739,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L695-L739"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 880,
+          "line_end": 888,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L880-L888"
+        },
+        {
+          "path": "hydro/hydro_core_meshless.h",
+          "line_start": 270,
+          "line_end": 302,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/hydro_core_meshless.h#L270-L302"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0007.md"
+    },
+    {
+      "id": "GZ-0008",
+      "title": "Exact Riemann iteration can report numerical failure as vacuum or success",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "HYDRO_MESHLESS_FINITE_VOLUME",
+        "!MAGNETIC",
+        "!EOS_GENERAL",
+        "!COOLING",
+        "!GALSF"
+      ],
+      "summary": "iterative_Riemann_solver() used the same zero return for a physical vacuum and exhaustion of 1,000 Newton iterations, so the wrapper sampled both as vacuum. Non-finite Newton arithmetic could also make tol NaN, terminate the loop, and be reported as success because the only success test was the iteration count. Its PVRS seed additionally multiplied velocity and sound speed by pressure rather than density, which is dimensionally inconsistent.",
+      "impact": "Difficult but non-vacuum interfaces can silently receive zero-pressure vacuum coupling or a NaN exact state instead of triggering the caller's safer-reconstruction retries.",
+      "reproduction": "Force the Newton loop to exhaust its iteration budget or produce a non-finite update. Before the fix it returns zero or exits with niter below the maximum; Riemann_solver_exact() respectively samples a physical vacuum or accepts the non-finite pressure as converged.",
+      "falsification": "Prove finite positive pressure and convergence before every success return and show that the nonconvergence return is distinguishable from the physical two-rarefaction vacuum outcome.",
+      "oracle": {
+        "type": "invariant",
+        "classification": "property",
+        "rationale": "Physical vacuum, converged positive-pressure solution, and numerical failure are mutually exclusive solver outcomes and must not share success semantics."
+      },
+      "sources": [
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 1044,
+          "line_end": 1138,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L1044-L1138"
+        },
+        {
+          "path": "hydro/reimann.h",
+          "line_start": 695,
+          "line_end": 728,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/reimann.h#L695-L728"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0008.md"
+    },
+    {
+      "id": "GZ-0009",
+      "title": "Apparent first-step force spikes were a missing Rust predictor semantic",
+      "status": "rejected",
+      "confidence": "high",
+      "affected_flags": [
+        "HYDRO_MESHLESS_FINITE_MASS",
+        "BOX_SPATIAL_DIMENSION=1",
+        "BOX_PERIODIC",
+        "SELFGRAVITY_OFF",
+        "FORCE_EQUAL_TIMESTEPS"
+      ],
+      "summary": "The suspected C tree/gradient defect is falsified. A direct all-pairs calculation reproduces the C endpoint gradients to floating-point precision. Rust had omitted the density-loop Particle_DivVel smoothing-length predictor, selecting a different tolerance-accepted Hsml branch at strict support boundaries.",
+      "impact": "No C correctness defect was established. The port must preserve the predictor seed because machine-scale Hsml changes can flip support-boundary membership and slope-limiter extrema.",
+      "reproduction": "Run the pinned corrected-C first-step oracle and the ignored Rust integration test. Removing the Particle_DivVel Hsml predictor restores the localized second-kick divergence; retaining it gives machine-precision completed-step parity.",
+      "falsification": "Already falsified as a C defect: an independent direct all-pairs implementation reproduces the instrumented C gradients with maximum absolute error 6.8e-21, and porting the predictor collapses the endpoint velocity error to 1.1e-17.",
+      "oracle": {
+        "type": "differential",
+        "classification": "property",
+        "rationale": "The post-kick state separates both half-kicks; the direct all-pairs reconstruction exonerates the C tree path, while the completed-step differential pins the missing predictor semantic."
+      },
+      "sources": [
+        {
+          "path": "run.c",
+          "line_start": 70,
+          "line_end": 133,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/run.c#L70-L133"
+        },
+        {
+          "path": "io.c",
+          "line_start": 236,
+          "line_end": 240,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/io.c#L236-L240"
+        },
+        {
+          "path": "hydro/density.c",
+          "line_start": 281,
+          "line_end": 335,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/density.c#L281-L335"
+        },
+        {
+          "path": "predict.c",
+          "line_start": 151,
+          "line_end": 237,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/predict.c#L151-L237"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0009.md"
+    },
+    {
+      "id": "GZ-0010",
+      "title": "Force tree applies the top-tree capacity to ordinary nodes",
+      "status": "fixed",
+      "confidence": "high",
+      "affected_flags": [
+        "RESTART_FLAG=0",
+        "ALL_TREE_CONFIGURATIONS"
+      ],
+      "summary": "force_create_empty_nodes() allocated ordinary internal nodes from the MaxNodes-sized Nodes array but aborted when their count reached either MaxNodes or the unrelated MaxTopNodes capacity for the domain-decomposition TopNodes array.",
+      "impact": "Valid sparse or nonuniform initial states can abort during restart-0 tree construction despite sufficient capacity in the array actually being written.",
+      "reproduction": "Run the public differential-mass shock-tube IC with the pinned one-rank 1-D profile. The uncorrected tree deterministically aborts when nodecount reaches MaxTopNodes; removing only that comparison allows tree construction and the run to complete.",
+      "falsification": "Show that nodecount indexes TopNodes or another MaxTopNodes-sized allocation in force_create_empty_nodes(), or reproduce an out-of-bounds Nodes write below MaxNodes after removing the unrelated guard.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The public initial condition is a deterministic restart-0 reproducer, and the allocation/index ownership gives an independent structural invariant."
+      },
+      "sources": [
+        {
+          "path": "gravity/forcetree.c",
+          "line_start": 350,
+          "line_end": 402,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/gravity/forcetree.c#L350-L402"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0010.md"
+    },
+    {
+      "id": "GZ-0011",
+      "title": "Published dusty-wave profile collapses grain timesteps to the minimum bin",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "GRAIN_FLUID",
+        "GRAIN_BACKREACTION",
+        "BOX_SPATIAL_DIMENSION=1",
+        "SELFGRAVITY_OFF"
+      ],
+      "summary": "The hosted dusty-wave IC has no grain smoothing-length field and the published parameter file leaves type-3 softening commented out. Grain timesteps use Get_Particle_Size(), so every grain obtains zero Courant length and requests a zero timestep. The non-fatal minimum-timestep path then repeatedly advances those grains by only two integer ticks.",
+      "impact": "Running the public example literally does not reproduce the published t=1.2 solution on a practical timescale: after 2,532 synchronization points it has advanced only 1.10e-14 of the requested 2.5 time units while emitting a warning for every grain.",
+      "reproduction": "Run the hosted dustywave_ics.hdf5 with the checked-in dustyboxwave.params and its documented compile flags. All gas particles select time bin 45 while all grains select time bin 1. Enabling the file's commented Softening_Type3=0.001 prompt makes all 128 particles select bin 45 and the run completes in 32,768 synchronized steps.",
+      "falsification": "Provide a hosted IC with a positive grain smoothing length, a parameter-resolution path that enables positive type-3 softening despite the commented line, or a grain-size definition that makes Get_Particle_Size() positive in this configuration.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The byte-pinned public IC and parameter file deterministically produce a zero grain Courant length; the documented softening prompt is a one-line controlled reproducer and recovery."
+      },
+      "sources": [
+        {
+          "path": "scripts/test_problems/dustyboxwave.params",
+          "line_start": 11,
+          "line_end": 26,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/scripts/test_problems/dustyboxwave.params#L11-L26"
+        },
+        {
+          "path": "timestep.c",
+          "line_start": 495,
+          "line_end": 507,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/timestep.c#L495-L507"
+        },
+        {
+          "path": "timestep.c",
+          "line_start": 1051,
+          "line_end": 1090,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/timestep.c#L1051-L1090"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0011.md"
+    },
+    {
+      "id": "GZ-0012",
+      "title": "Accumulated output time creates a nonconservative terminal dust snapshot",
+      "status": "fixed",
+      "confidence": "high",
+      "affected_flags": [
+        "REGULARLY_SPACED_OUTPUTS",
+        "GRAIN_FLUID",
+        "GRAIN_BACKREACTION"
+      ],
+      "summary": "Repeated floating-point addition put the mathematically terminal dustybox output several thousand integer ticks below TimeMax. GIZMO then emitted a second final snapshot after endpoint grain backreaction had directly advanced gas velocity but before the leapfrog representation supplied the matching grain half-step.",
+      "impact": "The duplicate final snapshot violates total dust-plus-gas momentum and can be mistaken for the physical state at TimeMax. The public strong-drag dustybox case shifts mean(v_g)+mean(v_d) by 2.36915e-7 between the scheduled and duplicate terminal files.",
+      "reproduction": "Run the byte-pinned public dustybox IC with TimeMax=2.5 and TimeBetSnapshot=0.01. The uncorrected run writes snapshot_250 at 2.4999999999999907 with mean velocity sum 0.9999999999999869, then snapshot_251 at 2.5 with sum 1.0000002369145602.",
+      "falsification": "Show that the duplicate final file is explicitly documented and consumed as a staggered nonphysical predictor state, or demonstrate exact total momentum across both terminal files for the public dustybox profile.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The public IC gives equal unit gas and dust masses, so mean(v_g)+mean(v_d)=1 is an exact momentum invariant; the published Epstein formula independently fixes both velocity means."
+      },
+      "sources": [
+        {
+          "path": "run.c",
+          "line_start": 505,
+          "line_end": 607,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/run.c#L505-L607"
+        },
+        {
+          "path": "solids/grain_physics.c",
+          "line_start": 155,
+          "line_end": 172,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/solids/grain_physics.c#L155-L172"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0012.md"
+    }
+  ]
+}

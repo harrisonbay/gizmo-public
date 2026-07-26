@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/harrisonbay/gizmo-public/audit/finding.schema.json",
+  "title": "GIZMO correctness finding registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "pinned_revision", "findings"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "pinned_revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "sha"],
+      "properties": {
+        "repository": {"type": "string", "format": "uri"},
+        "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/finding"}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "line_start", "line_end", "url"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "line_start": {"type": "integer", "minimum": 1},
+        "line_end": {"type": "integer", "minimum": 1},
+        "url": {"type": "string", "format": "uri"}
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "classification", "rationale"],
+      "properties": {
+        "type": {
+          "enum": [
+            "concurrency_stress",
+            "differential",
+            "invariant",
+            "metamorphic",
+            "reference",
+            "regression",
+            "sanitizer",
+            "static_analysis"
+          ]
+        },
+        "classification": {"enum": ["dynamic", "exact", "property", "static"]},
+        "rationale": {"type": "string", "minLength": 1}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "status",
+        "confidence",
+        "affected_flags",
+        "summary",
+        "impact",
+        "reproduction",
+        "falsification",
+        "oracle",
+        "sources",
+        "dossier"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^GZ-[0-9]{4}$"},
+        "title": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["confirmed", "fixed", "under_investigation", "rejected"]
+        },
+        "confidence": {"enum": ["low", "medium", "high"]},
+        "affected_flags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "summary": {"type": "string", "minLength": 1},
+        "impact": {"type": "string", "minLength": 1},
+        "reproduction": {"type": "string", "minLength": 1},
+        "falsification": {"type": "string", "minLength": 1},
+        "oracle": {"$ref": "#/$defs/oracle"},
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/source"}
+        },
+        "dossier": {"type": "string", "pattern": "^audit/findings/GZ-[0-9]{4}\\.md$"}
+      }
+    }
+  }
+}

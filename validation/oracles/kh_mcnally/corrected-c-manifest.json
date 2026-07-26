@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "source_repository": "https://github.com/harrisonbay/gizmo-public",
+  "source_commit": null,
+  "source_commit_note": "The retained corrected-C run directory is a source copy without .git metadata, so an exact source commit cannot be recovered and is deliberately not guessed.",
+  "execution": {
+    "mpi_ranks": 4,
+    "launcher": "mpirun -np 4 ./GIZMO-kh kh.params 0",
+    "compiler": null,
+    "compiler_note": "The retained executable and run directory do not preserve a compiler-version record; this field is deliberately unknown rather than inferred.",
+    "config_path": "corrected-c-config.sh",
+    "config_sha256": "fabef9b80e4249979ae6e1f50035aa439492038b223660bd0187b2981f84f42e",
+    "config_size_bytes": 144,
+    "parameters_path": "corrected-c.params",
+    "parameters_sha256": "318f02976a507ba143b9a4a41f56bd171b36db99e171379d14e2a7c27eb6bc3b",
+    "parameters_size_bytes": 577,
+    "time_max": 1.5,
+    "time_between_snapshots": 0.1,
+    "max_size_timestep": 0.02,
+    "desired_neighbors": 40,
+    "compile_options": [
+      "HYDRO_MESHLESS_FINITE_MASS",
+      "BOX_PERIODIC",
+      "BOX_SPATIAL_DIMENSION=2",
+      "SELFGRAVITY_OFF",
+      "EOS_GAMMA=(5.0/3.0)",
+      "KERNEL_FUNCTION=5",
+      "OUTPUT_IN_DOUBLEPRECISION"
+    ]
+  },
+  "trajectory": {
+    "path": "corrected-c-trajectory.csv",
+    "sha256": "ee3558dccd0a036f1a38cb4f3548ad9f8ee21e3a41faba9b953f83754d98cf01",
+    "size_bytes": 5586,
+    "snapshots": 16,
+    "first_time": 0.0,
+    "last_time": 1.5,
+    "reducer": "validation/oracles/reduce_kh_mcnally_trajectory.py"
+  }
+}

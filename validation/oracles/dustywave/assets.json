@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "dustywave_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/dustywave_ics.hdf5",
+      "size_bytes": 16616,
+      "sha256": "e3edc342e3ac1389b4bbc3b3485221743af846a8138a3baed56d2d2c6aabe01e"
+    },
+    {
+      "name": "dustwave_exact.txt",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/dustwave_exact.txt",
+      "size_bytes": 31000,
+      "sha256": "0dacdd96653013f8d019f973aec4f709561c6dcdc12fd3612ef2c4106e4fc96a"
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/dustyboxwave.params",
+      "size_bytes": 1012,
+      "sha256": "fdffcff71eba2b6aeaa38ceeafeda6aefb49c7c9933b43385f934bc06662d8f2"
+    }
+  ]
+}

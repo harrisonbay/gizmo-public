@@ -1,0 +1,18 @@
+% Based on scripts/test_problems/soundwave.params. The explicit I/O formats
+% make the generated fixture and emitted snapshots self-describing.
+InitCondFile                       soundwave_ics
+OutputDir                          output/
+ICFormat                           3
+SnapFormat                         3
+TimeBegin                          0
+TimeMax                            1.5
+BoxSize                            1
+TimeBetSnapshot                    0.1
+DesNumNgb                          4
+BufferSize                         8
+MaxMemSize                         512
+ErrTolIntAccuracy                  0.01
+CourantFac                         0.05
+MaxRMSDisplacementFac              0.1
+ErrTolForceAcc                     0.001
+TimeBetStatistics                  0.5

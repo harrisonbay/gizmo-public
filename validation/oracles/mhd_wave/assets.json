@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "mhd_wave_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/mhd_wave_ics.hdf5",
+      "sha256": "f596634b31807a32fc4c0069513d840279b0cbad416c34564e849f2367a3e3e5",
+      "size_bytes": 311728
+    }
+  ]
+}

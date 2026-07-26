@@ -383,7 +383,7 @@ void force_create_empty_nodes(int no, int topnode, int bits, int x, int y, int z
                     *nextfree = *nextfree + 1;
                     *nodecount = *nodecount + 1;
 
-                    if((*nodecount) >= MaxNodes || (*nodecount) >= MaxTopNodes)
+                    if((*nodecount) >= MaxNodes)
                     {
                         printf("task %d: maximum number MaxNodes=%d of tree-nodes reached."
                                "MaxTopNodes=%d NTopnodes=%d NTopleaves=%d nodecount=%d\n",

@@ -1,0 +1,24 @@
+# Legacy C build products
+Config.sh
+GIZMO
+GIZMO_config.h
+compile_time_info.c
+*.o
+*.oo
+
+# Rust build products
+rust/target/
+
+# Validation/test products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+validation/artifacts/
+validation/oracles/*/*.hdf5
+validation/oracles/*/*_exact.txt
+validation/oracles/*/output/
+
+# Local editor and platform files
+.DS_Store
+.vscode/
+.idea/

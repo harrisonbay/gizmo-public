@@ -1,0 +1,14 @@
+InitCondFile                       kh_mcnally_2d_ics
+OutputDir                          kh-output
+TimeMax                            1.5
+BoxSize                            1
+TimeBetSnapshot                    0.1
+MaxSizeTimestep                    0.02
+DesNumNgb                          40
+MaxMemSize                         2000
+SofteningGas                       0.001
+SofteningHalo                      0.001
+SofteningDisk                      0.001
+SofteningBulge                     0.001
+SofteningStars                     0.001
+SofteningBndry                     0.001

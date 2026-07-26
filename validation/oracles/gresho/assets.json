@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "gresho_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/gresho_ics.hdf5",
+      "sha256": "9109bbce2a58eef3cb13d665582fa636e667a1098ae491b80f8f39c2fae1a43c",
+      "size_bytes": 186624
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/gresho.params",
+      "sha256": "d84b3a8a1b451f6e467585305d00afc866d102f2deca7e1b663d95c012f20630",
+      "size_bytes": 1302
+    }
+  ]
+}

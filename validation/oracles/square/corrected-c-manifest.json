@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source_commit": null,
+  "source_commit_note": "The retained corrected-C source directory had no Git metadata; no commit is asserted.",
+  "compiler": null,
+  "compiler_note": "The exact compiler version was not retained; the binary and generated config digests are pinned instead.",
+  "mpi_ranks": 4,
+  "launch_command": "mpirun -np 4 GIZMO-square square.params 0",
+  "sha256": {
+    "fixture": "dd21e566f647405e62e59a0a5124a4081fcdd780f8489ae92447293f03bcc182",
+    "config": "60d8f14fbc344f5eb1381cf9d09022007a39198afdd5fb6801cf20e82bb49b3a",
+    "generated_config_header": "20b9bb088404322c00d4304441258530315a35bbaf442a0ba55464f388523a85",
+    "parameters": "123812fd8f0551412f989dc5ccfc0cf14ef5bef54f73ea4ee28b5497ad4ad763",
+    "parameters_usedvalues": "4d340d2642784d9c1c08fb6be953a36c0ca9c8e8e2fe9fe93115f368f2da1ee3",
+    "binary": "1e25721261ee9754bdc7bbbc177a07799c55f00ed1f4f0d6d0acbb2b79a0d366",
+    "analyzer": "4956aa927fe1c63c81a1250d04471ff007f13f5320a3bc6b4b5709017dc81ec8",
+    "trajectory_checker": "d855dfd75691c9b9f4ceba767a04c4502fe39ddd6056d026f8f41955f1a9534f",
+    "reducer": "634b7d3903dc05e5fd27ea1a468f98f5f0af352938271f71533e51682e4eef08",
+    "reduced_trajectory": "a9a28a27cd1056e6ae0e9cecba902b1c46a2871624c58145615b054741b9795c",
+    "snapshot_000": "b919d8cc78d68582daeaeaec78ca65f6d32666895d6b27e545264824de3b0d2d",
+    "snapshot_020": "36ed88e5f5a6f7e572e50ccaf3b0df2dbf091dd432067c8c1bb53f9ad6808fd9"
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "source_commit": "8334f2330e96f9180dd623dae5d91cafd65aecef",
+  "problem": "public one-dimensional differential-mass Sod shock tube",
+  "corrected_c_finding": "GZ-0010",
+  "compiler": {
+    "driver": "mpicc",
+    "implementation": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "target": "arm64-apple-darwin",
+    "optimization": "-O1 -funroll-loops",
+    "mpi_ranks": 1,
+    "openmp_threads": 1,
+    "hdf5_version": "2.1.1"
+  },
+  "inputs": {
+    "config": {
+      "path": "../../legacy/shocktube.Config.sh",
+      "sha256": "9d3cd8878ff17275f95982accfb5edaebd8e9a7f3ab28a781968d2f4fc3b69a3"
+    },
+    "parameters": {
+      "path": "../../legacy/shocktube-diffmass.params",
+      "sha256": "ec5d691ad2011a4fdf7f8d417b7295e118c7b2260ceca1202c8cf76aa7b25f51"
+    },
+    "resolved_parameters": {
+      "path": "diffmass-parameters-usedvalues",
+      "sha256": "ba7f325ad5aca6f82bd0ec3bc6ab93f3b1a4eb216c56abff629db3f82941408f"
+    },
+    "initial_conditions": {
+      "path": "shocktube_ics_diffmass.hdf5",
+      "sha256": "46d8cc58a167ae772b29d2ed3423bad03a3853816fa64af4327b07eb7fad9f72"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 5.0,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 140737488355328,
+    "shared_step": 0.0006103515625,
+    "steps": 8192,
+    "all_particles_remained_in_timebin": 47,
+    "scheduled_outputs": 11
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "phase": "initial drift after first half-kick",
+      "raw_sha256": "5c9668162d8788bdcaacc1eb9eafdcd5342f1340e32ac252e46cbe89641cf3ad",
+      "table": "diffmass_t0.csv.gz",
+      "table_sha256": "3882c9a0a2fb161993da2250752d2999d71e90987ef69a78cff1a62611c9e726"
+    },
+    {
+      "time": 5.0,
+      "phase": "scheduled terminal drift before endpoint force and second kick",
+      "raw_sha256": "6aead3d11ac384af80591c9c22361e011c861d3ec154c21b7f07c304d6bc39b1",
+      "table": "diffmass_t5.csv.gz",
+      "table_sha256": "fb2684788ef17e9d58a7d9a2d854862fbcc18a0fb4ed91de2f9a8b5fd0ae41c8"
+    }
+  ],
+  "public_reference": {
+    "path": "shocktube_exact.txt",
+    "sha256": "4a52deb8d19f39b09bcf8c88b9403e03afa8da7e2d2b8157db0e70cffe8f3f57",
+    "comparison": "periodic linear interpolation at particle positions; L1 weighted by m/rho and normalized by total particle volume",
+    "volume_weighted_l1": {
+      "density": 0.005233216905994052,
+      "pressure": 0.005757768534014373,
+      "entropy": 0.00306382248719169,
+      "velocity_x": 0.004252986117800043
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "soundwave_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/soundwave_ics.hdf5",
+      "sha256": "d13c5f1bb916490037c96f2d3e4fa37b1121e09b352bd6bc15de80bee9f35b35",
+      "size_bytes": 178576
+    }
+  ]
+}

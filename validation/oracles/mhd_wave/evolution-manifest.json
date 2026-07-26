@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "profile": "public-linear-fast-mhd-wave",
+  "source": {
+    "repository": "https://github.com/pfhopkins/gizmo-public",
+    "commit": "b4949ca2f89c2603ef0109ce210f7276e83aa758",
+    "run_c_sha256": "cc345bc2781da3620b1ab837bb50a856641073e22c1d851c98726ebf7f649898",
+    "config_sha256": "58ba0c3a9bd9486b33eeb76793335642244e9f51afb0a6446bf5e8ec0e807f4d",
+    "parameters_usedvalues_sha256": "39c2d304b66676f0b2d18c63a814915bd2fb5cfdf3c3bdbb27666b4eb385341e"
+  },
+  "execution": {
+    "mpi_ranks": 1,
+    "openmp_threads": 1,
+    "shared_steps": 16384,
+    "step_size": 0.000030517578125,
+    "output_times": [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+  },
+  "raw_snapshots": [
+    {"index": 0, "time": 0.0, "sha256": "9ac29984a0b5625050a5af56b5de8e993b119d000cc3c5a41e6a11eba92fee8f"},
+    {"index": 1, "time": 0.05, "sha256": "f79fd7d5d018e1d6d881834484eac1c44feca5d161c16ffa77143edc36361a24"},
+    {"index": 2, "time": 0.1, "sha256": "1dfd5db56c6fc37d0dbe24ba12b76b919a5b0b45375964582e67c59931ba8b80"},
+    {"index": 3, "time": 0.15, "sha256": "dc7fbb556ad5c2ba536d451720008f0ef8943596089ddca7b7086c746634aef3"},
+    {"index": 4, "time": 0.2, "sha256": "2bf71fa848bdf205b657826a6b3a2a81fcc63345f25fa7f1a2722530101c812d"},
+    {"index": 5, "time": 0.25, "sha256": "32de2667e37147d8680a4925e201d858de1e729c2a07be7dfb55a260486edc87"},
+    {"index": 6, "time": 0.3, "sha256": "2657515ca96412f73d974c28135597d59f9bc08132a8017698191a40b108f20d"},
+    {"index": 7, "time": 0.35, "sha256": "9c0711ddca79b915705a3ca7ef56aeac83c360018f685831943059207693e0c2"},
+    {"index": 8, "time": 0.4, "sha256": "ba211e103bfe393181549784aa3ae1bba2005c0da989ea7badd4e85428556a4a"},
+    {"index": 9, "time": 0.45, "sha256": "b29b30109cf39413ac112b0d75493a283f6bf4ef5f82cb9c2e2a4698c362e862"},
+    {"index": 10, "time": 0.5, "sha256": "e9b655c883c3780572dbd6c5fa14998190d300f8070d06dfe0f7578a1da08282"}
+  ],
+  "semantic_artifacts": [
+    {"path": "evolution_t0.csv.gz", "time": 0.0, "sha256": "5180b03b1bd7d9d0684b7333befbe8af346728f19c2e45f413136f0dab5ddd4c"},
+    {"path": "evolution_t0.25.csv.gz", "time": 0.25, "sha256": "c4e5c846882c91df1657ae7e2210f2790ae5a1e728757e8ad229d7c246c80db0"},
+    {"path": "evolution_t0.5.csv.gz", "time": 0.5, "sha256": "2f211cdfb116212ff9dc3a78f969438e8f715439fa4305ab99b49f2d3b64a3c2"},
+    {"path": "evolution_curve.csv.gz", "sha256": "9e67d9c139b422b7fc7e453c680553214545b89e2ae4a4ce4a488fb05b1938c9"}
+  ],
+  "analytic_oracle": {
+    "phase": "sin(2*pi*(x+2*t))",
+    "norm": "particle_l1",
+    "maximum_l1_over_trajectory": {
+      "density": 1.580851239344795e-08,
+      "velocity_x": 5.426783765321277e-09,
+      "velocity_y": 6.852295222543506e-09,
+      "velocity_z": 2.4226536733012366e-09,
+      "pressure": 1.2444483982849367e-08,
+      "magnetic_x": 4.346978558199006e-09,
+      "magnetic_y": 5.140274308523644e-09,
+      "magnetic_z": 1.8173550105397233e-09
+    }
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "source_commit": "ba44e1710992d9b10ae7589779a9030c1e0e1863",
+  "corrected_c_findings": [
+    "GZ-0010"
+  ],
+  "profile": {
+    "name": "public 1-D MFM Woodward-Colella interacting blastwave",
+    "particle_count": 512,
+    "gamma": 1.4,
+    "box_size": 1.0,
+    "boundary": "reflective x; non-periodic neighbor geometry",
+    "boundary_particle_flag_effect": "inert because hosted IDs are unique 1..512"
+  },
+  "inputs": {
+    "config": {
+      "path": "legacy-config.sh",
+      "sha256": "599eaa413bc9136411b75b54484b2dd1f0e0e1a02167dab750848327f1755975"
+    },
+    "parameters": {
+      "path": "legacy.params",
+      "sha256": "0fd63f509e2e9c1146126ff821d5d896feeec9b292be4a8a7eb0b7c560a7d892"
+    },
+    "resolved_parameters": {
+      "path": "parameters-usedvalues",
+      "sha256": "4b70c7686a8d7ae7e7fc4431538fcac31d225f0849f972a775d05638710f23dd"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 0.038,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 4398046511104,
+    "physical_step": 1.4495849609375e-7,
+    "steps": 262144,
+    "scheduled_outputs": 11,
+    "output_times": [
+      0.0,
+      0.0038,
+      0.0076,
+      0.011400000000000002,
+      0.0152,
+      0.019,
+      0.022800000000000004,
+      0.026600000000000002,
+      0.030400000000000007,
+      0.0342,
+      0.038
+    ]
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "phase": "initial scheduled drift after first half-kick",
+      "raw_sha256": "c4b83f76a67d3dec74b544e987754d35695cd068e83bda6919ca638f9f5a725a",
+      "table": "evolution_t0.csv.gz",
+      "table_sha256": "180fc3463a6181d22461543861c5df3198715f4cdab89d8fd5949fdd55eded95"
+    },
+    {
+      "time": 0.019,
+      "phase": "scheduled midpoint drift at a synchronized endpoint before force and second kick",
+      "raw_sha256": "ba41c3565be324080e92a82394793b545cd01a3050467b1cfa7112e56a50bd3b",
+      "table": "evolution_tmid.csv.gz",
+      "table_sha256": "0ca763f82f2792f424f4f6018f730e734402617b8d86ae35e50f379c3bf26bbe"
+    },
+    {
+      "time": 0.038,
+      "phase": "scheduled terminal drift before endpoint force and second kick",
+      "raw_sha256": "ecfe39f2db61639288e4aed22b2542c8e6c7a4202f6c4e6cd8c6a0f652266e0a",
+      "table": "evolution_tfinal.csv.gz",
+      "table_sha256": "8604db02463c689e4f1890cc5891abd8961ac8f11506bf85a9a9f0f6ddfb82ee"
+    }
+  ],
+  "public_reference": {
+    "description": "approximately exact 20,000-zone solution supplied by the public test",
+    "time": 0.038,
+    "interpolation": "non-periodic linear interpolation with endpoint extrapolation",
+    "weighting": "particle volume mass/density",
+    "volume_weighted_l1": {
+      "density": 0.0462596080240944,
+      "pressure": 3.720250090920468,
+      "entropy": 15.666363547865624,
+      "velocity_x": 0.1913819332869832
+    }
+  },
+  "observations": {
+    "documentation_particle_count": 400,
+    "hosted_ic_particle_count": 512,
+    "wall_crossings_observed": true,
+    "wall_rule": "flip outward half-kicked velocity, replace predicted velocity with it, zero predictor acceleration, then apply the ID-dependent inward position nudge"
+  }
+}

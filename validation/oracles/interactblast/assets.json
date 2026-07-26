@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "interactblast_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/interactblast_ics.hdf5",
+      "sha256": "0a7dfc561475bc55ffd684e3339171d5cba05626233648eca926bd62647939e1",
+      "size_bytes": 49552
+    },
+    {
+      "name": "interactblast_exact.txt",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/interactblast_exact.txt",
+      "sha256": "239f6a5f83c2875535a247d08af3035f502dc9d6eee5c0dea1c9bf1dedb8c8a4",
+      "size_bytes": 1700215
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/interactblast.params",
+      "sha256": "3d66aca137023408af77bf74fef707fbc94ed6f5f9db551edcb3f5e8f008be53",
+      "size_bytes": 869
+    }
+  ]
+}

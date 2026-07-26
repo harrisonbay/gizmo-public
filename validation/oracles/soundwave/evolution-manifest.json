@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "description": "Corrected-C semantic evolution oracle for the pinned public 1-D MFM sound wave",
+  "source_commit": "f408a498ec42990fa6b3cc413ded2223f3d33dc2",
+  "compiler": {
+    "driver": "mpicc",
+    "implementation": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "target": "arm64-apple-darwin24.6.0",
+    "optimization": "-O1",
+    "mpi_ranks": 1
+  },
+  "inputs": {
+    "config": {
+      "path": "legacy-config.sh",
+      "sha256": "1b46ce4cd392c6e9321db531a56106d1971baee74e310c88231b8b4e946a8273"
+    },
+    "parameters": {
+      "path": "legacy.params",
+      "sha256": "47814e91badf91863568a7939693b48d2b39fc63fb81d1bdd5213b497dcc42fa"
+    },
+    "one_step_parameters": {
+      "path": "one-step.params",
+      "sha256": "b60e032180371f553e1187ac7b461045c9c4ed674f898e9231572e4331678bd8",
+      "note": "Uses the initial-step snapshot cadence and explicitly preserves the production MaxSizeTimestep=0.001 cap"
+    },
+    "post_kick_instrumentation": {
+      "path": "post-kick-snapshot.patch",
+      "sha256": "d2838661fb403e1e9f552c239bdca19b80ed0fd7b13f51c4fc2ea6b7c8598f89",
+      "note": "Adds one semantic snapshot immediately after the first do_second_halfstep_kick; no numerical state is modified"
+    },
+    "initial_conditions": {
+      "path": "soundwave_ics.hdf5",
+      "sha256": "d13c5f1bb916490037c96f2d3e4fa37b1121e09b352bd6bc15de80bee9f35b35"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 1.5,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 17592186044416,
+    "shared_step": 2.288818359375e-05,
+    "steps": 65536,
+    "all_particles_remained_in_timebin": 44
+  },
+  "table_format": {
+    "compression": "gzip with mtime=0",
+    "ordering": "ascending ParticleIDs",
+    "columns": [
+      "particle_id",
+      "x",
+      "velocity_x",
+      "density",
+      "specific_internal_energy",
+      "smoothing_length",
+      "mass"
+    ],
+    "float_encoding": "17 significant decimal digits"
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "raw_sha256": "9d78a048b41ec2261f22e87befe512e94371538e18efd594635572c4e55611c3",
+      "table": "evolution_t0.csv.gz",
+      "table_sha256": "e55d626ace04511a62f64b05639bf666c3e4ef83438a24b236714e82acbbbeac"
+    },
+    {
+      "time": 2.288818359375e-05,
+      "run_profile": "one_step_parameters + post_kick_instrumentation",
+      "state_phase": "immediately after do_second_halfstep_kick",
+      "raw_sha256": "f40f2cd99ba433ac2f44ca4b248955c6b735060260cce62ed63396e709a6111f",
+      "table": "evolution_step1.csv.gz",
+      "table_sha256": "f0330968cf6c72d85921cd10092ed59a19b271c8df9f0f2b2426b3dfd849649c"
+    },
+    {
+      "time": 0.1,
+      "raw_sha256": "8d65dbe2651441418b90b3ce9ed2096ed45041ea397116dfcef6eb15fba0391a",
+      "table": "evolution_t0.1.csv.gz",
+      "table_sha256": "cc95da43184751db680b0e9603eaed54d7aeae3c96670c9dfbbda8a1bf831d94"
+    },
+    {
+      "time": 1.5,
+      "raw_sha256": "c8973b00f6e1a7bba239594fdc94487ed5e5da77faf8049c66a025efab5e89ba",
+      "table": "evolution_t1.5.csv.gz",
+      "table_sha256": "e4efc6d11bfe07740cf83c654451f9e506c84fbee26d1f44bf93915205e68288"
+    }
+  ]
+}

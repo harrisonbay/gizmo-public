@@ -1,0 +1,16 @@
+% Derived from public.params solely by shortening TimeMax from 10 to 1.5.
+% The published reference curves end at t=1.5 and must not be extrapolated.
+InitCondFile                       kh_mcnally_2d_ics
+OutputDir                          output
+TimeMax                            1.5
+BoxSize                            1
+TimeBetSnapshot                    0.1
+MaxSizeTimestep                    0.02
+DesNumNgb                          40
+BiniX                              0.07
+BiniY                              1.0e0
+BiniZ                              1.0e0
+ConductionCoeff                    0.0002
+ShearViscosityCoeff                0.0002
+BulkViscosityCoeff                 0.0
+CourantFac                         0.1

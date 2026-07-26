@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "path": "unknown-ion.json",
+      "sha256": "7a54ec6e4b466f6a417bceadca65160fd75b6ff136d9345e172505ea6028e119",
+      "size_bytes": 93,
+      "finding_ids": [
+        "GZ-0003"
+      ],
+      "description": "An ion name outside the simple-chemistry recombination lookup table."
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "square_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/square_ics.hdf5",
+      "sha256": "dd21e566f647405e62e59a0a5124a4081fcdd780f8489ae92447293f03bcc182",
+      "size_bytes": 727440
+    },
+    {
+      "name": "public.params",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/square.params",
+      "sha256": "c0fcc5e5ca30088ed72ebcd73c6f3799a9fc490fbdaf6f254c2cbc310ff7232e",
+      "size_bytes": 623
+    }
+  ]
+}

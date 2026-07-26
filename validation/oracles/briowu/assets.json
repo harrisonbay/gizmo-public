@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "name": "briowu_ics.hdf5",
+      "url": "http://www.tapir.caltech.edu/~phopkins/sims/briowu_ics.hdf5",
+      "sha256": "300364564285270ed6e2f435786728683aeccd23c7c1eeb34d11eee9fade6f01",
+      "size_bytes": 3821968
+    }
+  ]
+}
