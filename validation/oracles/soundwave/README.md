@@ -22,6 +22,13 @@ Run the Rust HDF5, density, and adaptive-smoothing-length parity gate with:
 validation/oracles/run_rust_soundwave_init.sh
 ```
 
+Run the opt-in 65,536-step release differential against all three corrected-C
+tables with:
+
+```sh
+validation/oracles/run_rust_soundwave_long.sh
+```
+
 `evolution-manifest.json` pins a fresh corrected-C run from commit
 `f408a498ec42990fa6b3cc413ded2223f3d33dc2`. The run used one MPI rank,
 completed all 65,536 shared `2^44`-tick steps to `t=1.5`, and kept every gas
