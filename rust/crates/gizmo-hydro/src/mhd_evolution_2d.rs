@@ -5,20 +5,25 @@
 //! Magnetic flux is stored as the extensive `V B` variable used by the public
 //! MFM equations. Both fixed-H and public-C adaptive-H synchronized KDK entry
 //! points are available. The hierarchical entry point reproduces the
-//! independently verifiable initial per-particle kick and first drift event;
-//! active-target endpoint force evolution remains under construction.
+//! public per-particle kick/drift ordering, active-target endpoint force
+//! refresh, retained inactive predictors, and wakeup/reverse-kick semantics.
 
 use std::error::Error;
 use std::fmt;
 
 use crate::individual_timeline::{IndividualParticleTimeline, IndividualTimelineError};
 use crate::legacy_float_equal;
+#[cfg(test)]
+use crate::meshless_2d::scalar_gradients_batch_with_moments_2d;
 use crate::meshless_2d::{
     Box2d, FaceClosure2d, GeometryError, InteractionPair2d, InverseMoment2d, MeshlessFace2d,
     MeshlessPoint2d, Vector2, cubic_kernel_2d, density_at_hsml_2d, face_closure_diagnostics_2d,
-    interacting_pairs_2d, inverse_moments_2d, meshless_face_geometry_2d,
-    particle_divergence_at_hsml_2d, scalar_gradients_batch_with_moments_2d,
+    interacting_pairs_2d, interacting_pairs_for_targets_2d, inverse_moments_2d,
+    inverse_moments_for_targets_2d, legacy_face_closure_for_targets_with_moments_2d,
+    meshless_face_geometry_2d, particle_divergence_at_hsml_2d,
+    particle_divergence_at_hsml_for_targets_2d, scalar_gradients_batch_with_moments_for_targets_2d,
     solve_public_c_smoothing_lengths_from_seeds_2d,
+    solve_public_c_smoothing_lengths_from_seeds_for_targets_2d,
 };
 use crate::mhd::{
     DednerOptions, FluxFrame1d, HlldOptions, IdealMhdPrimitive1d, MhdError, MhdRiemannMethod,
@@ -198,6 +203,7 @@ pub struct PublicMhdInitialHierarchy2d {
     face_closure_cache: Vec<FaceClosure2d>,
     minimum_specific_internal_energy: f64,
     awaiting_second_kick: bool,
+    pending_wakeup: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1019,12 +1025,13 @@ pub fn mhd_mfm_active_target_rates_with_cache_2d(
         .iter()
         .map(|velocity| Vector2::new(velocity.x, velocity.y))
         .collect();
-    let fresh_velocity_divergence = particle_divergence_at_hsml_2d(
+    let fresh_velocity_divergence = particle_divergence_at_hsml_for_targets_2d(
         &state.positions,
         &planar_velocities,
         &state.smoothing_lengths,
         &primitive.dhsml_factor,
         state.domain,
+        active,
     )?;
     let mut updated = retained.clone();
     let mut magnetic_divergence_volume = vec![0.0; count];
@@ -1051,7 +1058,12 @@ pub fn mhd_mfm_active_target_rates_with_cache_2d(
         }
     }
 
-    let pairs = interacting_pairs_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
+    let pairs = interacting_pairs_for_targets_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        active,
+    )?;
     let mut directed_pair_count = 0_usize;
     let mut entropic_pair_count = 0_usize;
     let mut wakeup = vec![false; count];
@@ -1239,50 +1251,79 @@ pub fn refresh_mhd_active_target_caches_2d(
             ),
         ],
     )?;
-    let solved = solve_public_c_smoothing_lengths_from_seeds_2d(
+    let solved = solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.domain,
         desired_neighbors,
         neighbor_tolerance,
+        active,
     )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
-            state.smoothing_lengths[i] = solved[i].smoothing_length;
+            let estimate = solved[i].ok_or_else(|| {
+                invalid(
+                    Some(i),
+                    "missing active smoothing-length estimate",
+                    f64::NAN,
+                )
+            })?;
+            state.smoothing_lengths[i] = estimate.smoothing_length;
+            primitive_cache.density[i] = estimate.estimate.density;
+            primitive_cache.dhsml_factor[i] = estimate.estimate.dhsml_factor;
+
+            let volume = state.masses[i] / estimate.estimate.density;
+            let magnetic = state.magnetic_volume[i] / volume;
+            let cleaning_scalar = state.cleaning_mass[i] / state.masses[i];
+            let pressure =
+                (state.gamma - 1.0) * estimate.estimate.density * state.specific_internal_energy[i];
+            IdealMhdPrimitive1d {
+                density: estimate.estimate.density,
+                velocity: state.velocities[i],
+                gas_pressure: pressure,
+                magnetic,
+                cleaning_scalar,
+            }
+            .to_conserved(state.gamma)?;
+            primitive_cache.pressure[i] = pressure;
+            primitive_cache.magnetic[i] = magnetic;
+            primitive_cache.cleaning_scalar[i] = cleaning_scalar;
         }
     }
-    let fresh_primitive = state.primitive_columns()?;
-    for (i, &is_active) in active.iter().enumerate() {
-        if is_active {
-            primitive_cache.density[i] = fresh_primitive.density[i];
-            primitive_cache.dhsml_factor[i] = fresh_primitive.dhsml_factor[i];
-            primitive_cache.pressure[i] = fresh_primitive.pressure[i];
-            primitive_cache.magnetic[i] = fresh_primitive.magnetic[i];
-            primitive_cache.cleaning_scalar[i] = fresh_primitive.cleaning_scalar[i];
-        }
-    }
-    let fresh_moments =
-        inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
-    let fresh_closure = face_closure_diagnostics_2d(
+    let fresh_moments = inverse_moments_for_targets_2d(
         &state.positions,
-        &state.masses,
         &state.smoothing_lengths,
         state.domain,
+        active,
     )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
-            moment_cache[i] = fresh_moments[i];
-            // Only this density-loop diagnostic is persistent. Net face area
-            // is a force-loop accumulator and is rebuilt target-locally.
-            face_closure_cache[i].legacy_dimensionless_leak =
-                fresh_closure[i].legacy_dimensionless_leak;
+            moment_cache[i] = fresh_moments[i]
+                .ok_or_else(|| invalid(Some(i), "missing active inverse moment", f64::NAN))?;
         }
     }
-    let fresh_gradients = primitive_gradients(
+    let fresh_closure = legacy_face_closure_for_targets_with_moments_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        moment_cache,
+        active,
+    )?;
+    for (i, &is_active) in active.iter().enumerate() {
+        if is_active {
+            // Only this density-loop diagnostic is persistent. Net face area
+            // is a force-loop accumulator and is rebuilt target-locally.
+            face_closure_cache[i].legacy_dimensionless_leak = fresh_closure[i]
+                .ok_or_else(|| invalid(Some(i), "missing active face closure", f64::NAN))?;
+        }
+    }
+    let fresh_gradients = primitive_gradients_for_targets(
         state,
         primitive_cache,
-        Some(previous_stored_magnetic_divergence),
+        previous_stored_magnetic_divergence,
+        active,
+        moment_cache,
     )?;
     for (i, &is_active) in active.iter().enumerate() {
         if is_active {
@@ -1605,17 +1646,61 @@ pub fn public_mhd_particle_timestep_bounds_2d(
     courant_factor: f64,
     integration_accuracy: f64,
 ) -> Result<Vec<PublicMhdTimestepBounds2d>, MhdEvolution2dError> {
+    let primitive = state.primitive_columns()?;
+    public_mhd_particle_timestep_bounds_from_primitive_2d(
+        state,
+        &primitive,
+        rates,
+        courant_factor,
+        integration_accuracy,
+    )
+}
+
+/// Return public-C timestep criteria using a caller-retained primitive cache.
+///
+/// Hierarchical callers must use this form at partial synchronization points:
+/// their state deliberately contains mixed-epoch inactive positions, while
+/// the retained primitive cache is the public-C lazy-drift neighbor view.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, primitive/rate columns, Courant factor,
+/// integration accuracy, or a non-physical primitive value.
+pub fn public_mhd_particle_timestep_bounds_from_primitive_2d(
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    rates: &MhdMfmRates2d,
+    courant_factor: f64,
+    integration_accuracy: f64,
+) -> Result<Vec<PublicMhdTimestepBounds2d>, MhdEvolution2dError> {
     state.validate()?;
     validate_rate_lengths(rates, state.positions.len())?;
+    validate_lengths(
+        state.positions.len(),
+        &[
+            ("primitive_density", primitive.density.len()),
+            ("primitive_dhsml_factor", primitive.dhsml_factor.len()),
+            ("primitive_pressure", primitive.pressure.len()),
+            ("primitive_magnetic", primitive.magnetic.len()),
+            ("primitive_cleaning_scalar", primitive.cleaning_scalar.len()),
+        ],
+    )?;
     if !courant_factor.is_finite() || courant_factor <= 0.0 || courant_factor > 0.5 {
         return Err(invalid(None, "courant_factor", courant_factor));
     }
     if !integration_accuracy.is_finite() || integration_accuracy <= 0.0 {
         return Err(invalid(None, "integration_accuracy", integration_accuracy));
     }
-    let primitive = state.primitive_columns()?;
     let mut bounds = Vec::with_capacity(state.positions.len());
     for i in 0..state.positions.len() {
+        IdealMhdPrimitive1d {
+            density: primitive.density[i],
+            velocity: state.velocities[i],
+            gas_pressure: primitive.pressure[i],
+            magnetic: primitive.magnetic[i],
+            cleaning_scalar: primitive.cleaning_scalar[i],
+        }
+        .to_conserved(state.gamma)?;
         let acceleration = rates.acceleration[i].squared_norm().sqrt();
         let acceleration = if acceleration == 0.0 {
             1.0e-30
@@ -2035,10 +2120,36 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
         face_closure_cache,
         minimum_specific_internal_energy,
         awaiting_second_kick: false,
+        pending_wakeup: vec![false; count],
     })
 }
 
 impl PublicMhdInitialHierarchy2d {
+    #[must_use]
+    pub fn current_tick(&self) -> u64 {
+        self.timeline.current_tick()
+    }
+
+    #[must_use]
+    pub fn current_time(&self) -> f64 {
+        self.timeline.current_time()
+    }
+
+    #[must_use]
+    pub fn active_mask(&self) -> Vec<bool> {
+        self.timeline.active_mask()
+    }
+
+    #[must_use]
+    pub fn current_drift_state(&self) -> &PublicMhdDriftState2d {
+        &self.drift
+    }
+
+    #[must_use]
+    pub fn retained_rates(&self) -> &MhdMfmRates2d {
+        &self.old_rates
+    }
+
     /// Drift active particles to the earliest occupied bin.
     ///
     /// Inactive columns retain their preceding predictor epoch until
@@ -2082,6 +2193,21 @@ impl PublicMhdInitialHierarchy2d {
         self.drift_particle_to_current(index)
     }
 
+    /// Conservatively materialize every predictor at the current sync.
+    ///
+    /// This is useful for dense validation traversals. Sparse production
+    /// callers should drift only neighbors encountered by active targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for predictor arithmetic.
+    pub fn drift_all_particles_to_current(&mut self) -> Result<(), MhdEvolution2dError> {
+        for i in 0..self.start.positions.len() {
+            self.drift_particle_to_current(i)?;
+        }
+        Ok(())
+    }
+
     /// Materialize the current predicted particle view after the caller has
     /// lazily drifted every neighbor needed by its traversal.
     ///
@@ -2104,9 +2230,83 @@ impl PublicMhdInitialHierarchy2d {
         Ok(state)
     }
 
-    /// Refresh the density/gradient caches of the currently arriving active
-    /// targets. Required inactive neighbors must already have been lazily
-    /// drifted with [`Self::drift_neighbor_to_current`].
+    fn projected_search_state_at_current(&self) -> Result<MhdMfmState2d, MhdEvolution2dError> {
+        let mut state = self.predicted_state()?;
+        let current_tick = self.timeline.current_tick();
+        for i in 0..state.positions.len() {
+            let source_tick = self.predictor_ticks[i];
+            if source_tick > current_tick {
+                return Err(invalid(
+                    Some(i),
+                    "hierarchy_predictor_tick",
+                    self.timeline.current_time(),
+                ));
+            }
+            if source_tick == current_tick {
+                continue;
+            }
+            let segment = self.timeline.duration_for_ticks(current_tick - source_tick);
+            let velocity = self.drift.actual_velocities[i];
+            state.positions[i] = state
+                .domain
+                .wrap(state.positions[i] + Vector2::new(velocity.x, velocity.y) * segment)?;
+            let divergence_increment =
+                (self.old_rates.velocity_divergence[i] * segment).clamp(-0.3, 0.3);
+            state.smoothing_lengths[i] *= (0.5 * divergence_increment).exp();
+        }
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn required_active_neighbors(&self, active: &[bool]) -> Result<Vec<bool>, MhdEvolution2dError> {
+        let state = self.projected_search_state_at_current()?;
+        let pairs = interacting_pairs_for_targets_2d(
+            &state.positions,
+            &state.smoothing_lengths,
+            state.domain,
+            active,
+        )?;
+        let mut required = active.to_vec();
+        for pair in pairs {
+            if active[pair.i] {
+                required[pair.j] = true;
+            }
+            if active[pair.j] {
+                required[pair.i] = true;
+            }
+        }
+        Ok(required)
+    }
+
+    fn drift_required_active_neighbors_to_current(
+        &mut self,
+        active: &[bool],
+    ) -> Result<(), MhdEvolution2dError> {
+        let required = self.required_active_neighbors(active)?;
+        for (i, &is_required) in required.iter().enumerate() {
+            if is_required {
+                self.drift_particle_to_current(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn has_stale_required_active_neighbor(
+        &self,
+        active: &[bool],
+    ) -> Result<bool, MhdEvolution2dError> {
+        let required = self.required_active_neighbors(active)?;
+        let current_tick = self.timeline.current_tick();
+        Ok(required
+            .iter()
+            .zip(&self.predictor_ticks)
+            .any(|(&is_required, &tick)| is_required && tick != current_tick))
+    }
+
+    /// Lazily materialize the inactive neighbors required by arriving active
+    /// targets, then refresh their density/gradient caches. Neighbor discovery
+    /// uses projected current geometry without splitting unrelated inactive
+    /// predictor intervals.
     ///
     /// # Errors
     ///
@@ -2124,25 +2324,36 @@ impl PublicMhdInitialHierarchy2d {
             ));
         }
         let active = self.timeline.active_mask();
-        let mut state = self.predicted_state()?;
-        refresh_mhd_active_target_caches_2d(
-            &mut state,
-            &mut self.primitive_cache,
-            &mut self.gradient_cache,
-            &mut self.moment_cache,
-            &mut self.face_closure_cache,
-            &active,
-            &self.old_rates.stored_magnetic_divergence,
-            desired_neighbors,
-            neighbor_tolerance,
-        )?;
-        for (i, &is_active) in active.iter().enumerate() {
-            if is_active {
-                self.drift.predicted_density[i] = self.primitive_cache.density[i];
-                self.drift.predicted_smoothing_lengths[i] = state.smoothing_lengths[i];
+        let count = self.start.positions.len();
+        for _ in 0..=count {
+            self.drift_required_active_neighbors_to_current(&active)?;
+            let mut state = self.projected_search_state_at_current()?;
+            refresh_mhd_active_target_caches_2d(
+                &mut state,
+                &mut self.primitive_cache,
+                &mut self.gradient_cache,
+                &mut self.moment_cache,
+                &mut self.face_closure_cache,
+                &active,
+                &self.old_rates.stored_magnetic_divergence,
+                desired_neighbors,
+                neighbor_tolerance,
+            )?;
+            for (i, &is_active) in active.iter().enumerate() {
+                if is_active {
+                    self.drift.predicted_density[i] = self.primitive_cache.density[i];
+                    self.drift.predicted_smoothing_lengths[i] = state.smoothing_lengths[i];
+                }
+            }
+            if !self.has_stale_required_active_neighbor(&active)? {
+                return Ok(());
             }
         }
-        Ok(())
+        Err(invalid(
+            None,
+            "hierarchy_neighbor_materialization",
+            self.timeline.current_time(),
+        ))
     }
 
     /// Evaluate the currently arriving active targets against the retained
@@ -2165,6 +2376,13 @@ impl PublicMhdInitialHierarchy2d {
             ));
         }
         let active = self.timeline.active_mask();
+        if self.has_stale_required_active_neighbor(&active)? {
+            return Err(invalid(
+                None,
+                "hierarchy_stale_force_neighbor",
+                self.timeline.current_time(),
+            ));
+        }
         let particle_timesteps: Vec<_> = self
             .timeline
             .step_ticks()
@@ -2172,7 +2390,7 @@ impl PublicMhdInitialHierarchy2d {
             .map(|&ticks| self.timeline.duration_for_ticks(ticks))
             .collect();
         mhd_mfm_active_target_rates_with_cache_2d(
-            &self.predicted_state()?,
+            &self.projected_search_state_at_current()?,
             &self.primitive_cache,
             &self.gradient_cache,
             &self.moment_cache,
@@ -2332,6 +2550,7 @@ impl PublicMhdInitialHierarchy2d {
             }
         }
         self.old_rates = endpoint.rates.clone();
+        self.pending_wakeup.clone_from(&endpoint.wakeup);
         self.awaiting_second_kick = false;
         Ok(PublicMhdHierarchyKickResult2d {
             state,
@@ -2355,14 +2574,32 @@ impl PublicMhdInitialHierarchy2d {
         active_bounds: &[Option<f64>],
     ) -> Result<PublicMhdHierarchySync2d, MhdEvolution2dError> {
         let mut next = self.clone();
-        let result = next.begin_next_sync_without_wakeups_in_place(active_bounds)?;
+        let result = next.begin_next_sync_in_place(active_bounds, false)?;
         *self = next;
         Ok(result)
     }
 
-    fn begin_next_sync_without_wakeups_in_place(
+    /// Apply pending public wakeups, reassign current active steps, perform
+    /// the next first kicks, and drift to the following synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, a wakeup whose neighbor predictor
+    /// was not brought current, or kick/drift arithmetic.
+    pub fn begin_next_sync(
         &mut self,
         active_bounds: &[Option<f64>],
+    ) -> Result<PublicMhdHierarchySync2d, MhdEvolution2dError> {
+        let mut next = self.clone();
+        let result = next.begin_next_sync_in_place(active_bounds, true)?;
+        *self = next;
+        Ok(result)
+    }
+
+    fn begin_next_sync_in_place(
+        &mut self,
+        active_bounds: &[Option<f64>],
+        process_wakeups: bool,
     ) -> Result<PublicMhdHierarchySync2d, MhdEvolution2dError> {
         if self.awaiting_second_kick {
             return Err(invalid(
@@ -2373,6 +2610,23 @@ impl PublicMhdInitialHierarchy2d {
         }
         let active = self.timeline.active_mask();
         self.timeline.reassign_active_bounds(active_bounds)?;
+        if process_wakeups {
+            let transitions = self.timeline.apply_wakeups(&self.pending_wakeup)?;
+            for transition in transitions {
+                self.reverse_wakeup_kick_to_current(
+                    transition.index,
+                    transition.old_endpoint_tick,
+                    transition.new_step_active_at_current,
+                )?;
+            }
+            self.pending_wakeup.fill(false);
+        } else if self.pending_wakeup.iter().any(|&wakeup| wakeup) {
+            return Err(invalid(
+                None,
+                "hierarchy_pending_wakeup",
+                self.timeline.current_time(),
+            ));
+        }
         for (i, &is_active) in active.iter().enumerate() {
             if !is_active {
                 continue;
@@ -2461,6 +2715,64 @@ impl PublicMhdInitialHierarchy2d {
     #[must_use]
     pub fn actual_cleaning_mass(&self) -> &[f64] {
         &self.half_cleaning
+    }
+
+    fn reverse_wakeup_kick_to_current(
+        &mut self,
+        i: usize,
+        old_endpoint_tick: u64,
+        new_step_active_at_current: bool,
+    ) -> Result<(), MhdEvolution2dError> {
+        let current_tick = self.timeline.current_tick();
+        if self.predictor_ticks[i] != current_tick {
+            return Err(invalid(
+                Some(i),
+                "wakeup_neighbor_predictor_tick",
+                self.timeline.current_time(),
+            ));
+        }
+        let reverse_start_tick = old_endpoint_tick.max(self.predictor_ticks[i]);
+        if new_step_active_at_current && current_tick < reverse_start_tick {
+            let duration = -self
+                .timeline
+                .duration_for_ticks(reverse_start_tick - current_tick);
+            self.drift.actual_velocities[i] =
+                self.drift.actual_velocities[i] + self.old_rates.acceleration[i] * duration;
+            self.half_internal[i] = limited_internal_energy_update_signed_public_2d(
+                self.half_internal[i],
+                self.old_rates.specific_internal_energy[i],
+                duration,
+                self.minimum_specific_internal_energy,
+            )?;
+            self.half_magnetic[i] =
+                self.half_magnetic[i] + self.old_rates.magnetic_volume[i] * duration;
+            let cleaning_kick = kick_cleaning_mass_public_2d(
+                self.half_cleaning[i],
+                self.drift.predicted_cleaning_mass[i],
+                self.old_rates.cleaning_mass[i],
+                self.old_rates.cleaning_damping_rate[i],
+                duration,
+                self.start.masses[i],
+                self.primitive_cache.density[i],
+                self.primitive_cache.pressure[i],
+                self.primitive_cache.magnetic[i],
+                self.start.gamma,
+                self.old_rates.maximum_signal_speed[i],
+                self.old_rates.global_fastest_wave_speed,
+            );
+            self.half_cleaning[i] = cleaning_kick.value;
+            self.old_rates.cleaning_mass[i] = cleaning_kick.effective_rate;
+            self.drift.predicted_velocities[i] = self.drift.actual_velocities[i];
+            self.drift.predicted_specific_internal_energy[i] = self.half_internal[i];
+            self.primitive_cache.pressure[i] =
+                (self.start.gamma - 1.0) * self.primitive_cache.density[i] * self.half_internal[i];
+        }
+        self.drift.predicted_magnetic_volume[i] = self.half_magnetic[i];
+        self.drift.predicted_cleaning_mass[i] = self.half_cleaning[i];
+        let volume = self.start.masses[i] / self.primitive_cache.density[i];
+        self.primitive_cache.magnetic[i] = self.half_magnetic[i] / volume;
+        self.primitive_cache.cleaning_scalar[i] = self.half_cleaning[i] / self.start.masses[i];
+        Ok(())
     }
 
     fn drift_particle_to_current(&mut self, i: usize) -> Result<(), MhdEvolution2dError> {
@@ -3126,6 +3438,31 @@ fn limited_internal_energy_update_2d(
     .max(floor))
 }
 
+fn limited_internal_energy_update_signed_public_2d(
+    previous: f64,
+    rate: f64,
+    timestep: f64,
+    floor: f64,
+) -> Result<f64, MhdEvolution2dError> {
+    let candidate = previous + timestep * rate;
+    if !previous.is_finite()
+        || previous <= 0.0
+        || !rate.is_finite()
+        || !timestep.is_finite()
+        || !floor.is_finite()
+        || floor < 0.0
+        || !candidate.is_finite()
+    {
+        return Err(invalid(None, "signed_internal_energy_update", candidate));
+    }
+    Ok(if candidate < 0.5 * previous {
+        0.5 * previous
+    } else {
+        candidate
+    }
+    .max(floor))
+}
+
 fn predict_cleaning_mass_2d(current: f64, rate: f64, damping_rate: f64, timestep: f64) -> f64 {
     (current + timestep * rate) * (-timestep * damping_rate).exp()
 }
@@ -3180,8 +3517,16 @@ fn kick_cleaning_mass_public_2d(
             updated += timestep * rate;
         }
     }
+    // kicks.c applies parabolic Dedner damping only for a forward kick.
+    // Wakeup correction calls this path with t_start > t_end; reversing the
+    // exponential would spuriously amplify phi.
+    let damping_factor = if timestep > 0.0 {
+        (-timestep * damping_rate).exp()
+    } else {
+        1.0
+    };
     CleaningKick2d {
-        value: updated * (-timestep * damping_rate).exp(),
+        value: updated * damping_factor,
         effective_rate,
         reset_predicted,
     }
@@ -3239,9 +3584,36 @@ fn primitive_gradients(
     primitive: &MhdPrimitiveColumns2d,
     previous_stored_magnetic_divergence: Option<&[f64]>,
 ) -> Result<MhdPrimitiveGradients2d, MhdEvolution2dError> {
+    let targets = vec![true; state.positions.len()];
+    let moments = inverse_moments_2d(&state.positions, &state.smoothing_lengths, state.domain)?;
+    let zero_divergence;
+    let previous_stored_magnetic_divergence =
+        if let Some(values) = previous_stored_magnetic_divergence {
+            values
+        } else {
+            zero_divergence = vec![0.0; state.positions.len()];
+            &zero_divergence
+        };
+    primitive_gradients_for_targets(
+        state,
+        primitive,
+        previous_stored_magnetic_divergence,
+        &targets,
+        &moments,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn primitive_gradients_for_targets(
+    state: &MhdMfmState2d,
+    primitive: &MhdPrimitiveColumns2d,
+    previous_stored_magnetic_divergence: &[f64],
+    targets: &[bool],
+    moments: &[InverseMoment2d],
+) -> Result<MhdPrimitiveGradients2d, MhdEvolution2dError> {
     let velocity = vector_columns(&state.velocities);
     let magnetic = vector_columns(&primitive.magnetic);
-    let limiter = gradient_limiter_geometry(state)?;
+    let limiter = gradient_limiter_geometry_for_targets(state, targets, moments)?;
     let fields: [&[f64]; 9] = [
         &primitive.density,
         &primitive.pressure,
@@ -3253,18 +3625,36 @@ fn primitive_gradients(
         &magnetic[2],
         &primitive.cleaning_scalar,
     ];
-    let mut raw = scalar_gradients_batch_with_moments_2d(
+    let mut raw = scalar_gradients_batch_with_moments_for_targets_2d(
         &state.positions,
         &fields,
         &state.smoothing_lengths,
         state.domain,
         &limiter.moments,
+        targets,
     )?;
+    let mut raw: Vec<Vec<Vector2>> = raw
+        .drain(..)
+        .map(|field| {
+            field
+                .into_iter()
+                .enumerate()
+                .map(|(index, gradient)| {
+                    if targets[index] {
+                        gradient.ok_or_else(|| {
+                            invalid(Some(index), "missing active scalar gradient", f64::NAN)
+                        })
+                    } else {
+                        Ok(Vector2::ZERO)
+                    }
+                })
+                .collect()
+        })
+        .collect::<Result<_, _>>()?;
     let magnetic_distance_fraction: Vec<f64> = (0..state.positions.len())
         .map(|i| {
             let base = base_gradient_limiter_fraction(limiter.moments[i].condition_number);
-            let integrated_divergence =
-                previous_stored_magnetic_divergence.map_or(0.0, |values| values[i]);
+            let integrated_divergence = previous_stored_magnetic_divergence[i];
             let volume = state.masses[i] / primitive.density[i];
             let normalization = (1.0e-37
                 + 2.0 * primitive.pressure[i] * volume * volume
@@ -3364,6 +3754,7 @@ fn primitive_gradients(
     Ok(gradients)
 }
 
+#[cfg(test)]
 fn gradient_limiter_geometry(
     state: &MhdMfmState2d,
 ) -> Result<GradientLimiterGeometry2d, MhdEvolution2dError> {
@@ -3378,6 +3769,36 @@ fn gradient_limiter_geometry(
         pairs,
         maximum_neighbor_distance,
         moments,
+    })
+}
+
+fn gradient_limiter_geometry_for_targets(
+    state: &MhdMfmState2d,
+    targets: &[bool],
+    moments: &[InverseMoment2d],
+) -> Result<GradientLimiterGeometry2d, MhdEvolution2dError> {
+    validate_lengths(
+        state.positions.len(),
+        &[
+            ("active_mask", targets.len()),
+            ("inverse_moments", moments.len()),
+        ],
+    )?;
+    let pairs = interacting_pairs_for_targets_2d(
+        &state.positions,
+        &state.smoothing_lengths,
+        state.domain,
+        targets,
+    )?;
+    let mut maximum_neighbor_distance = vec![0.0_f64; state.positions.len()];
+    for pair in &pairs {
+        maximum_neighbor_distance[pair.i] = maximum_neighbor_distance[pair.i].max(pair.distance);
+        maximum_neighbor_distance[pair.j] = maximum_neighbor_distance[pair.j].max(pair.distance);
+    }
+    Ok(GradientLimiterGeometry2d {
+        pairs,
+        maximum_neighbor_distance,
+        moments: moments.to_vec(),
     })
 }
 
@@ -4158,6 +4579,11 @@ mod tests {
         let rates = mhd_mfm_spatial_rates_2d(&state, no_sources()).unwrap();
         let primitive = state.primitive_columns().unwrap();
         let bounds = public_mhd_particle_timestep_bounds_2d(&state, &rates, 0.2, 0.01).unwrap();
+        let cached_bounds = public_mhd_particle_timestep_bounds_from_primitive_2d(
+            &state, &primitive, &rates, 0.2, 0.01,
+        )
+        .unwrap();
+        assert_eq!(cached_bounds, bounds);
         for (i, bound) in bounds.iter().enumerate() {
             let effective_neighbor_root =
                 (std::f64::consts::PI * state.smoothing_lengths[i].powi(2) * primitive.density[i]
@@ -4173,6 +4599,22 @@ mod tests {
             .fold(f64::INFINITY, f64::min);
         let actual_global = global_public_mhd_timestep_bound_2d(&state, &rates, 0.2, 0.01).unwrap();
         assert_eq!(actual_global.to_bits(), expected_global.to_bits());
+
+        let mut retained = primitive;
+        retained.density[0] *= 1.21;
+        retained.pressure[0] *= 1.21;
+        let retained_bounds = public_mhd_particle_timestep_bounds_from_primitive_2d(
+            &state, &retained, &rates, 0.2, 0.01,
+        )
+        .unwrap();
+        assert_ne!(
+            retained_bounds[0].courant.to_bits(),
+            bounds[0].courant.to_bits()
+        );
+        assert!(
+            (retained_bounds[0].courant - bounds[0].courant / 1.1).abs()
+                <= 4.0 * f64::EPSILON * bounds[0].courant
+        );
     }
 
     #[test]
@@ -4267,7 +4709,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn initial_hierarchy_uses_particle_half_steps_and_minimum_bin_sync() {
         let state = sheet(16, 4, true);
         let rates = mhd_mfm_spatial_rates_2d(&state, no_sources()).unwrap();
@@ -4327,6 +4769,17 @@ mod tests {
         assert_eq!(
             hierarchy.drift.predicted_velocities[0],
             state.velocities[0] + rates.acceleration[0] * drift_duration
+        );
+        hierarchy.drift_all_particles_to_current().unwrap();
+        assert!(
+            hierarchy
+                .predictor_ticks()
+                .iter()
+                .all(|&tick| tick == short_ticks)
+        );
+        assert_eq!(
+            hierarchy.current_drift_state().positions,
+            hierarchy.drift.positions
         );
         assert_eq!(hierarchy.retained_gradient_cache(), &initial_gradient_cache);
         assert!(hierarchy.drift_to_first_sync().is_err());
@@ -4586,6 +5039,51 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
+    fn active_refresh_materializes_neighbors_without_splitting_far_predictors() {
+        let state = sheet(16, 4, true);
+        let controls = no_sources();
+        let rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let short_ticks = 1_u64 << 49;
+        let long_ticks = 1_u64 << 51;
+        let timebins: Vec<_> = (0..state.positions.len())
+            .map(|i| {
+                let ticks = if i == 1 { short_ticks } else { long_ticks };
+                PublicMhdInitialTimebin2d {
+                    bounded_timestep: ticks as f64 * tick_duration,
+                    raw_ticks: ticks,
+                    ticks,
+                    time_bin: ticks.ilog2(),
+                    duration: ticks as f64 * tick_duration,
+                }
+            })
+            .collect();
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let sync = hierarchy.drift_to_first_sync().unwrap();
+        assert_eq!(
+            sync.active.iter().filter(|&&is_active| is_active).count(),
+            1
+        );
+        hierarchy
+            .refresh_arriving_active_caches(20.0, 0.05)
+            .unwrap();
+        let current_count = hierarchy
+            .predictor_ticks()
+            .iter()
+            .filter(|&&tick| tick == short_ticks)
+            .count();
+        assert!(current_count > 1);
+        assert!(current_count < state.positions.len());
+        assert!(hierarchy.predictor_ticks().contains(&0));
+        hierarchy
+            .evaluate_arriving_active_rates(controls, 0.2)
+            .unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn full_sync_refreshes_dedner_global_before_the_next_first_kick() {
         let mut state = sheet(16, 4, true);
         state.cleaning_mass.fill(1.0e-6);
@@ -4645,6 +5143,183 @@ mod tests {
             let expected = before * (-half_timestep * kicked.rates.cleaning_damping_rate[i]).exp();
             assert_eq!(hierarchy.half_cleaning[i].to_bits(), expected.to_bits());
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn wakeup_rebins_without_reverse_when_the_new_bin_is_inactive_now() {
+        let state = sheet(16, 4, true);
+        let controls = no_sources();
+        let rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let short_ticks = 1_u64 << 49;
+        let old_woken_ticks = 1_u64 << 51;
+        let new_woken_ticks = 1_u64 << 50;
+        let timebins: Vec<_> = (0..state.positions.len())
+            .map(|i| {
+                let ticks = if i == 0 { old_woken_ticks } else { short_ticks };
+                PublicMhdInitialTimebin2d {
+                    bounded_timestep: ticks as f64 * tick_duration,
+                    raw_ticks: ticks,
+                    ticks,
+                    time_bin: ticks.ilog2(),
+                    duration: ticks as f64 * tick_duration,
+                }
+            })
+            .collect();
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let sync = hierarchy.drift_to_first_sync().unwrap();
+        assert!(!sync.active[0]);
+        hierarchy.drift_neighbor_to_current(0).unwrap();
+        let before_actual_velocity = hierarchy.drift.actual_velocities[0];
+        let before_actual_internal = hierarchy.half_internal[0];
+        let before_predicted_velocity = hierarchy.drift.predicted_velocities[0];
+        let mut wakeup = vec![false; state.positions.len()];
+        wakeup[0] = true;
+        let endpoint = PublicMhdActiveRateResult2d {
+            rates: rates.clone(),
+            wakeup,
+            controls,
+        };
+        hierarchy.finish_arriving_active_kicks(endpoint).unwrap();
+        let bounds: Vec<_> = sync
+            .active
+            .iter()
+            .map(|&is_active| is_active.then_some(short_ticks as f64 * tick_duration))
+            .collect();
+        let before_failed_transition = hierarchy.clone();
+        assert!(hierarchy.begin_next_sync_without_wakeups(&bounds).is_err());
+        assert_eq!(hierarchy, before_failed_transition);
+        let next = hierarchy.begin_next_sync(&bounds).unwrap();
+        assert_eq!(next.tick, new_woken_ticks);
+        assert!(next.active.iter().all(|&is_active| is_active));
+        assert_eq!(hierarchy.timeline.begin_ticks()[0], short_ticks);
+        assert_eq!(hierarchy.timeline.step_ticks()[0], new_woken_ticks);
+        assert_eq!(hierarchy.drift.actual_velocities[0], before_actual_velocity);
+        assert_eq!(
+            hierarchy.half_internal[0].to_bits(),
+            before_actual_internal.to_bits()
+        );
+        let forward_duration = (new_woken_ticks - short_ticks) as f64 * tick_duration;
+        assert_eq!(
+            hierarchy.drift.predicted_velocities[0],
+            before_predicted_velocity + rates.acceleration[0] * forward_duration
+        );
+        assert_eq!(hierarchy.predictor_ticks()[0], new_woken_ticks);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    fn wakeup_reverse_kicks_when_the_new_bin_is_also_active_now() {
+        let mut state = sheet(16, 4, true);
+        state.cleaning_mass.fill(1.0e-6);
+        let controls = DivergenceControl2d::default();
+        let rates = mhd_mfm_spatial_rates_2d(&state, controls).unwrap();
+        let tick_duration = 1.0 / crate::LEGACY_TIMEBASE_TICKS as f64;
+        let short_ticks = 1_u64 << 49;
+        let old_woken_ticks = 1_u64 << 51;
+        let timebins: Vec<_> = (0..state.positions.len())
+            .map(|i| {
+                let ticks = if i == 0 { old_woken_ticks } else { short_ticks };
+                PublicMhdInitialTimebin2d {
+                    bounded_timestep: ticks as f64 * tick_duration,
+                    raw_ticks: ticks,
+                    ticks,
+                    time_bin: ticks.ilog2(),
+                    duration: ticks as f64 * tick_duration,
+                }
+            })
+            .collect();
+        let mut hierarchy =
+            begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
+                .unwrap();
+        let first = hierarchy.drift_to_first_sync().unwrap();
+        let quiet_endpoint = PublicMhdActiveRateResult2d {
+            rates: rates.clone(),
+            wakeup: vec![false; state.positions.len()],
+            controls,
+        };
+        hierarchy
+            .finish_arriving_active_kicks(quiet_endpoint)
+            .unwrap();
+        let first_bounds: Vec<_> = first
+            .active
+            .iter()
+            .map(|&is_active| is_active.then_some(short_ticks as f64 * tick_duration))
+            .collect();
+        let second = hierarchy.begin_next_sync(&first_bounds).unwrap();
+        assert_eq!(second.tick, 2 * short_ticks);
+        assert!(!second.active[0]);
+        hierarchy.drift_neighbor_to_current(0).unwrap();
+        let before_actual_velocity = hierarchy.drift.actual_velocities[0];
+        let before_actual_internal = hierarchy.half_internal[0];
+        let before_actual_cleaning = hierarchy.half_cleaning[0];
+        let before_predicted_cleaning = hierarchy.drift.predicted_cleaning_mass[0];
+        let before_cleaning_rate = hierarchy.old_rates.cleaning_mass[0];
+        let before_primitive = hierarchy.primitive_cache.clone();
+        let mut wakeup = vec![false; state.positions.len()];
+        wakeup[0] = true;
+        hierarchy
+            .finish_arriving_active_kicks(PublicMhdActiveRateResult2d {
+                rates: rates.clone(),
+                wakeup,
+                controls,
+            })
+            .unwrap();
+        let second_bounds: Vec<_> = second
+            .active
+            .iter()
+            .map(|&is_active| is_active.then_some(short_ticks as f64 * tick_duration))
+            .collect();
+        let third = hierarchy.begin_next_sync(&second_bounds).unwrap();
+        assert_eq!(third.tick, 3 * short_ticks);
+        assert!(third.active[0]);
+        assert_eq!(hierarchy.timeline.begin_ticks()[0], 2 * short_ticks);
+        assert_eq!(hierarchy.timeline.step_ticks()[0], short_ticks);
+        let reverse_duration = -2.0 * short_ticks as f64 * tick_duration;
+        let expected_actual_velocity =
+            before_actual_velocity + rates.acceleration[0] * reverse_duration;
+        assert_eq!(
+            hierarchy.drift.actual_velocities[0],
+            expected_actual_velocity
+        );
+        let expected_actual_internal = limited_internal_energy_update_signed_public_2d(
+            before_actual_internal,
+            rates.specific_internal_energy[0],
+            reverse_duration,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(
+            hierarchy.half_internal[0].to_bits(),
+            expected_actual_internal.to_bits()
+        );
+        let expected_cleaning_without_reverse_damping = kick_cleaning_mass_public_2d(
+            before_actual_cleaning,
+            before_predicted_cleaning,
+            before_cleaning_rate,
+            0.0,
+            reverse_duration,
+            state.masses[0],
+            before_primitive.density[0],
+            before_primitive.pressure[0],
+            before_primitive.magnetic[0],
+            state.gamma,
+            rates.maximum_signal_speed[0],
+            rates.global_fastest_wave_speed,
+        );
+        assert_eq!(
+            hierarchy.half_cleaning[0].to_bits(),
+            expected_cleaning_without_reverse_damping.value.to_bits()
+        );
+        let forward_duration = short_ticks as f64 * tick_duration;
+        assert_eq!(
+            hierarchy.drift.predicted_velocities[0],
+            expected_actual_velocity + rates.acceleration[0] * forward_duration
+        );
+        assert_eq!(hierarchy.predictor_ticks()[0], 3 * short_ticks);
     }
 
     #[test]
@@ -4758,6 +5433,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, clippy::too_many_lines)]
     fn active_cache_refresh_leaves_inactive_geometry_and_gradients_bitwise_stale() {
         let mut state = sheet(16, 4, true);
         let mut primitive = state.primitive_columns().unwrap();
@@ -4781,6 +5457,47 @@ mod tests {
         state.specific_internal_energy[1] *= 1.25;
         let mut active = vec![false; state.positions.len()];
         active[1] = true;
+
+        // Reconstruct the former all-target temporary path as an oracle for
+        // the active slots committed by the target-index implementation.
+        let mut expected_state = state.clone();
+        let solved = solve_public_c_smoothing_lengths_from_seeds_2d(
+            &expected_state.positions,
+            &expected_state.masses,
+            &expected_state.smoothing_lengths,
+            expected_state.domain,
+            20.0,
+            0.05,
+        )
+        .unwrap();
+        expected_state.smoothing_lengths[1] = solved[1].smoothing_length;
+        let fresh_primitive = expected_state.primitive_columns().unwrap();
+        let mut expected_primitive = primitive.clone();
+        expected_primitive.density[1] = fresh_primitive.density[1];
+        expected_primitive.dhsml_factor[1] = fresh_primitive.dhsml_factor[1];
+        expected_primitive.pressure[1] = fresh_primitive.pressure[1];
+        expected_primitive.magnetic[1] = fresh_primitive.magnetic[1];
+        expected_primitive.cleaning_scalar[1] = fresh_primitive.cleaning_scalar[1];
+        let expected_moments = inverse_moments_2d(
+            &expected_state.positions,
+            &expected_state.smoothing_lengths,
+            expected_state.domain,
+        )
+        .unwrap();
+        let expected_closure = face_closure_diagnostics_2d(
+            &expected_state.positions,
+            &expected_state.masses,
+            &expected_state.smoothing_lengths,
+            expected_state.domain,
+        )
+        .unwrap();
+        let expected_gradients = primitive_gradients(
+            &expected_state,
+            &expected_primitive,
+            Some(&rates.stored_magnetic_divergence),
+        )
+        .unwrap();
+
         refresh_mhd_active_target_caches_2d(
             &mut state,
             &mut primitive,
@@ -4793,6 +5510,39 @@ mod tests {
             0.05,
         )
         .unwrap();
+        assert_eq!(
+            state.smoothing_lengths[1],
+            expected_state.smoothing_lengths[1]
+        );
+        assert_eq!(primitive.density[1], expected_primitive.density[1]);
+        assert_eq!(
+            primitive.dhsml_factor[1],
+            expected_primitive.dhsml_factor[1]
+        );
+        assert_eq!(primitive.pressure[1], expected_primitive.pressure[1]);
+        assert_eq!(primitive.magnetic[1], expected_primitive.magnetic[1]);
+        assert_eq!(
+            primitive.cleaning_scalar[1],
+            expected_primitive.cleaning_scalar[1]
+        );
+        assert_eq!(moments[1], expected_moments[1]);
+        assert_eq!(
+            closure[1].legacy_dimensionless_leak,
+            expected_closure[1].legacy_dimensionless_leak
+        );
+        assert_eq!(gradients.density[1], expected_gradients.density[1]);
+        assert_eq!(gradients.pressure[1], expected_gradients.pressure[1]);
+        for component in 0..3 {
+            assert_eq!(
+                gradients.velocity[component][1],
+                expected_gradients.velocity[component][1]
+            );
+            assert_eq!(
+                gradients.magnetic[component][1],
+                expected_gradients.magnetic[component][1]
+            );
+        }
+        assert_eq!(gradients.cleaning[1], expected_gradients.cleaning[1]);
         assert_ne!(
             primitive.pressure[1].to_bits(),
             old_active_pressure.to_bits()

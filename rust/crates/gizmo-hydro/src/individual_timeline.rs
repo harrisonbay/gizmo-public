@@ -61,6 +61,17 @@ pub struct IndividualParticleTimeline {
     step_ticks: Vec<u64>,
 }
 
+/// Literal scheduling mutation performed by public C's `process_wake_ups`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndividualWakeupTransition {
+    pub index: usize,
+    pub old_begin_tick: u64,
+    pub old_step_ticks: u64,
+    pub new_step_ticks: u64,
+    pub old_endpoint_tick: u64,
+    pub new_step_active_at_current: bool,
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -307,6 +318,61 @@ impl IndividualParticleTimeline {
         Ok(())
     }
 
+    /// Shorten flagged inactive particles so they are synchronized at the
+    /// next occupied-bin endpoint.
+    ///
+    /// This is the scheduling half of public C's `process_wake_ups()`.
+    /// Physics callers use the returned former endpoint to apply the
+    /// corresponding negative-duration old-force kick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched flags or an invalid/finished schedule.
+    pub fn apply_wakeups(
+        &mut self,
+        wakeup: &[bool],
+    ) -> Result<Vec<IndividualWakeupTransition>, IndividualTimelineError> {
+        if wakeup.len() != self.step_ticks.len() {
+            return Err(IndividualTimelineError::MismatchedLength {
+                expected: self.step_ticks.len(),
+                actual: wakeup.len(),
+            });
+        }
+        let next_sync = self.next_sync_tick()?;
+        let maximum_next_active_bin = next_sync.trailing_zeros().min(59);
+        let maximum_next_active_step = 1_u64 << maximum_next_active_bin;
+        let active = self.active_mask();
+        let mut transitions = Vec::new();
+        for (index, &flagged) in wakeup.iter().enumerate() {
+            if !flagged || active[index] {
+                continue;
+            }
+            let old_step_ticks = self.step_ticks[index];
+            let new_step_ticks = old_step_ticks.min(maximum_next_active_step);
+            if new_step_ticks == old_step_ticks {
+                continue;
+            }
+            let old_begin_tick = self.begin_ticks[index];
+            let old_endpoint_tick = old_begin_tick
+                .checked_add(old_step_ticks)
+                .ok_or(IndividualTimelineError::BeyondTimelineEnd)?;
+            transitions.push(IndividualWakeupTransition {
+                index,
+                old_begin_tick,
+                old_step_ticks,
+                new_step_ticks,
+                old_endpoint_tick,
+                new_step_active_at_current: self.current_tick % new_step_ticks == 0,
+            });
+        }
+        for transition in &transitions {
+            self.time_bins[transition.index] = bin_for_step(transition.new_step_ticks);
+            self.begin_ticks[transition.index] = self.current_tick;
+            self.step_ticks[transition.index] = transition.new_step_ticks;
+        }
+        Ok(transitions)
+    }
+
     fn tick_duration(&self) -> f64 {
         (self.time_max - self.time_begin) / LEGACY_TIMEBASE_TICKS as f64
     }
@@ -463,6 +529,77 @@ mod tests {
         assert_eq!(
             timeline.reassign_active_bounds(&[Some(physical_ticks(4)), None]),
             Err(IndividualTimelineError::MissingActiveBound { index: 1 })
+        );
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn wakeup_shortens_an_inactive_step_to_the_next_sync_divisor() {
+        let mut timeline =
+            IndividualParticleTimeline::from_initial_steps(0.0, 1.0, &[2, 8]).unwrap();
+        assert_eq!(timeline.advance_to_next_sync().unwrap(), [true, false]);
+        timeline
+            .reassign_active_bounds(&[Some(physical_ticks(2)), None])
+            .unwrap();
+        let transitions = timeline.apply_wakeups(&[false, true]).unwrap();
+        assert_eq!(
+            transitions,
+            [IndividualWakeupTransition {
+                index: 1,
+                old_begin_tick: 0,
+                old_step_ticks: 8,
+                new_step_ticks: 4,
+                old_endpoint_tick: 8,
+                new_step_active_at_current: false,
+            }]
+        );
+        assert_eq!(timeline.begin_ticks(), &[2, 2]);
+        assert_eq!(timeline.step_ticks(), &[2, 4]);
+        assert_eq!(timeline.active_mask(), [true, false]);
+        assert_eq!(timeline.advance_to_next_sync().unwrap(), [true, true]);
+        assert_eq!(timeline.current_tick(), 4);
+    }
+
+    #[test]
+    fn wakeup_ignores_currently_active_and_already_synchronized_bins() {
+        let mut timeline =
+            IndividualParticleTimeline::from_initial_steps(0.0, 1.0, &[2, 4, 8]).unwrap();
+        timeline.advance_to_next_sync().unwrap();
+        let before = timeline.clone();
+        assert!(
+            timeline
+                .apply_wakeups(&[true, true, false])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn wakeup_records_when_the_new_bin_is_also_active_now() {
+        let mut timeline =
+            IndividualParticleTimeline::from_initial_steps(0.0, 1.0, &[2, 8]).unwrap();
+        timeline.advance_to_next_sync().unwrap();
+        timeline.advance_to_next_sync().unwrap();
+        let transitions = timeline.apply_wakeups(&[false, true]).unwrap();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].new_step_ticks, 2);
+        assert!(transitions[0].new_step_active_at_current);
+        assert_eq!(timeline.current_tick(), 4);
+    }
+
+    #[test]
+    fn failed_wakeup_is_transactional() {
+        let mut timeline =
+            IndividualParticleTimeline::from_initial_steps(0.0, 1.0, &[2, 8]).unwrap();
+        timeline.advance_to_next_sync().unwrap();
+        let before = timeline.clone();
+        assert_eq!(
+            timeline.apply_wakeups(&[true]),
+            Err(IndividualTimelineError::MismatchedLength {
+                expected: 2,
+                actual: 1,
+            })
         );
         assert_eq!(timeline, before);
     }

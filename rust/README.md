@@ -15,8 +15,10 @@ with synchronized KDK stepping and writes checked, upstream-compatible HDF5
 snapshots. The Brio-Wu slice additionally implements rectangular-periodic 2-D
 MFM geometry, adaptive smoothing lengths, limited planar MLS gradients,
 arbitrary-normal HLLD, Powell/Dedner terms, synchronized 2-D KDK, exact
-per-particle time-bin selection, and the hierarchical initial kick/drift
-event. Other physics/configuration profiles fail closed.
+per-particle time-bin selection, active-target cached force evaluation,
+hierarchical KDK kick/drift events, literal public wakeup/reverse-kick
+semantics, and a hierarchy-backed strict CLI trajectory. Other
+physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh

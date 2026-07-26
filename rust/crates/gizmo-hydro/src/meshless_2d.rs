@@ -491,18 +491,68 @@ pub fn interacting_pairs_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<InteractionPair2d>, GeometryError> {
+    interacting_pairs_for_targets_2d(
+        positions,
+        smoothing_lengths,
+        domain,
+        &vec![true; positions.len()],
+    )
+}
+
+/// Enumerate unordered union-support pairs incident on selected targets.
+///
+/// Unlike [`interacting_pairs_2d`], inactive-inactive pairs are never
+/// traversed. The result retains the same lexicographic canonical ordering.
+///
+/// # Errors
+///
+/// Returns an error for invalid geometry or a mismatched target mask.
+pub fn interacting_pairs_for_targets_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+) -> Result<Vec<InteractionPair2d>, GeometryError> {
     validate_geometry_columns(positions, smoothing_lengths, domain)?;
+    if targets.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "targets",
+            expected: positions.len(),
+            actual: targets.len(),
+        });
+    }
     if positions.is_empty() {
         return Ok(Vec::new());
     }
     let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
     let index = CellList2d::new(positions, domain, maximum_support)?;
+    let all_targets = targets.iter().all(|&is_target| is_target);
     let mut pair_indices = Vec::new();
-    for (source, (&position, &support)) in positions.iter().zip(smoothing_lengths).enumerate() {
-        for neighbor in index.neighbors_within(position, support)? {
+    for (source, ((&position, &support), &is_target)) in positions
+        .iter()
+        .zip(smoothing_lengths)
+        .zip(targets)
+        .enumerate()
+    {
+        if !is_target {
+            continue;
+        }
+        // With every particle targeted, the original directed H_i traversal
+        // discovers the complete union-support set without exposing every
+        // source to a single large-H outlier. A sparse target set must query
+        // H_max so it also discovers r > H_target, r < H_neighbor pairs.
+        let query_radius = if all_targets {
+            support
+        } else {
+            maximum_support
+        };
+        for neighbor in index.neighbors_within(position, query_radius)? {
             if neighbor != source {
                 let distance = domain.displacement(position, positions[neighbor])?.norm();
-                if distance > 0.0 {
+                if distance > 0.0
+                    && (distance < smoothing_lengths[source]
+                        || distance < smoothing_lengths[neighbor])
+                {
                     pair_indices.push(if source < neighbor {
                         (source, neighbor)
                     } else {
@@ -610,6 +660,31 @@ pub fn particle_divergence_at_hsml_2d(
     dhsml_factors: &[f64],
     domain: Box2d,
 ) -> Result<Vec<f64>, GeometryError> {
+    particle_divergence_at_hsml_for_targets_2d(
+        positions,
+        velocities,
+        smoothing_lengths,
+        dhsml_factors,
+        domain,
+        &vec![true; positions.len()],
+    )
+}
+
+/// Evaluate the density-loop divergence for selected targets only.
+///
+/// Inactive output entries are zero and no inactive target kernel is queried.
+///
+/// # Errors
+///
+/// Returns an error for invalid columns, geometry, or a mismatched mask.
+pub fn particle_divergence_at_hsml_for_targets_2d(
+    positions: &[Vector2],
+    velocities: &[Vector2],
+    smoothing_lengths: &[f64],
+    dhsml_factors: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+) -> Result<Vec<f64>, GeometryError> {
     validate_geometry_columns(positions, smoothing_lengths, domain)?;
     if velocities.len() != positions.len() {
         return Err(GeometryError::MismatchedLength {
@@ -625,6 +700,13 @@ pub fn particle_divergence_at_hsml_2d(
             actual: dhsml_factors.len(),
         });
     }
+    if targets.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "targets",
+            expected: positions.len(),
+            actual: targets.len(),
+        });
+    }
     for (index, velocity) in velocities.iter().enumerate() {
         if !velocity.is_finite() {
             return Err(GeometryError::NonFiniteResult {
@@ -636,8 +718,11 @@ pub fn particle_divergence_at_hsml_2d(
     }
     let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
     let neighbors = CellList2d::new(positions, domain, maximum_support)?;
-    let mut output = Vec::with_capacity(positions.len());
+    let mut output = vec![0.0; positions.len()];
     for (particle, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        if !targets[particle] {
+            continue;
+        }
         let mut kernel_sum = 0.0;
         let mut divergence_sum = 0.0;
         for neighbor in neighbors.neighbors_within(position, hsml)? {
@@ -663,7 +748,7 @@ pub fn particle_divergence_at_hsml_2d(
                 value: divergence,
             });
         }
-        output.push(divergence);
+        output[particle] = divergence;
     }
     Ok(output)
 }
@@ -690,7 +775,51 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_2d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, GeometryError> {
-    validate_particle_columns(positions, masses, seeds, domain)?;
+    let targets = vec![true; positions.len()];
+    solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+        positions,
+        masses,
+        seeds,
+        domain,
+        desired_neighbors,
+        tolerance,
+        &targets,
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(index, estimate)| {
+        estimate.ok_or(GeometryError::NonFiniteResult {
+            index,
+            field: "missing all-target smoothing-length estimate",
+            value: f64::NAN,
+        })
+    })
+    .collect()
+}
+
+/// Run the public-C density/smoothing-length solve for selected targets.
+///
+/// The result has particle-column length. Inactive entries are [`None`], and
+/// inactive masses/seeds are not evaluated. All positions remain part of the
+/// neighbor distribution.
+///
+/// # Errors
+///
+/// Returns an error for invalid shared geometry, an invalid active target,
+/// invalid neighbor constraints, or failure of an active target to converge.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+    positions: &[Vector2],
+    masses: &[f64],
+    seeds: &[f64],
+    domain: Box2d,
+    desired_neighbors: f64,
+    tolerance: f64,
+    targets: &[bool],
+) -> Result<Vec<Option<AdaptiveDensityEstimate>>, GeometryError> {
+    validate_positions(positions, domain)?;
+    validate_target_column_lengths(positions.len(), masses.len(), "masses", targets)?;
+    validate_target_column_lengths(positions.len(), seeds.len(), "smoothing_lengths", targets)?;
     if !desired_neighbors.is_finite()
         || desired_neighbors <= 0.0
         || !tolerance.is_finite()
@@ -702,20 +831,42 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_2d(
             tolerance,
         });
     }
-    if positions.is_empty() {
-        return Ok(Vec::new());
+    let mut output: Vec<Option<AdaptiveDensityEstimate>> =
+        (0..positions.len()).map(|_| None).collect();
+    if positions.is_empty() || !targets.iter().any(|&target| target) {
+        return Ok(output);
+    }
+    for (index, &is_target) in targets.iter().enumerate() {
+        if !is_target {
+            continue;
+        }
+        if !masses[index].is_finite() || masses[index] <= 0.0 {
+            return Err(GeometryError::InvalidPoint {
+                index: Some(index),
+                field: "mass",
+                value: masses[index],
+            });
+        }
+        if !seeds[index].is_finite() || seeds[index] <= 0.0 {
+            return Err(GeometryError::InvalidPoint {
+                index: Some(index),
+                field: "smoothing_length",
+                value: seeds[index],
+            });
+        }
     }
 
     // The cell layout is only an acceleration structure: queries remain exact
     // for radii larger than this construction scale as H grows during solving.
-    let maximum_seed = seeds.iter().copied().fold(0.0_f64, f64::max);
-    let neighbor_index = CellList2d::new(positions, domain, maximum_seed)?;
-    seeds
+    let maximum_seed = seeds
         .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, seed)| {
-            solve_public_c_particle_from_seed_2d(
+        .zip(targets)
+        .filter_map(|(&seed, &is_target)| is_target.then_some(seed))
+        .fold(0.0_f64, f64::max);
+    let neighbor_index = CellList2d::new(positions, domain, maximum_seed)?;
+    for (index, (&seed, &is_target)) in seeds.iter().zip(targets).enumerate() {
+        if is_target {
+            output[index] = Some(solve_public_c_particle_from_seed_2d(
                 index,
                 positions,
                 masses,
@@ -724,9 +875,10 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_2d(
                 tolerance,
                 seed,
                 &neighbor_index,
-            )
-        })
-        .collect()
+            )?);
+        }
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1003,14 +1155,53 @@ pub fn inverse_moments_2d(
     smoothing_lengths: &[f64],
     domain: Box2d,
 ) -> Result<Vec<InverseMoment2d>, GeometryError> {
-    validate_geometry_columns(positions, smoothing_lengths, domain)?;
-    if positions.is_empty() {
-        return Ok(Vec::new());
+    let targets = vec![true; positions.len()];
+    inverse_moments_for_targets_2d(positions, smoothing_lengths, domain, &targets)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, moment)| {
+            moment.ok_or(GeometryError::NonFiniteResult {
+                index,
+                field: "missing all-target inverse moment",
+                value: f64::NAN,
+            })
+        })
+        .collect()
+}
+
+/// Build and invert MLS moments for selected targets only.
+///
+/// Inactive entries are [`None`]. Their smoothing lengths are neither
+/// validated nor queried.
+///
+/// # Errors
+///
+/// Returns an error for invalid shared positions, invalid active supports, a
+/// mismatched mask, or a singular active-target moment.
+pub fn inverse_moments_for_targets_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    targets: &[bool],
+) -> Result<Vec<Option<InverseMoment2d>>, GeometryError> {
+    validate_positions(positions, domain)?;
+    validate_target_column_lengths(
+        positions.len(),
+        smoothing_lengths.len(),
+        "smoothing_lengths",
+        targets,
+    )?;
+    let mut output: Vec<Option<InverseMoment2d>> = (0..positions.len()).map(|_| None).collect();
+    if positions.is_empty() || !targets.iter().any(|&target| target) {
+        return Ok(output);
     }
-    let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
+    let maximum_support =
+        validate_active_supports_and_maximum(smoothing_lengths, targets, "smoothing_length")?;
     let index = CellList2d::new(positions, domain, maximum_support)?;
-    let mut output = Vec::with_capacity(positions.len());
     for (particle, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        if !targets[particle] {
+            continue;
+        }
         let mut xx = 0.0;
         let mut xy = 0.0;
         let mut yy = 0.0;
@@ -1025,7 +1216,7 @@ pub fn inverse_moments_2d(
             xy += weight * displacement.x * displacement.y;
             yy += weight * displacement.y * displacement.y;
         }
-        output.push(invert_symmetric_moment(particle, xx, xy, yy)?);
+        output[particle] = Some(invert_symmetric_moment(particle, xx, xy, yy)?);
     }
     Ok(output)
 }
@@ -1134,7 +1325,58 @@ pub fn scalar_gradients_batch_with_moments_2d(
     domain: Box2d,
     moments: &[InverseMoment2d],
 ) -> Result<Vec<Vec<Vector2>>, GeometryError> {
-    validate_geometry_columns(positions, smoothing_lengths, domain)?;
+    let targets = vec![true; positions.len()];
+    scalar_gradients_batch_with_moments_for_targets_2d(
+        positions,
+        fields,
+        smoothing_lengths,
+        domain,
+        moments,
+        &targets,
+    )?
+    .into_iter()
+    .map(|field| {
+        field
+            .into_iter()
+            .enumerate()
+            .map(|(index, gradient)| {
+                gradient.ok_or(GeometryError::NonFiniteResult {
+                    index,
+                    field: "missing all-target scalar gradient",
+                    value: f64::NAN,
+                })
+            })
+            .collect()
+    })
+    .collect()
+}
+
+/// Evaluate batched scalar MLS gradients for selected targets.
+///
+/// The supplied moment cache and each returned field have full particle
+/// length. Inactive output entries are [`None`]; inactive moments and supports
+/// are not evaluated. Field values are validated when an active target reads
+/// them as a center or neighbor.
+///
+/// # Errors
+///
+/// Returns an error for invalid shared geometry, mismatched columns, or
+/// non-finite data involved in an active-target result.
+pub fn scalar_gradients_batch_with_moments_for_targets_2d(
+    positions: &[Vector2],
+    fields: &[&[f64]],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+    targets: &[bool],
+) -> Result<Vec<Vec<Option<Vector2>>>, GeometryError> {
+    validate_positions(positions, domain)?;
+    validate_target_column_lengths(
+        positions.len(),
+        smoothing_lengths.len(),
+        "smoothing_lengths",
+        targets,
+    )?;
     if moments.len() != positions.len() {
         return Err(GeometryError::MismatchedLength {
             field: "inverse_moments",
@@ -1143,15 +1385,31 @@ pub fn scalar_gradients_batch_with_moments_2d(
         });
     }
     for field in fields {
-        validate_values(field, positions.len(), "scalar_values")?;
+        if field.len() != positions.len() {
+            return Err(GeometryError::MismatchedLength {
+                field: "scalar_values",
+                expected: positions.len(),
+                actual: field.len(),
+            });
+        }
     }
     if positions.is_empty() {
         return Ok(vec![Vec::new(); fields.len()]);
     }
-    let maximum_support = smoothing_lengths.iter().copied().fold(0.0_f64, f64::max);
+    if !targets.iter().any(|&target| target) {
+        return Ok(fields.iter().map(|_| vec![None; positions.len()]).collect());
+    }
+    let maximum_support =
+        validate_active_supports_and_maximum(smoothing_lengths, targets, "smoothing_length")?;
     let index = CellList2d::new(positions, domain, maximum_support)?;
     let mut numerators = vec![vec![Vector2::ZERO; positions.len()]; fields.len()];
     for (center, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        if !targets[center] {
+            continue;
+        }
+        for values in fields {
+            validate_scalar_value(values[center], center, "scalar_values")?;
+        }
         for neighbor in index.neighbors_within(position, hsml)? {
             if neighbor == center {
                 continue;
@@ -1159,6 +1417,7 @@ pub fn scalar_gradients_batch_with_moments_2d(
             let displacement = domain.displacement(position, positions[neighbor])?;
             let weight = cubic_kernel_2d(displacement.norm(), hsml)?.weight;
             for (field_index, values) in fields.iter().enumerate() {
+                validate_scalar_value(values[neighbor], neighbor, "scalar_values")?;
                 let delta = values[neighbor] - values[center];
                 numerators[field_index][center].x -= weight * displacement.x * delta;
                 numerators[field_index][center].y -= weight * displacement.y * delta;
@@ -1173,9 +1432,12 @@ pub fn scalar_gradients_batch_with_moments_2d(
                 .zip(moments)
                 .enumerate()
                 .map(|(index, (numerator, moment))| {
+                    if !targets[index] {
+                        return Ok(None);
+                    }
                     let gradient = moment.matrix.mul_vector(numerator);
                     if gradient.is_finite() {
-                        Ok(gradient)
+                        Ok(Some(gradient))
                     } else {
                         Err(GeometryError::NonFiniteResult {
                             index,
@@ -1187,6 +1449,86 @@ pub fn scalar_gradients_batch_with_moments_2d(
                 .collect()
         })
         .collect()
+}
+
+/// Compute the public density-loop closure leak for selected targets.
+///
+/// This uses the supplied persistent inverse-moment cache and intentionally
+/// does not construct pair faces or any force-loop closure diagnostics.
+/// Inactive entries are [`None`].
+///
+/// # Errors
+///
+/// Returns an error for invalid shared positions, invalid active supports, a
+/// mismatched cache/mask, or non-finite active-target arithmetic.
+pub fn legacy_face_closure_for_targets_with_moments_2d(
+    positions: &[Vector2],
+    smoothing_lengths: &[f64],
+    domain: Box2d,
+    moments: &[InverseMoment2d],
+    targets: &[bool],
+) -> Result<Vec<Option<f64>>, GeometryError> {
+    validate_positions(positions, domain)?;
+    validate_target_column_lengths(
+        positions.len(),
+        smoothing_lengths.len(),
+        "smoothing_lengths",
+        targets,
+    )?;
+    if moments.len() != positions.len() {
+        return Err(GeometryError::MismatchedLength {
+            field: "inverse_moments",
+            expected: positions.len(),
+            actual: moments.len(),
+        });
+    }
+    let mut output = vec![None; positions.len()];
+    if positions.is_empty() || !targets.iter().any(|&target| target) {
+        return Ok(output);
+    }
+    let maximum_support =
+        validate_active_supports_and_maximum(smoothing_lengths, targets, "smoothing_length")?;
+    let index = CellList2d::new(positions, domain, maximum_support)?;
+    for (particle, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        if !targets[particle] {
+            continue;
+        }
+        let mut kernel_sum = 0.0;
+        let mut first_moment = Vector2::ZERO;
+        let mut moment_trace = 0.0;
+        for neighbor in index.neighbors_within(position, hsml)? {
+            let displacement = domain.displacement(position, positions[neighbor])?;
+            let radius = displacement.norm();
+            let kernel = cubic_kernel_2d(radius, hsml)?;
+            kernel_sum += kernel.weight;
+            if radius > 0.0 {
+                first_moment += displacement * kernel.weight;
+                moment_trace += kernel.weight * displacement.squared_norm();
+            }
+        }
+        if kernel_sum <= 0.0 || moment_trace <= 0.0 {
+            return Err(GeometryError::NonFiniteResult {
+                index: particle,
+                field: "closure moments",
+                value: kernel_sum.min(moment_trace),
+            });
+        }
+        let leak = public_c_face_closure_error_2d(
+            kernel_sum,
+            moment_trace,
+            moments[particle].matrix,
+            first_moment,
+        );
+        if !leak.is_finite() {
+            return Err(GeometryError::NonFiniteResult {
+                index: particle,
+                field: "face closure error",
+                value: leak,
+            });
+        }
+        output[particle] = Some(leak);
+    }
+    Ok(output)
 }
 
 /// Unlimited vector MLS gradients.
@@ -1480,6 +1822,66 @@ pub fn face_closure_diagnostics_2d(
 fn validate_positions(positions: &[Vector2], domain: Box2d) -> Result<(), GeometryError> {
     for (index, &position) in positions.iter().enumerate() {
         domain.validate_wrapped(position, Some(index))?;
+    }
+    Ok(())
+}
+
+fn validate_target_column_lengths(
+    expected: usize,
+    actual: usize,
+    field: &'static str,
+    targets: &[bool],
+) -> Result<(), GeometryError> {
+    if targets.len() != expected {
+        return Err(GeometryError::MismatchedLength {
+            field: "targets",
+            expected,
+            actual: targets.len(),
+        });
+    }
+    if actual != expected {
+        return Err(GeometryError::MismatchedLength {
+            field,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_active_supports_and_maximum(
+    smoothing_lengths: &[f64],
+    targets: &[bool],
+    field: &'static str,
+) -> Result<f64, GeometryError> {
+    let mut maximum = 0.0_f64;
+    for (index, (&hsml, &is_target)) in smoothing_lengths.iter().zip(targets).enumerate() {
+        if !is_target {
+            continue;
+        }
+        if !hsml.is_finite() || hsml <= 0.0 {
+            return Err(GeometryError::InvalidPoint {
+                index: Some(index),
+                field,
+                value: hsml,
+            });
+        }
+        maximum = maximum.max(hsml);
+    }
+    Ok(maximum)
+}
+
+fn validate_scalar_value(
+    value: f64,
+    index: usize,
+    field: &'static str,
+) -> Result<(), GeometryError> {
+    if !value.is_finite() {
+        return Err(GeometryError::InvalidPoint {
+            index: Some(index),
+            field,
+            value,
+        });
     }
     Ok(())
 }
@@ -1837,6 +2239,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+        let targets = [true, false, false, false, false];
+        let targeted =
+            interacting_pairs_for_targets_2d(&positions, &hsml, domain, &targets).unwrap();
+        assert_eq!(
+            targeted
+                .iter()
+                .map(|pair| (pair.i, pair.j))
+                .collect::<Vec<_>>(),
+            pairs
+                .iter()
+                .filter(|pair| targets[pair.i] || targets[pair.j])
+                .map(|pair| (pair.i, pair.j))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1896,6 +2312,59 @@ mod tests {
                 particle.estimate.effective_neighbors / (PI * particle.smoothing_length.powi(2));
             assert!((particle.estimate.density - mass * kernel_sum).abs() < 1.0e-12);
         }
+    }
+
+    #[test]
+    fn target_public_c_solver_matches_all_target_results_and_ignores_inactive_inputs() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let (positions, masses, seeds) = square_lattice(8, domain);
+        let desired = 20.0;
+        let tolerance = 0.05;
+        let all = solve_public_c_smoothing_lengths_from_seeds_2d(
+            &positions, &masses, &seeds, domain, desired, tolerance,
+        )
+        .unwrap();
+        let targets: Vec<_> = (0..positions.len()).map(|index| index % 7 == 0).collect();
+        let selected = solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+            &positions, &masses, &seeds, domain, desired, tolerance, &targets,
+        )
+        .unwrap();
+        for (index, &is_target) in targets.iter().enumerate() {
+            assert_eq!(selected[index], is_target.then_some(all[index]));
+        }
+
+        let mut invalid_masses = masses;
+        let mut invalid_seeds = seeds;
+        for (index, &is_target) in targets.iter().enumerate() {
+            if !is_target {
+                invalid_masses[index] = f64::NAN;
+                invalid_seeds[index] = 0.0;
+            }
+        }
+        let isolated = solve_public_c_smoothing_lengths_from_seeds_for_targets_2d(
+            &positions,
+            &invalid_masses,
+            &invalid_seeds,
+            domain,
+            desired,
+            tolerance,
+            &targets,
+        )
+        .unwrap();
+        for (index, &is_target) in targets.iter().enumerate() {
+            assert_eq!(isolated[index], is_target.then_some(all[index]));
+        }
+        assert!(
+            solve_public_c_smoothing_lengths_from_seeds_2d(
+                &positions,
+                &invalid_masses,
+                &invalid_seeds,
+                domain,
+                desired,
+                tolerance,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1980,6 +2449,138 @@ mod tests {
             assert!((gradient.x + 1.0).abs() < 2.0e-13, "{gradient:?}");
             assert!((gradient.y - 4.0).abs() < 2.0e-13, "{gradient:?}");
         }
+    }
+
+    #[test]
+    fn target_moments_gradients_and_legacy_closure_match_full_results() {
+        let domain = Box2d::new(1.0, 1.0).unwrap();
+        let (positions, masses, hsml) = square_lattice(8, domain);
+        let targets: Vec<_> = (0..positions.len()).map(|index| index % 5 == 1).collect();
+        let moments = inverse_moments_2d(&positions, &hsml, domain).unwrap();
+        let selected_moments =
+            inverse_moments_for_targets_2d(&positions, &hsml, domain, &targets).unwrap();
+        for (index, &is_target) in targets.iter().enumerate() {
+            assert_eq!(selected_moments[index], is_target.then_some(moments[index]));
+        }
+
+        let first: Vec<_> = positions
+            .iter()
+            .map(|point| 3.0 * point.x - 2.0 * point.y)
+            .collect();
+        let second: Vec<_> = positions
+            .iter()
+            .map(|point| -point.x + 4.0 * point.y)
+            .collect();
+        let all_gradients = scalar_gradients_batch_with_moments_2d(
+            &positions,
+            &[&first, &second],
+            &hsml,
+            domain,
+            &moments,
+        )
+        .unwrap();
+        let selected_gradients = scalar_gradients_batch_with_moments_for_targets_2d(
+            &positions,
+            &[&first, &second],
+            &hsml,
+            domain,
+            &moments,
+            &targets,
+        )
+        .unwrap();
+        for field in 0..all_gradients.len() {
+            for (index, &is_target) in targets.iter().enumerate() {
+                assert_eq!(
+                    selected_gradients[field][index],
+                    is_target.then_some(all_gradients[field][index])
+                );
+            }
+        }
+
+        let diagnostics = face_closure_diagnostics_2d(&positions, &masses, &hsml, domain).unwrap();
+        let selected_closure = legacy_face_closure_for_targets_with_moments_2d(
+            &positions, &hsml, domain, &moments, &targets,
+        )
+        .unwrap();
+        for (index, &is_target) in targets.iter().enumerate() {
+            assert_eq!(
+                selected_closure[index],
+                is_target.then_some(diagnostics[index].legacy_dimensionless_leak)
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_degenerate_particles_do_not_poison_target_geometry() {
+        let domain = Box2d::new(10.0, 10.0).unwrap();
+        let positions = vec![
+            Vector2::new(5.0, 5.0),
+            Vector2::new(5.2, 5.0),
+            Vector2::new(4.8, 5.0),
+            Vector2::new(5.0, 5.2),
+            Vector2::new(5.0, 4.8),
+            Vector2::new(1.0, 1.0),
+        ];
+        let targets = vec![true, false, false, false, false, false];
+        let hsml = vec![0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let selected = inverse_moments_for_targets_2d(&positions, &hsml, domain, &targets).unwrap();
+        assert!(selected[0].is_some());
+        assert!(selected[1..].iter().all(Option::is_none));
+        assert!(inverse_moments_2d(&positions, &hsml, domain).is_err());
+
+        let valid = selected[0].unwrap();
+        let invalid = InverseMoment2d {
+            matrix: Matrix2::new(f64::NAN, 0.0, 0.0, f64::NAN),
+            condition_number: f64::NAN,
+            diagonal_regularization: f64::NAN,
+        };
+        let mut moments = vec![invalid; positions.len()];
+        moments[0] = valid;
+        let mut values: Vec<_> = positions
+            .iter()
+            .map(|point| point.x + 2.0 * point.y)
+            .collect();
+        values[5] = f64::NAN;
+        let gradients = scalar_gradients_batch_with_moments_for_targets_2d(
+            &positions,
+            &[&values],
+            &hsml,
+            domain,
+            &moments,
+            &targets,
+        )
+        .unwrap();
+        assert!(gradients[0][0].unwrap().is_finite());
+        assert!(gradients[0][1..].iter().all(Option::is_none));
+        assert!(
+            scalar_gradients_batch_with_moments_2d(
+                &positions,
+                &[&values],
+                &hsml,
+                domain,
+                &moments,
+            )
+            .is_err()
+        );
+
+        let closure = legacy_face_closure_for_targets_with_moments_2d(
+            &positions, &hsml, domain, &moments, &targets,
+        )
+        .unwrap();
+        assert!(closure[0].unwrap().is_finite());
+        assert!(closure[1..].iter().all(Option::is_none));
+
+        let no_targets = vec![false; positions.len()];
+        let empty_gradients = scalar_gradients_batch_with_moments_for_targets_2d(
+            &positions,
+            &[&values],
+            &hsml,
+            domain,
+            &moments,
+            &no_targets,
+        )
+        .unwrap();
+        assert_eq!(empty_gradients, vec![vec![None; positions.len()]]);
     }
 
     #[test]

@@ -57,8 +57,11 @@ arbitrary-normal HLLD, the MFM entropic/PdV energy correction, Powell/Dedner
 terms and safety limiters, the density-loop `Particle_DivVel` estimator,
 public-C adaptive smoothing lengths, synchronized primitive KDK evolution, and
 the exact initial per-particle timestep bounds and `2^60` bin scheduler. The
-strict CLI accepts this profile without a one-dimensional projection and
-writes `t=0`, `0.1`, and `0.2` snapshots.
+hierarchical path retains inactive predictors/rates/gradients, materializes
+only active force neighbors, refreshes target-index geometry, and reproduces
+the public wakeup/reverse-kick ordering. The strict CLI uses that hierarchy
+without a one-dimensional projection and writes `t=0`, `0.1`, and `0.2`
+snapshots.
 
 Run the pinned initialization, three-pass adaptive-H, and full production
 two-dimensional RHS gate with:
@@ -80,12 +83,15 @@ event applies each particle's own half-kick and reaches maximum
 `|vx|=0.0181975` and `|vy|=0.0263302`, matching the corrected-C extrema that
 the synchronized step could not reproduce.
 
-The remaining work is endpoint evolution. Corrected C recomputes and kicks only
-active targets while inactive neighbors lazily drift predicted primitives from
-retained endpoint rates and stale gradients. This MFM build has no deferred
-equal-and-opposite flux ledger. Porting that persistent target-local state and
-mutable lazy-neighbor traversal is the principal blocker before a Rust `t=0.2`
-profile can be promoted to the 5% gate.
+Endpoint evolution is now ported: only active targets refresh and kick, while
+required inactive neighbors lazily drift predicted primitives from retained
+endpoint rates and gradients. This MFM build has no deferred equal-and-opposite
+flux ledger, matching the public path. The remaining blocker before promoting
+the Rust `t=0.2` trajectory to the 5% gate is validation: run the full fixture
+to completion, reduce its `t=0.1`/`t=0.2` snapshots, and compare them against
+the pinned corrected-C and digitized published profiles. The requested
+particle-ID time-bin/early-sync dump is still needed to independently verify
+the hierarchy rather than merely reproduce the public source semantics.
 
 ## Approximate published-figure reference
 
@@ -171,8 +177,8 @@ The terminal Rust acceptance gate must still require:
 - corrected-C profile agreement at `t=0.1` and `t=0.2`;
 - an independent exact/profile or convergence oracle once upstream publishes
   it;
-- equivalent handling or an explicitly quantified comparison of synchronized
-  versus hierarchical time stepping.
+- particle-ID hierarchy agreement at early synchronization points once the
+  upstream dump is available.
 
 The real fixture/rectangular-domain gate and the separate `gamma=2`
 corrected-C HLLD table are already active. The existing

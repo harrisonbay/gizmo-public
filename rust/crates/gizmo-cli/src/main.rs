@@ -19,8 +19,9 @@ use gizmo_hydro::mhd_evolution::{
 };
 use gizmo_hydro::mhd_evolution_2d::{
     DivergenceControl2d, MhdMfmRates2d, MhdMfmState2d, PublicMhdDriftState2d,
-    begin_public_mhd_kdk_adaptive_2d, finish_public_mhd_kdk_adaptive_2d,
-    global_public_mhd_timestep_bound_2d, mhd_mfm_spatial_rates_2d,
+    begin_public_mhd_initial_hierarchy_2d, mhd_mfm_spatial_rates_2d,
+    public_mhd_particle_timestep_bounds_2d, public_mhd_particle_timestep_bounds_from_primitive_2d,
+    quantize_public_mhd_initial_timebins_2d,
 };
 use gizmo_hydro::{
     BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
@@ -1864,7 +1865,7 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
             .unwrap_or(1.0),
         ..Default::default()
     };
-    let mut state = MhdMfmState2d::from_primitive(
+    let state = MhdMfmState2d::from_primitive(
         positions,
         initialized.masses.clone(),
         velocities,
@@ -1876,102 +1877,121 @@ fn evolve_briowu(initialized: &InitializedBrioWu) -> Result<(), ApplicationError
         2.0,
     )
     .map_err(ApplicationError::MhdEvolution2d)?;
-    let mut rates =
+    let rates =
         mhd_mfm_spatial_rates_2d(&state, controls).map_err(ApplicationError::MhdEvolution2d)?;
-    let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
-        .map_err(ApplicationError::Hydro)?;
-    let mut time = timeline.current_time();
+    let initial_bounds = public_mhd_particle_timestep_bounds_2d(
+        &state,
+        &rates,
+        initialized.parameters.courant_factor,
+        initialized.parameters.integration_accuracy,
+    )
+    .map_err(ApplicationError::MhdEvolution2d)?;
+    let initial_timebins = quantize_public_mhd_initial_timebins_2d(
+        &initial_bounds,
+        0.0,
+        initialized.parameters.time_max,
+        initialized.parameters.max_timestep,
+    )
+    .map_err(ApplicationError::MhdEvolution2d)?;
+    let mut hierarchy = begin_public_mhd_initial_hierarchy_2d(
+        &state,
+        &rates,
+        &initial_timebins,
+        0.0,
+        initialized.parameters.time_max,
+        0.0,
+    )
+    .map_err(ApplicationError::MhdEvolution2d)?;
     let mut snapshot_number = 0_u32;
     let mut step_count = 0_u64;
-
-    for output_index in 1..=2_u32 {
-        let output_time = if output_index == 2 {
-            initialized.parameters.time_max
+    write_briowu_drift_snapshot(
+        initialized,
+        &state.masses,
+        hierarchy.current_drift_state(),
+        hierarchy.retained_rates(),
+        output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+        0.0,
+    )?;
+    snapshot_number += 1;
+    let mut sync = hierarchy
+        .drift_to_first_sync()
+        .map_err(ApplicationError::MhdEvolution2d)?;
+    loop {
+        let next_output_time = if snapshot_number == 1 {
+            initialized.parameters.time_between_snapshots
         } else {
-            f64::from(output_index) * initialized.parameters.time_between_snapshots
+            initialized.parameters.time_max
         };
-        while time < output_time {
-            let desired_timestep = global_public_mhd_timestep_bound_2d(
-                &state,
-                &rates,
-                initialized.parameters.courant_factor,
-                initialized.parameters.integration_accuracy,
-            )
-            .map_err(ApplicationError::MhdEvolution2d)?;
-            let synchronized = timeline
-                .select_step(
-                    desired_timestep.min(output_time - time),
-                    initialized.parameters.max_timestep,
-                )
-                .map_err(ApplicationError::Hydro)?;
-            let timestep = synchronized.duration;
-            let expected_synchronized_timestep = initialized.parameters.time_max / 2048.0;
-            if timestep.to_bits() != expected_synchronized_timestep.to_bits() {
-                return Err(ApplicationError::StateMismatch(format!(
-                    "public Brio-Wu global-cadence oracle failed: selected dt={timestep:.17e}, \
-                     expected {expected_synchronized_timestep:.17e}"
-                )));
-            }
-            let mut step = begin_public_mhd_kdk_adaptive_2d(
-                &state,
-                &rates,
-                timestep,
-                0.0,
-                controls,
+        let tolerance = 64.0 * f64::EPSILON * next_output_time.abs().max(f64::MIN_POSITIVE);
+        if sync.time > next_output_time + tolerance {
+            return Err(ApplicationError::StateMismatch(format!(
+                "hierarchical Brio-Wu schedule skipped output {next_output_time:.17e}; \
+                 arrived at {:.17e}",
+                sync.time
+            )));
+        }
+        if (sync.time - next_output_time).abs() <= tolerance {
+            hierarchy
+                .drift_all_particles_to_current()
+                .map_err(ApplicationError::MhdEvolution2d)?;
+            write_briowu_drift_snapshot(
+                initialized,
+                &state.masses,
+                hierarchy.current_drift_state(),
+                hierarchy.retained_rates(),
+                output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                next_output_time,
+            )?;
+            snapshot_number += 1;
+        }
+        let terminal_sync = hierarchy.current_tick() >= LEGACY_TIMEBASE_TICKS;
+        hierarchy
+            .refresh_arriving_active_caches(
                 initialized.parameters.desired_num_neighbors,
                 initialized.parameters.max_neighbor_deviation,
-                initialized.parameters.courant_factor,
             )
             .map_err(ApplicationError::MhdEvolution2d)?;
-            if snapshot_number == 0 {
-                let initial_view = step
-                    .drift_state(0.0)
-                    .map_err(ApplicationError::MhdEvolution2d)?;
-                write_briowu_drift_snapshot(
-                    initialized,
-                    &state.masses,
-                    &initial_view,
-                    &rates,
-                    output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
-                    time,
-                )?;
-                snapshot_number += 1;
-            }
-            let endpoint_view = step
-                .drift_state(timestep)
-                .map_err(ApplicationError::MhdEvolution2d)?;
-            let endpoint_time = time + timestep;
-            let tolerance = 64.0 * f64::EPSILON * output_time.abs().max(1.0);
-            if (endpoint_time - output_time).abs() <= tolerance {
-                write_briowu_drift_snapshot(
-                    initialized,
-                    &state.masses,
-                    &endpoint_view,
-                    &rates,
-                    output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
-                    output_time,
-                )?;
-                snapshot_number += 1;
-            }
-            let result = finish_public_mhd_kdk_adaptive_2d(step)
-                .map_err(ApplicationError::MhdEvolution2d)?;
-            state = result.state;
-            rates = result.rates;
-            timeline
-                .advance(synchronized)
-                .map_err(ApplicationError::Hydro)?;
-            time = timeline.current_time();
-            if (time - output_time).abs() <= tolerance {
-                time = output_time;
-            }
-            step_count = step_count.checked_add(1).ok_or_else(|| {
-                ApplicationError::StateMismatch("2-D MHD step count overflow".to_owned())
-            })?;
+        let endpoint = hierarchy
+            .evaluate_arriving_active_rates(controls, initialized.parameters.courant_factor)
+            .map_err(ApplicationError::MhdEvolution2d)?;
+        let kicked = hierarchy
+            .finish_arriving_active_kicks(endpoint)
+            .map_err(ApplicationError::MhdEvolution2d)?;
+        step_count = step_count.checked_add(1).ok_or_else(|| {
+            ApplicationError::StateMismatch("2-D MHD step count overflow".to_owned())
+        })?;
+        if terminal_sync {
+            break;
         }
+        let bounds = public_mhd_particle_timestep_bounds_from_primitive_2d(
+            &kicked.state,
+            hierarchy.predicted_primitive_cache(),
+            &kicked.rates,
+            initialized.parameters.courant_factor,
+            initialized.parameters.integration_accuracy,
+        )
+        .map_err(ApplicationError::MhdEvolution2d)?;
+        let active = hierarchy.active_mask();
+        let active_bounds: Vec<_> = active
+            .iter()
+            .zip(&bounds)
+            .map(|(&is_active, bound)| {
+                is_active.then_some(bound.selected.min(initialized.parameters.max_timestep))
+            })
+            .collect();
+        sync = hierarchy
+            .begin_next_sync(&active_bounds)
+            .map_err(ApplicationError::MhdEvolution2d)?;
     }
+    if snapshot_number != 3 {
+        return Err(ApplicationError::StateMismatch(format!(
+            "hierarchical Brio-Wu wrote {snapshot_number} snapshots, expected 3"
+        )));
+    }
+    let time = hierarchy.current_time();
     eprintln!(
-        "completed {step_count} synchronized 2-D MHD KDK steps to t={time:.17e}; \
-         wrote {snapshot_number} snapshots (the public C run uses hierarchical time bins)"
+        "completed {step_count} hierarchical 2-D MHD KDK events to t={time:.17e}; \
+         wrote {snapshot_number} snapshots"
     );
     Ok(())
 }
@@ -3017,6 +3037,60 @@ ResubmitCommand none
                 Err(ApplicationError::UnsupportedParameters(_))
             ));
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn tiny_briowu_cli_trajectory_uses_hierarchical_events() {
+        let mut parameters = read_briowu_parameters(BRIOWU_FRONTIER_PARAMETERS).unwrap();
+        parameters.time_max = 8.0 / LEGACY_TIMEBASE_TICKS as f64;
+        parameters.max_timestep = 2.0 / LEGACY_TIMEBASE_TICKS as f64;
+        parameters.time_between_snapshots = 4.0 / LEGACY_TIMEBASE_TICKS as f64;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output_dir =
+            std::env::temp_dir().join(format!("gizmo-tiny-briowu-{}-{nonce}", std::process::id()));
+        parameters.output_dir = output_dir.to_string_lossy().into_owned();
+        let nx = 16_usize;
+        let ny = 4_usize;
+        let count = nx * ny;
+        let positions: Vec<_> = (0..ny)
+            .flat_map(|iy| {
+                (0..nx).map(move |ix| {
+                    [
+                        (ix as f64 + 0.5) * 4.0 / nx as f64,
+                        (iy as f64 + 0.5) * 0.25 / ny as f64,
+                        0.0,
+                    ]
+                })
+            })
+            .collect();
+        let initialized = InitializedBrioWu {
+            parameters,
+            particle_ids: (1..=u64::try_from(count).unwrap()).collect(),
+            positions,
+            masses: vec![1.0 / count as f64; count],
+            velocities: vec![[0.0; 3]; count],
+            specific_internal_energy: vec![1.0; count],
+            density: vec![1.0; count],
+            smoothing_lengths: vec![0.18; count],
+            magnetic_field: vec![[1.0, 0.0, 0.0]; count],
+            cleaning_phi: vec![0.0; count],
+            cleaning_grad_phi: vec![[0.0; 3]; count],
+            divergence_of_magnetic_field: vec![0.0; count],
+            box_lengths: [4.0, 0.25, 0.25],
+        };
+        evolve_briowu(&initialized).unwrap();
+        for snapshot in 0..3 {
+            assert!(
+                output_dir
+                    .join(format!("snapshot_{snapshot:03}.hdf5"))
+                    .is_file()
+            );
+        }
+        std::fs::remove_dir_all(output_dir).unwrap();
     }
 
     #[test]
