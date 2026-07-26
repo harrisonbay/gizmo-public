@@ -81,6 +81,59 @@ pub fn periodic_displacement_1d(a: f64, b: f64, box_size: f64) -> Result<f64, Hy
     Ok(displacement)
 }
 
+/// Reusable exact spatial index for periodic target-kernel queries.
+///
+/// Query results are sorted by original particle index, not position. Every
+/// kernel accumulator therefore retains the arithmetic order of the legacy
+/// all-particles scan while omitting compact-support zeroes.
+struct PeriodicNeighborIndex1d {
+    sorted: Vec<(f64, usize)>,
+    box_size: f64,
+}
+
+impl PeriodicNeighborIndex1d {
+    fn new(positions: &[f64], box_size: f64) -> Self {
+        let mut sorted: Vec<(f64, usize)> = positions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, position)| (position, index))
+            .collect();
+        sorted.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        Self { sorted, box_size }
+    }
+
+    fn query(&self, position: f64, support: f64, output: &mut Vec<usize>) {
+        output.clear();
+        if support >= 0.5 * self.box_size {
+            output.extend(0..self.sorted.len());
+        } else {
+            let lower = position - support;
+            let upper = position + support;
+            if lower < 0.0 {
+                append_sorted_position_range(&self.sorted, 0.0, upper, output);
+                append_sorted_position_range(
+                    &self.sorted,
+                    lower + self.box_size,
+                    self.box_size,
+                    output,
+                );
+            } else if upper >= self.box_size {
+                append_sorted_position_range(&self.sorted, lower, self.box_size, output);
+                append_sorted_position_range(&self.sorted, 0.0, upper - self.box_size, output);
+            } else {
+                append_sorted_position_range(&self.sorted, lower, upper, output);
+            }
+        }
+        output.sort_unstable();
+        output.dedup();
+    }
+}
+
 /// Enumerate exact unordered interactions in legacy particle-index order.
 ///
 /// The sorted position index queries each particle's own compact support.
@@ -89,46 +142,19 @@ pub fn periodic_displacement_1d(a: f64, b: f64, box_size: f64) -> Result<f64, Hy
 /// radius. The returned order is identical to the former nested `for i`/`for
 /// j` scan, preserving floating-point force accumulation.
 ///
-/// This costs `O(N log N + sum(k_i) + P log P)`, where `k_i` is the number of
-/// particles inside `H_i` and `P` is the interacting-pair count, instead of
-/// `O(N²)` for locally bounded support.
+/// This costs `O(N log N + sum(k_i log k_i) + P log P)`, where `k_i` is the
+/// number of particles inside `H_i` and `P` is the interacting-pair count,
+/// instead of `O(N²)` for locally bounded support.
 fn interacting_pairs_periodic_1d(
     positions: &[f64],
     smoothing_lengths: &[f64],
     box_size: f64,
 ) -> Result<Vec<(usize, usize, f64)>, HydroError> {
-    let mut sorted: Vec<(f64, usize)> = positions
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, position)| (position, index))
-        .collect();
-    sorted.sort_by(|left, right| {
-        left.0
-            .total_cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
-
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
     let mut pair_indices = Vec::new();
     let mut candidates = Vec::new();
     for (source, (&position, &support)) in positions.iter().zip(smoothing_lengths).enumerate() {
-        candidates.clear();
-        if support >= 0.5 * box_size {
-            candidates.extend(0..positions.len());
-        } else {
-            let lower = position - support;
-            let upper = position + support;
-            if lower < 0.0 {
-                append_sorted_position_range(&sorted, 0.0, upper, &mut candidates);
-                append_sorted_position_range(&sorted, lower + box_size, box_size, &mut candidates);
-            } else if upper >= box_size {
-                append_sorted_position_range(&sorted, lower, box_size, &mut candidates);
-                append_sorted_position_range(&sorted, 0.0, upper - box_size, &mut candidates);
-            } else {
-                append_sorted_position_range(&sorted, lower, upper, &mut candidates);
-            }
-        }
-
+        neighbor_index.query(position, support, &mut candidates);
         for &neighbor in &candidates {
             if neighbor == source {
                 continue;
@@ -183,9 +209,17 @@ pub fn density_at_hsml_1d(
     box_size: f64,
 ) -> Result<Vec<DensityEstimate>, HydroError> {
     validate_particle_columns(positions, masses, smoothing_lengths, box_size)?;
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
     let mut output = Vec::with_capacity(positions.len());
     for (index, &hsml) in smoothing_lengths.iter().enumerate() {
-        output.push(estimate_particle(index, positions, masses, hsml, box_size)?);
+        output.push(estimate_particle(
+            index,
+            positions,
+            masses,
+            hsml,
+            box_size,
+            &neighbor_index,
+        )?);
     }
     Ok(output)
 }
@@ -227,6 +261,8 @@ pub fn particle_divergence_at_hsml_1d(
     }
 
     let density = density_at_hsml_1d(positions, masses, smoothing_lengths, box_size)?;
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, ((&position, &velocity), &hsml)) in positions
         .iter()
@@ -236,7 +272,10 @@ pub fn particle_divergence_at_hsml_1d(
     {
         let mut kernel_sum = 0.0;
         let mut divergence_numerator = 0.0;
-        for (&neighbor_position, &neighbor_velocity) in positions.iter().zip(velocities) {
+        neighbor_index.query(position, hsml, &mut neighbors);
+        for &neighbor in &neighbors {
+            let neighbor_position = positions[neighbor];
+            let neighbor_velocity = velocities[neighbor];
             let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
             let distance = displacement.abs();
             let kernel = cubic_kernel_1d(distance, hsml)?;
@@ -296,12 +335,14 @@ pub fn solve_smoothing_lengths_1d(
         });
     }
 
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
     let mut output = Vec::with_capacity(positions.len());
     for (index, &initial_hsml) in initial_smoothing_lengths.iter().enumerate() {
         let mut hsml = initial_hsml;
         let mut lower: Option<f64> = None;
         let mut upper: Option<f64> = None;
-        let mut last_estimate = estimate_particle(index, positions, masses, hsml, box_size)?;
+        let mut last_estimate =
+            estimate_particle(index, positions, masses, hsml, box_size, &neighbor_index)?;
         let mut converged = false;
 
         for _ in 0..128 {
@@ -323,7 +364,8 @@ pub fn solve_smoothing_lengths_1d(
             if !hsml.is_finite() || hsml <= 0.0 {
                 break;
             }
-            last_estimate = estimate_particle(index, positions, masses, hsml, box_size)?;
+            last_estimate =
+                estimate_particle(index, positions, masses, hsml, box_size, &neighbor_index)?;
         }
         if !converged {
             return Err(HydroError::SmoothingLengthDidNotConverge {
@@ -357,10 +399,14 @@ pub fn inverse_moments_1d(
 ) -> Result<Vec<f64>, HydroError> {
     let unit_masses = vec![1.0; positions.len()];
     validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
         let mut moment = 0.0;
-        for &neighbor_position in positions {
+        neighbor_index.query(position, hsml, &mut neighbors);
+        for &neighbor in &neighbors {
+            let neighbor_position = positions[neighbor];
             let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
             let distance = displacement.abs();
             if distance <= 0.0 || distance >= hsml {
@@ -401,11 +447,15 @@ pub fn face_closure_errors_1d(
     let unit_masses = vec![1.0; positions.len()];
     validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
     let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
         let mut kernel_sum = 0.0;
         let mut first_moment = 0.0;
-        for &neighbor_position in positions {
+        neighbor_index.query(position, hsml, &mut neighbors);
+        for &neighbor in &neighbors {
+            let neighbor_position = positions[neighbor];
             let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
             let kernel = cubic_kernel_1d(displacement.abs(), hsml)?;
             kernel_sum += kernel.weight;
@@ -470,6 +520,14 @@ pub fn gradients_at_hsml_1d(
         return Err(HydroError::InvalidGradientTolerance(shoot_tolerance));
     }
     let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
+    let mut neighbor_lists = vec![Vec::new(); positions.len()];
+    for (i, j, _) in interacting_pairs_periodic_1d(positions, smoothing_lengths, box_size)? {
+        neighbor_lists[i].push(j);
+        neighbor_lists[j].push(i);
+    }
+    for neighbors in &mut neighbor_lists {
+        neighbors.sort_unstable();
+    }
 
     let mut output = Vec::with_capacity(positions.len());
     for (index, ((&position, &center), &hsml)) in positions
@@ -482,14 +540,11 @@ pub fn gradients_at_hsml_1d(
         let mut minimum_delta = 0.0_f64;
         let mut maximum_delta = 0.0_f64;
         let mut max_distance = 0.0_f64;
-        for ((&neighbor_position, &neighbor_value), &neighbor_hsml) in
-            positions.iter().zip(values).zip(smoothing_lengths)
-        {
+        for &neighbor in &neighbor_lists[index] {
+            let neighbor_position = positions[neighbor];
+            let neighbor_value = values[neighbor];
             let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
             let distance = displacement.abs();
-            if distance <= 0.0 || (distance >= hsml && distance >= neighbor_hsml) {
-                continue;
-            }
             let delta = neighbor_value - center;
             minimum_delta = minimum_delta.min(delta);
             maximum_delta = maximum_delta.max(delta);
@@ -2760,11 +2815,15 @@ fn estimate_particle(
     masses: &[f64],
     hsml: f64,
     box_size: f64,
+    neighbor_index: &PeriodicNeighborIndex1d,
 ) -> Result<DensityEstimate, HydroError> {
     let position = positions[index];
     let mut kernel_sum = 0.0;
     let mut derivative_sum = 0.0;
-    for &neighbor_position in positions {
+    let mut neighbors = Vec::new();
+    neighbor_index.query(position, hsml, &mut neighbors);
+    for neighbor in neighbors {
+        let neighbor_position = positions[neighbor];
         let radius = periodic_displacement_1d(position, neighbor_position, box_size)?.abs();
         let kernel = cubic_kernel_1d(radius, hsml)?;
         kernel_sum += kernel.weight;
@@ -3287,6 +3346,43 @@ mod tests {
             let (right_i, right_j, _) = pair[1];
             (left_i, left_j) < (right_i, right_j)
         }));
+    }
+
+    #[test]
+    fn sorted_periodic_target_queries_match_brute_force_index_order() {
+        let box_size = 1.0;
+        let mut seed = 0xd1ff_3a71_a15e_5eed_u64;
+        let mut random_unit = || {
+            seed = seed
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            let bytes = seed.to_le_bytes();
+            f64::from(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+                / f64::from(u32::MAX)
+        };
+        let mut positions = vec![0.0, 1.0e-13, 0.5, 0.999_999_999_999_9];
+        for _ in positions.len()..128 {
+            positions.push(random_unit());
+        }
+        let index = PeriodicNeighborIndex1d::new(&positions, box_size);
+        let mut actual = Vec::new();
+        for source in 0..positions.len() {
+            for support in [0.001, 0.017 + 0.08 * random_unit(), 0.5, 0.73] {
+                index.query(positions[source], support, &mut actual);
+                let expected: Vec<usize> = positions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(neighbor, &position)| {
+                        let distance =
+                            periodic_displacement_1d(positions[source], position, box_size)
+                                .unwrap()
+                                .abs();
+                        (distance <= support).then_some(neighbor)
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
