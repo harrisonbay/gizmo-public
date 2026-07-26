@@ -287,14 +287,15 @@ fn assert_corrected_c_first_step() {
          {first_kick_signal:.12e}, {second_kick_error:.12e}/{second_kick_signal:.12e}"
     );
 
-    assert!(position_error < 0.01 * position_signal);
-    assert!(density_error < 0.01 * density_signal);
-    assert!(energy_error < 0.01 * energy_signal);
-    assert!(smoothing_error < 1.0e-9);
-    assert!(first_kick_error < 0.01 * first_kick_signal);
+    assert!(position_error < 1.0e-6 * position_signal);
+    assert!(velocity_error < 1.0e-6 * velocity_signal);
+    assert!(density_error < 1.0e-5 * density_signal);
+    assert!(energy_error < 1.0e-5 * energy_signal);
+    assert!(smoothing_error < 1.0e-12);
+    assert!(first_kick_error < 1.0e-6 * first_kick_signal);
     assert!(
-        second_kick_error > 0.1 * second_kick_signal,
-        "GZ-0009 remains under investigation; do not silently claim full endpoint parity"
+        second_kick_error < 1.0e-6 * second_kick_signal,
+        "the endpoint Hsml predictor must preserve corrected-C second-kick parity"
     );
 }
 

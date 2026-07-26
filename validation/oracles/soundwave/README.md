@@ -44,7 +44,7 @@ and second kick, and `io.c` warns that their velocity is staggered. Therefore
 after the first `do_second_halfstep_kick()`. The patch only observes state and
 is checksum-pinned in the manifest. The ignored Rust integration test compares
 this completed 8192-tick state against the original IC. Position, density,
-internal energy, and the first half-kick are strict gates. The second half-kick
-currently has a localized corrected-C/Rust force divergence recorded as
-GZ-0009, so the test asserts that the discrepancy remains visible instead of
-silently claiming endpoint velocity parity.
+internal energy, both half-kicks, and the predicted smoothing lengths are
+strict gates. GZ-0009 records why predicting `Hsml` from the density-loop
+particle divergence is essential: changes near machine precision can alter
+support-boundary membership and therefore the slope-limiter extrema.

@@ -311,9 +311,9 @@
     },
     {
       "id": "GZ-0009",
-      "title": "First evolved MFM gradient pass produces localized force spikes",
-      "status": "under_investigation",
-      "confidence": "medium",
+      "title": "Apparent first-step force spikes were a missing Rust predictor semantic",
+      "status": "rejected",
+      "confidence": "high",
       "affected_flags": [
         "HYDRO_MESHLESS_FINITE_MASS",
         "BOX_SPATIAL_DIMENSION=1",
@@ -321,14 +321,14 @@
         "SELFGRAVITY_OFF",
         "FORCE_EQUAL_TIMESTEPS"
       ],
-      "summary": "An observation-only post-kick differential agrees on the first half-kick and endpoint scalar state but finds localized density/pressure-gradient and acceleration spikes in the first evolved corrected-C force pass. The divergence clusters near tree/order boundaries; its attribution remains under investigation.",
-      "impact": "A C-side neighbor or gradient-accumulation defect would inject tree-layout-dependent momentum errors into smooth MFM flows. Alternatively, an unported intended semantic would leave the Rust endpoint momentum update incomplete.",
-      "reproduction": "Run the pinned one-rank sound wave with validation/oracles/soundwave/post-kick-snapshot.patch, record endpoint HydroAccel and scalar gradients before the second kick, and compare by particle ID with the direct Rust all-pairs operator.",
-      "falsification": "Show that an independent implementation without the C tree traversal reproduces the localized gradients, or identify a diagnostic phase or field-conversion error that explains the measured divergence.",
+      "summary": "The suspected C tree/gradient defect is falsified. A direct all-pairs calculation reproduces the C endpoint gradients to floating-point precision. Rust had omitted the density-loop Particle_DivVel smoothing-length predictor, selecting a different tolerance-accepted Hsml branch at strict support boundaries.",
+      "impact": "No C correctness defect was established. The port must preserve the predictor seed because machine-scale Hsml changes can flip support-boundary membership and slope-limiter extrema.",
+      "reproduction": "Run the pinned corrected-C first-step oracle and the ignored Rust integration test. Removing the Particle_DivVel Hsml predictor restores the localized second-kick divergence; retaining it gives machine-precision completed-step parity.",
+      "falsification": "Already falsified as a C defect: an independent direct all-pairs implementation reproduces the instrumented C gradients with maximum absolute error 6.8e-21, and porting the predictor collapses the endpoint velocity error to 1.1e-17.",
       "oracle": {
         "type": "differential",
         "classification": "property",
-        "rationale": "The post-kick state separates two half-kicks and compares the tree-based C operator with a direct all-pairs implementation while checking smooth-wave scale and conservation invariants."
+        "rationale": "The post-kick state separates both half-kicks; the direct all-pairs reconstruction exonerates the C tree path, while the completed-step differential pins the missing predictor semantic."
       },
       "sources": [
         {
@@ -344,10 +344,16 @@
           "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/io.c#L236-L240"
         },
         {
-          "path": "hydro/gradients.c",
-          "line_start": 1940,
-          "line_end": 1995,
-          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/gradients.c#L1940-L1995"
+          "path": "hydro/density.c",
+          "line_start": 281,
+          "line_end": 335,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/hydro/density.c#L281-L335"
+        },
+        {
+          "path": "predict.c",
+          "line_start": 151,
+          "line_end": 237,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/predict.c#L151-L237"
         }
       ],
       "dossier": "audit/findings/GZ-0009.md"

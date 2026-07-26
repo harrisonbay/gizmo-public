@@ -104,6 +104,80 @@ pub fn density_at_hsml_1d(
     Ok(output)
 }
 
+/// Estimate the particle-trajectory velocity divergence used to predict `Hsml`.
+///
+/// This is the one-dimensional specialization of the density-loop
+/// `Particle_DivVel` estimator. Unlike the MLS velocity gradient, this
+/// kernel-gradient estimate controls smoothing-length drift between force
+/// evaluations.
+///
+/// # Errors
+///
+/// Returns an error for mismatched or invalid columns, invalid kernel
+/// arithmetic, or a non-finite divergence.
+pub fn particle_divergence_at_hsml_1d(
+    positions: &[f64],
+    velocities: &[f64],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<Vec<f64>, HydroError> {
+    validate_particle_columns(positions, masses, smoothing_lengths, box_size)?;
+    if velocities.len() != positions.len() {
+        return Err(HydroError::MismatchedLength {
+            field: "velocities",
+            expected: positions.len(),
+            actual: velocities.len(),
+        });
+    }
+    for (index, &velocity) in velocities.iter().enumerate() {
+        if !velocity.is_finite() {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "velocity",
+                value: velocity,
+            });
+        }
+    }
+
+    let density = density_at_hsml_1d(positions, masses, smoothing_lengths, box_size)?;
+    let mut output = Vec::with_capacity(positions.len());
+    for (index, ((&position, &velocity), &hsml)) in positions
+        .iter()
+        .zip(velocities)
+        .zip(smoothing_lengths)
+        .enumerate()
+    {
+        let mut kernel_sum = 0.0;
+        let mut divergence_numerator = 0.0;
+        for (&neighbor_position, &neighbor_velocity) in positions.iter().zip(velocities) {
+            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let distance = displacement.abs();
+            let kernel = cubic_kernel_1d(distance, hsml)?;
+            kernel_sum += kernel.weight;
+            if distance > 0.0 && distance < hsml {
+                let velocity_difference = velocity - neighbor_velocity;
+                divergence_numerator -=
+                    kernel.radial_derivative * displacement * velocity_difference / distance;
+            }
+        }
+        let divergence = divergence_numerator * density[index].dhsml_factor / kernel_sum;
+        if !kernel_sum.is_finite()
+            || kernel_sum <= 0.0
+            || !divergence_numerator.is_finite()
+            || !divergence.is_finite()
+        {
+            return Err(HydroError::NonFiniteDensityEstimate {
+                index,
+                field: "particle_divergence",
+                value: divergence,
+            });
+        }
+        output.push(divergence);
+    }
+    Ok(output)
+}
+
 /// Solve the one-dimensional effective-neighbor constraint and density.
 ///
 /// This uses a conservative geometric bracket around the same normalized
@@ -1106,6 +1180,13 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         inverse_moments_1d(state.positions, state.smoothing_lengths, state.box_size)?;
     let closure_errors =
         face_closure_errors_1d(state.positions, state.smoothing_lengths, state.box_size)?;
+    let particle_divergence = particle_divergence_at_hsml_1d(
+        state.positions,
+        state.velocities,
+        state.masses,
+        state.smoothing_lengths,
+        state.box_size,
+    )?;
 
     let mut momentum = vec![0.0; particle_count];
     let mut total_energy = vec![0.0; particle_count];
@@ -1211,6 +1292,7 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         pair_count,
         entropic_pair_count,
         maximum_signal_speed,
+        particle_divergence,
     })
 }
 
@@ -1498,10 +1580,16 @@ pub fn advance_mfm_kdk_1d(
         predicted_velocity.push(velocity_predicted);
         predicted_internal_energy.push(internal_energy_predicted);
     }
+    let predicted_smoothing_lengths: Vec<f64> = state
+        .smoothing_lengths
+        .iter()
+        .zip(&old_rates.particle_divergence)
+        .map(|(&hsml, &divergence)| hsml * (divergence * timestep).clamp(-0.3, 0.3).exp())
+        .collect();
     let solved = solve_smoothing_lengths_1d(
         &endpoint_positions,
         &state.masses,
-        &state.smoothing_lengths,
+        &predicted_smoothing_lengths,
         state.box_size,
         desired_neighbors,
         neighbor_tolerance,
@@ -1556,6 +1644,7 @@ fn validate_rate_columns(rates: &MfmRates1d, expected: usize) -> Result<(), Hydr
             rates.specific_internal_energy.len(),
         ),
         ("maximum_signal_speed", rates.maximum_signal_speed.len()),
+        ("particle_divergence", rates.particle_divergence.len()),
     ] {
         if actual != expected {
             return Err(HydroError::MismatchedLength {
@@ -1572,6 +1661,7 @@ fn validate_rate_columns(rates: &MfmRates1d, expected: usize) -> Result<(), Hydr
         .chain(&rates.acceleration)
         .chain(&rates.specific_internal_energy)
         .chain(&rates.maximum_signal_speed)
+        .chain(&rates.particle_divergence)
     {
         if !value.is_finite() {
             return Err(HydroError::NonFiniteRiemannResult {
@@ -2431,6 +2521,7 @@ pub struct MfmRates1d {
     pub pair_count: usize,
     pub entropic_pair_count: usize,
     pub maximum_signal_speed: Vec<f64>,
+    pub particle_divergence: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2739,12 +2830,29 @@ mod tests {
     }
 
     #[test]
+    fn particle_divergence_recovers_linear_expansion_and_uniform_translation() {
+        let positions = [0.25, 0.5, 0.75];
+        let masses = [1.0 / 3.0; 3];
+        let hsml = [0.4; 3];
+        let velocities = [-0.5, 0.0, 0.5];
+        let divergence =
+            particle_divergence_at_hsml_1d(&positions, &velocities, &masses, &hsml, 1.0).unwrap();
+        assert_close(divergence[1], 2.0);
+
+        let translated: Vec<f64> = velocities.iter().map(|velocity| velocity + 7.0).collect();
+        let translated_divergence =
+            particle_divergence_at_hsml_1d(&positions, &translated, &masses, &hsml, 1.0).unwrap();
+        assert_close(translated_divergence[1], divergence[1]);
+    }
+
+    #[test]
     fn malformed_columns_fail_closed() {
         assert!(density_at_hsml_1d(&[0.0], &[], &[0.5], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.0], 1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0], &[1.0], &[0.5], -1.0).is_err());
         assert!(density_at_hsml_1d(&[0.0, 0.25], &[f64::MAX; 2], &[0.5; 2], 1.0).is_err());
         assert!(cubic_kernel_1d(0.0, f64::MIN_POSITIVE).is_err());
+        assert!(particle_divergence_at_hsml_1d(&[0.0], &[], &[1.0], &[0.5], 1.0).is_err());
     }
 
     #[test]
