@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
 use gizmo_hydro::SynchronizedTimeline1d;
+use gizmo_hydro::individual_timeline::IndividualParticleTimeline;
 use gizmo_hydro::meshless_2d::{
     Box2d, Vector2, density_at_hsml_2d, face_closure_diagnostics_2d, inverse_moments_2d,
     solve_public_c_smoothing_lengths_from_seeds_2d,
@@ -9,8 +11,8 @@ use gizmo_hydro::meshless_2d::{
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution_2d::{
     DivergenceControl2d, MhdMfmState2d, begin_public_mhd_kdk_adaptive_2d,
-    finish_public_mhd_kdk_adaptive_2d, global_public_mhd_timestep_bound_2d,
-    mhd_mfm_spatial_rates_2d,
+    finish_public_mhd_kdk_adaptive_2d, mhd_mfm_spatial_rates_2d,
+    public_mhd_particle_timestep_bounds_2d, quantize_public_mhd_initial_timebins_2d,
 };
 use gizmo_io::read_mhd_wave;
 
@@ -244,12 +246,66 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
             && rates.magnetic_volume.iter().all(|value| value.is_finite())
     );
     assert!(rates.entropic_pair_count > 0);
-    let physical_bound = global_public_mhd_timestep_bound_2d(&state, &rates, 0.2, 0.01)
-        .expect("evaluate every enabled public Brio-Wu timestep bound");
+    let particle_bounds = public_mhd_particle_timestep_bounds_2d(&state, &rates, 0.2, 0.01)
+        .expect("evaluate every enabled public Brio-Wu particle timestep bound");
+    let physical_bound = particle_bounds
+        .iter()
+        .map(|bound| bound.selected)
+        .fold(f64::INFINITY, f64::min);
+    let initial_timebins =
+        quantize_public_mhd_initial_timebins_2d(&particle_bounds, 0.0, 0.2, 0.04)
+            .expect("assign the initial public-C integer time bins");
+    let timebin_counts =
+        initial_timebins
+            .iter()
+            .fold(BTreeMap::<u32, usize>::new(), |mut counts, timebin| {
+                *counts.entry(timebin.time_bin).or_default() += 1;
+                counts
+            });
+    assert_eq!(initial_timebins.len(), snapshot.gas.len());
+    assert!(
+        initial_timebins
+            .iter()
+            .all(|timebin| timebin.ticks.is_power_of_two())
+    );
+    assert_eq!(
+        timebin_counts,
+        BTreeMap::from([(49_u32, 25_088_usize), (50, 25_088)])
+    );
+    let mut individual_timeline = IndividualParticleTimeline::from_initial_steps(
+        0.0,
+        0.2,
+        &initial_timebins
+            .iter()
+            .map(|timebin| timebin.ticks)
+            .collect::<Vec<_>>(),
+    )
+    .expect("construct the exact initial active-set schedule");
+    assert!(
+        individual_timeline
+            .active_mask()
+            .into_iter()
+            .all(|active| active)
+    );
+    let first_active = individual_timeline
+        .advance_to_next_sync()
+        .expect("select the earliest occupied time-bin endpoint");
+    assert_eq!(
+        first_active.into_iter().filter(|&active| active).count(),
+        25_088
+    );
     let first_step = SynchronizedTimeline1d::new(0.0, 0.2)
         .unwrap()
         .select_step(physical_bound, 0.04)
         .unwrap();
+    assert_eq!(
+        initial_timebins
+            .iter()
+            .map(|timebin| timebin.duration)
+            .fold(f64::INFINITY, f64::min)
+            .to_bits(),
+        first_step.duration.to_bits()
+    );
     assert_eq!(first_step.duration.to_bits(), (0.2_f64 / 2048.0).to_bits());
     if std::env::var_os("GIZMO_BRIOWU_ADVANCE_ONE_STEP").is_some() {
         let mut step = begin_public_mhd_kdk_adaptive_2d(
@@ -307,7 +363,7 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
     eprintln!(
         "density={:?} neighbors={:?} condition={:?} relative_closure={:?} \
          legacy_closure={:?} solved_neighbor_error={maximum_neighbor_error} rhs_pairs={} \
-         entropic_pairs={} physical_dt={physical_bound} synchronized_dt={}",
+         entropic_pairs={} physical_dt={physical_bound} synchronized_dt={} timebins={:?}",
         density_range,
         neighbor_range,
         condition_range,
@@ -316,5 +372,6 @@ fn public_briowu_fixture_exercises_real_two_dimensional_geometry() {
         rates.pair_count,
         rates.entropic_pair_count,
         first_step.duration,
+        timebin_counts,
     );
 }

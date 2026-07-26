@@ -30,10 +30,11 @@ The minimum useful bundle would be:
 7. A particle-ID-keyed dump immediately after the first `find_timesteps()` of
    `TimeBin`, `Ti_begstep`, the selected integer/physical step, and the active
    particle IDs. Equivalent dumps at the first few synchronization points,
-   including deferred MFM momentum/energy/B/phi increments for inactive
-   neighbors, would make the hierarchical integrator independently
-   reproducible. The public logs establish the minimum global cadence but
-   cannot recover this per-particle state.
+   including the actual and predicted primitive fields and retained hydro/MHD
+   rates for inactive neighbors, would make the hierarchical integrator
+   independently reproducible. (The public MFM build does not maintain a
+   deferred equal-and-opposite flux ledger.) The public logs establish the
+   minimum global cadence but cannot recover this per-particle state.
 
 For unambiguous fixture identification, the currently hosted
 `briowu_ics.hdf5` is 3,821,968 bytes with SHA-256

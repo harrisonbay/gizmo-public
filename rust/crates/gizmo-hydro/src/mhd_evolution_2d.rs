@@ -100,6 +100,30 @@ pub struct MhdMfmRates2d {
     pub entropic_pair_count: usize,
 }
 
+/// Per-particle physical timestep criteria enabled by the public Brio-Wu
+/// configuration, before the maximum-step cap and integer quantization.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PublicMhdTimestepBounds2d {
+    pub acceleration: f64,
+    pub courant: f64,
+    pub dedner: f64,
+    pub velocity_divergence: f64,
+    pub selected: f64,
+}
+
+/// Initial per-particle time bin selected by public C's `find_timesteps`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PublicMhdInitialTimebin2d {
+    /// Physical criterion after applying `MaxSizeTimestep`.
+    pub bounded_timestep: f64,
+    /// Truncated integer request returned by `get_timestep`, before rounding
+    /// down to a power of two.
+    pub raw_ticks: u64,
+    pub ticks: u64,
+    pub time_bin: u32,
+    pub duration: f64,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MhdRateContext2d<'a> {
     /// Stored integrated divergence from the preceding force evaluation.
@@ -990,24 +1014,19 @@ pub fn global_mhd_courant_timestep_2d(
     Ok(timestep)
 }
 
-/// Return the minimum non-cosmological timestep bound enabled by the public
-/// Brio-Wu build before integer power-of-two quantization.
-///
-/// This combines the hydro-acceleration, standard MHD Courant, Dedner
-/// isotropic-wave, and velocity-divergence bounds. With `SELFGRAVITY_OFF`, the
-/// public force-softening radius used by the acceleration criterion is the
-/// adaptive gas smoothing length.
+/// Return every per-particle non-cosmological timestep criterion enabled by
+/// the public Brio-Wu build, before `MaxSizeTimestep` and integer quantization.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid state, rates, Courant factor, or integration
 /// accuracy.
-pub fn global_public_mhd_timestep_bound_2d(
+pub fn public_mhd_particle_timestep_bounds_2d(
     state: &MhdMfmState2d,
     rates: &MhdMfmRates2d,
     courant_factor: f64,
     integration_accuracy: f64,
-) -> Result<f64, MhdEvolution2dError> {
+) -> Result<Vec<PublicMhdTimestepBounds2d>, MhdEvolution2dError> {
     state.validate()?;
     validate_rate_lengths(rates, state.positions.len())?;
     if !courant_factor.is_finite() || courant_factor <= 0.0 || courant_factor > 0.5 {
@@ -1017,18 +1036,23 @@ pub fn global_public_mhd_timestep_bound_2d(
         return Err(invalid(None, "integration_accuracy", integration_accuracy));
     }
     let primitive = state.primitive_columns()?;
-    let mut timestep = f64::INFINITY;
+    let mut bounds = Vec::with_capacity(state.positions.len());
     for i in 0..state.positions.len() {
         let acceleration = rates.acceleration[i].squared_norm().sqrt().max(1.0e-30);
         // 2 * ErrTolIntAccuracy * KERNEL_CORE_SIZE with the cubic kernel's
         // KERNEL_CORE_SIZE=1/2 reduces to ErrTolIntAccuracy.
         let acceleration_bound =
             (integration_accuracy * state.smoothing_lengths[i] / acceleration).sqrt();
-        let particle_size = (state.masses[i] / primitive.density[i]).sqrt();
+        // `Get_Particle_Size` uses the literal sqrt(pi) approximation 1.77245
+        // and the square root of the 2-D effective neighbor number.
+        let effective_neighbor_root =
+            (std::f64::consts::PI * state.smoothing_lengths[i].powi(2) * primitive.density[i]
+                / state.masses[i])
+                .sqrt();
+        let particle_size = 1.77245 * state.smoothing_lengths[i] / effective_neighbor_root;
         let courant_bound = courant_factor * particle_size / (0.5 * rates.maximum_signal_speed[i]);
         let sound_squared = state.gamma * primitive.pressure[i] / primitive.density[i];
-        let phi_over_signal =
-            primitive.cleaning_scalar[i] / rates.maximum_signal_speed[i].max(MIN_REAL_NUMBER);
+        let phi_over_signal = primitive.cleaning_scalar[i] / rates.maximum_signal_speed[i];
         let dedner_speed = (sound_squared
             + (primitive.magnetic[i].squared_norm() + phi_over_signal * phi_over_signal)
                 / primitive.density[i])
@@ -1043,12 +1067,120 @@ pub fn global_public_mhd_timestep_bound_2d(
             .min(courant_bound)
             .min(dedner_bound)
             .min(divergence_bound);
+        for (field, value) in [
+            ("acceleration_timestep", acceleration_bound),
+            ("courant_timestep", courant_bound),
+            ("dedner_timestep", dedner_bound),
+            ("velocity_divergence_timestep", divergence_bound),
+        ] {
+            if value.is_nan() || value <= 0.0 {
+                return Err(invalid(Some(i), field, value));
+            }
+        }
         if !candidate.is_finite() || candidate <= 0.0 {
             return Err(invalid(Some(i), "public_mhd_timestep", candidate));
         }
-        timestep = timestep.min(candidate);
+        bounds.push(PublicMhdTimestepBounds2d {
+            acceleration: acceleration_bound,
+            courant: courant_bound,
+            dedner: dedner_bound,
+            velocity_divergence: divergence_bound,
+            selected: candidate,
+        });
     }
-    Ok(timestep)
+    Ok(bounds)
+}
+
+/// Quantize initial public-C particle steps on its default `2^60` timebase.
+///
+/// At `Ti_Current == 0`, every time bin is synchronized, so
+/// `find_timesteps` independently truncates each physical request to integer
+/// ticks and rounds it down to a power of two.
+///
+/// # Errors
+///
+/// Returns an error for invalid times, timestep bounds, or a request outside
+/// the public integer timeline.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+pub fn quantize_public_mhd_initial_timebins_2d(
+    bounds: &[PublicMhdTimestepBounds2d],
+    time_begin: f64,
+    time_max: f64,
+    maximum_timestep: f64,
+) -> Result<Vec<PublicMhdInitialTimebin2d>, MhdEvolution2dError> {
+    if !time_begin.is_finite()
+        || !time_max.is_finite()
+        || time_max <= time_begin
+        || !maximum_timestep.is_finite()
+        || maximum_timestep <= 0.0
+    {
+        return Err(invalid(None, "public_mhd_timeline", time_max));
+    }
+    let tick_duration = (time_max - time_begin) / crate::LEGACY_TIMEBASE_TICKS as f64;
+    let mut timebins = Vec::with_capacity(bounds.len());
+    for (i, bound) in bounds.iter().enumerate() {
+        if !bound.selected.is_finite() || bound.selected <= 0.0 {
+            return Err(invalid(Some(i), "public_mhd_timestep", bound.selected));
+        }
+        let bounded_timestep = bound.selected.min(maximum_timestep);
+        let requested_ticks = (bounded_timestep / tick_duration).trunc();
+        if !requested_ticks.is_finite() || requested_ticks < 0.0 {
+            return Err(invalid(
+                Some(i),
+                "public_mhd_timestep_ticks",
+                requested_ticks,
+            ));
+        }
+        // Unless STOP_WHEN_BELOW_MINTIMESTEP is enabled, public C promotes
+        // integer requests 0 and 1 to the smallest legal step of two ticks.
+        let raw_ticks = (requested_ticks as u64).max(2);
+        if raw_ticks >= crate::LEGACY_TIMEBASE_TICKS {
+            return Err(invalid(
+                Some(i),
+                "public_mhd_timestep_ticks",
+                requested_ticks,
+            ));
+        }
+        let time_bin = raw_ticks.ilog2();
+        let ticks = 1_u64 << time_bin;
+        timebins.push(PublicMhdInitialTimebin2d {
+            bounded_timestep,
+            raw_ticks,
+            ticks,
+            time_bin,
+            duration: ticks as f64 * tick_duration,
+        });
+    }
+    Ok(timebins)
+}
+
+/// Return the minimum non-cosmological timestep bound enabled by the public
+/// Brio-Wu build before integer power-of-two quantization.
+///
+/// This synchronized-runner adapter preserves the previous global interface;
+/// public C itself assigns the corresponding bounds to individual particles.
+///
+/// # Errors
+///
+/// Returns an error for invalid state, rates, Courant factor, or integration
+/// accuracy.
+pub fn global_public_mhd_timestep_bound_2d(
+    state: &MhdMfmState2d,
+    rates: &MhdMfmRates2d,
+    courant_factor: f64,
+    integration_accuracy: f64,
+) -> Result<f64, MhdEvolution2dError> {
+    let bounds =
+        public_mhd_particle_timestep_bounds_2d(state, rates, courant_factor, integration_accuracy)?;
+    bounds
+        .iter()
+        .map(|bound| bound.selected)
+        .reduce(f64::min)
+        .ok_or_else(|| invalid(None, "public_mhd_timestep", f64::INFINITY))
 }
 
 /// Advance a synchronized KDK step while retaining caller-supplied H.
@@ -2815,6 +2947,65 @@ mod tests {
             .fold(f64::INFINITY, f64::min);
         let actual = global_mhd_courant_timestep_2d(&state, &rates, 0.2).unwrap();
         assert!((actual - expected).abs() <= 8.0 * f64::EPSILON * expected);
+    }
+
+    #[test]
+    fn public_particle_bounds_use_the_literal_c_particle_size() {
+        let state = sheet(16, 4, true);
+        let rates = mhd_mfm_spatial_rates_2d(&state, no_sources()).unwrap();
+        let primitive = state.primitive_columns().unwrap();
+        let bounds = public_mhd_particle_timestep_bounds_2d(&state, &rates, 0.2, 0.01).unwrap();
+        for (i, bound) in bounds.iter().enumerate() {
+            let effective_neighbor_root =
+                (std::f64::consts::PI * state.smoothing_lengths[i].powi(2) * primitive.density[i]
+                    / state.masses[i])
+                    .sqrt();
+            let particle_size = 1.77245 * state.smoothing_lengths[i] / effective_neighbor_root;
+            let expected = 0.2 * particle_size / (0.5 * rates.maximum_signal_speed[i]);
+            assert!((bound.courant - expected).abs() <= 4.0 * f64::EPSILON * expected);
+        }
+        let expected_global = bounds
+            .iter()
+            .map(|bound| bound.selected)
+            .fold(f64::INFINITY, f64::min);
+        let actual_global = global_public_mhd_timestep_bound_2d(&state, &rates, 0.2, 0.01).unwrap();
+        assert_eq!(actual_global.to_bits(), expected_global.to_bits());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn initial_public_timebins_match_c_truncation_and_power_of_two_rounding() {
+        let selected_ticks = [(1_u64 << 49) + 123, (1_u64 << 50) - 1, 1_u64 << 50, 1];
+        let bounds: Vec<_> = selected_ticks
+            .iter()
+            .map(|&ticks| PublicMhdTimestepBounds2d {
+                acceleration: f64::INFINITY,
+                courant: ticks as f64 / crate::LEGACY_TIMEBASE_TICKS as f64,
+                dedner: f64::INFINITY,
+                velocity_divergence: f64::INFINITY,
+                selected: ticks as f64 / crate::LEGACY_TIMEBASE_TICKS as f64,
+            })
+            .collect();
+        let timebins = quantize_public_mhd_initial_timebins_2d(&bounds, 0.0, 1.0, 0.25).unwrap();
+        assert_eq!(
+            timebins
+                .iter()
+                .map(|timebin| timebin.raw_ticks)
+                .collect::<Vec<_>>(),
+            vec![(1_u64 << 49) + 123, (1_u64 << 50) - 1, 1_u64 << 50, 2,]
+        );
+        assert_eq!(
+            timebins
+                .iter()
+                .map(|timebin| (timebin.time_bin, timebin.ticks))
+                .collect::<Vec<_>>(),
+            vec![
+                (49, 1_u64 << 49),
+                (49, 1_u64 << 49),
+                (50, 1_u64 << 50),
+                (1, 2),
+            ]
+        );
     }
 
     #[test]

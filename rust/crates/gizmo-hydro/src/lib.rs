@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod grain;
+pub mod individual_timeline;
 pub mod meshless_2d;
 pub mod mhd;
 pub mod mhd_2d;
