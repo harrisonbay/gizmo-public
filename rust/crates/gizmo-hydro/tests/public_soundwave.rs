@@ -1,12 +1,23 @@
 use gizmo_hydro::{
-    EntropicPoint1d, GradientEstimate, MeshlessPoint1d, MfmEvolvingState1d, MfmState1d,
-    PrimitiveState1d, ReconstructedPoint1d, RiemannMethod, SynchronizedTimeline1d,
-    advance_mfm_kdk_1d, apply_entropic_pdv_1d, cubic_kernel_1d, density_at_hsml_1d,
-    face_closure_errors_1d, global_courant_timestep_1d, gradients_at_hsml_1d, inverse_moments_1d,
-    meshless_face_geometry_1d, mfm_pair_flux_1d, mfm_spatial_rates_1d, solve_smoothing_lengths_1d,
+    EntropicPoint1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
+    MfmEvolvingState1d, MfmState1d, PrimitiveState1d, ReconstructedPoint1d, RiemannMethod,
+    SynchronizedTimeline1d, advance_mfm_kdk_1d, apply_entropic_pdv_1d, begin_mfm_kdk_1d,
+    cubic_kernel_1d, density_at_hsml_1d, face_closure_errors_1d, finish_mfm_kdk_1d,
+    global_courant_timestep_1d, gradients_at_hsml_1d, inverse_moments_1d,
+    meshless_face_geometry_1d, mfm_pair_flux_1d, mfm_spatial_rates_1d,
+    select_public_soundwave_timestep_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 use std::path::Path;
+
+const SOUNDWAVE_TIME_BEGIN: f64 = 0.0;
+const SOUNDWAVE_TIME_MAX: f64 = 1.5;
+const SOUNDWAVE_MAXIMUM_TIMESTEP: f64 = 1.0e-3;
+const SOUNDWAVE_COURANT_FACTOR: f64 = 0.05;
+const SOUNDWAVE_INTEGRATION_ACCURACY: f64 = 0.01;
+const SOUNDWAVE_DESIRED_NEIGHBORS: f64 = 4.0;
+const SOUNDWAVE_NEIGHBOR_TOLERANCE: f64 = 0.05;
+const SOUNDWAVE_MINIMUM_INTERNAL_ENERGY: f64 = 0.0;
 
 #[test]
 #[ignore = "requires GIZMO_SOUNDWAVE_IC; run via validation oracle script"]
@@ -119,6 +130,260 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         snapshot.header.box_size,
     );
     assert_corrected_c_first_step();
+}
+
+#[test]
+#[ignore = "requires opt-in corrected-C long-evolution tables; performs 65,536 MFM steps"]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn rust_long_evolution_matches_corrected_c_snapshots() {
+    let Some(terminal_path) = std::env::var_os("GIZMO_SOUNDWAVE_C_TMAX") else {
+        eprintln!("GIZMO_SOUNDWAVE_C_TMAX is absent; skipping opt-in long-evolution oracle");
+        return;
+    };
+    let initialized_path = std::env::var_os("GIZMO_SOUNDWAVE_C_T0")
+        .expect("GIZMO_SOUNDWAVE_C_T0 must identify the corrected-C t=0 semantic table");
+    let fixture_path = std::env::var_os("GIZMO_SOUNDWAVE_IC")
+        .expect("GIZMO_SOUNDWAVE_IC must identify the raw IC");
+    let interior_path = std::env::var_os("GIZMO_SOUNDWAVE_C_T01");
+    let initialized = read_evolution_table(Path::new(&initialized_path));
+    let terminal = read_evolution_table(Path::new(&terminal_path));
+    let initial = read_soundwave(fixture_path).expect("raw sound-wave IC must be valid");
+    let initial_positions: Vec<f64> = initial
+        .gas
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate[0])
+        .collect();
+    let initial_velocities: Vec<f64> = initial
+        .gas
+        .velocities
+        .iter()
+        .map(|velocity| velocity[0])
+        .collect();
+    let interior = interior_path
+        .as_deref()
+        .map(Path::new)
+        .map(read_evolution_table);
+    assert!(max_absolute_error(&initial_positions, &initialized.positions) < 1.0e-15);
+    assert!(max_relative_error(&initial.gas.masses, &initialized.masses) < 1.0e-15);
+    assert!(
+        max_relative_error(
+            &initial.gas.internal_energy,
+            &initialized.specific_internal_energy
+        ) < 1.0e-15
+    );
+    assert!(max_relative_error(&terminal.masses, &initialized.masses) < 1.0e-15);
+    if let Some(expected) = &interior {
+        assert!(max_relative_error(&expected.masses, &initialized.masses) < 1.0e-15);
+    }
+
+    let mut state = MfmEvolvingState1d {
+        positions: initialized.positions.clone(),
+        masses: initialized.masses.clone(),
+        velocities: initial_velocities.clone(),
+        specific_internal_energy: initial.gas.internal_energy,
+        smoothing_lengths: initialized.smoothing_lengths.clone(),
+        box_size: 1.0,
+        gamma: 5.0 / 3.0,
+    };
+    let mut rates =
+        mfm_spatial_rates_1d(state.as_view()).expect("corrected-C t=0 state must have a valid RHS");
+    let mut timeline = SynchronizedTimeline1d::new(SOUNDWAVE_TIME_BEGIN, SOUNDWAVE_TIME_MAX)
+        .expect("LONG timeline must be valid");
+    let tick_duration = (SOUNDWAVE_TIME_MAX - SOUNDWAVE_TIME_BEGIN) / LEGACY_TIMEBASE_TICKS as f64;
+    let interior_tick = legacy_output_tick(0.1, SOUNDWAVE_TIME_BEGIN, tick_duration);
+    assert_eq!(interior_tick, 76_861_433_640_456_464);
+    let mut compared_interior = interior.is_none();
+    let mut step_count = 0_u64;
+
+    while !timeline.is_finished() {
+        let selected = select_public_soundwave_timestep_1d(
+            state.as_view(),
+            &rates,
+            SOUNDWAVE_MAXIMUM_TIMESTEP,
+            SOUNDWAVE_COURANT_FACTOR,
+            SOUNDWAVE_INTEGRATION_ACCURACY,
+        )
+        .expect("complete public sound-wave timestep selector must succeed");
+        let synchronized = timeline
+            .select_step(selected.duration, SOUNDWAVE_MAXIMUM_TIMESTEP)
+            .expect("selected timestep must quantize on the LONG timeline");
+        let start_tick = timeline.current_tick();
+        let end_tick = start_tick + synchronized.ticks;
+        let prepared = begin_mfm_kdk_1d(
+            &state,
+            &rates,
+            synchronized.duration,
+            SOUNDWAVE_MINIMUM_INTERNAL_ENERGY,
+        )
+        .expect("first kick and drift preparation must succeed");
+
+        if start_tick == 0 {
+            let initial_drift = prepared
+                .drift_state(0.0)
+                .expect("initial half-kick snapshot state must be valid");
+            let half_kick_error =
+                max_absolute_error(&initial_drift.conserved_velocities, &initialized.velocities);
+            let half_kick_signal = max_absolute_error(&initialized.velocities, &initial_velocities);
+            eprintln!(
+                "corrected-C t=0 half-kick parity: error/signal=\
+                 {half_kick_error:.12e}/{half_kick_signal:.12e}"
+            );
+            assert!(
+                half_kick_error < 1.0e-6 * half_kick_signal,
+                "initial Rust half kick must match the staggered corrected-C t=0 velocity"
+            );
+        }
+
+        if !compared_interior && start_tick <= interior_tick && interior_tick <= end_tick {
+            let elapsed = (interior_tick - start_tick) as f64 * tick_duration;
+            let snapshot = prepared
+                .drift_state(elapsed)
+                .expect("t=0.1 partial drift state must be valid");
+            assert_drift_snapshot_matches(
+                "t=0.1 partial drift",
+                &snapshot,
+                interior.as_ref().expect("interior oracle was supplied"),
+                &initialized,
+            );
+            compared_interior = true;
+        }
+
+        let (endpoint, new_rates) = finish_mfm_kdk_1d(
+            prepared,
+            SOUNDWAVE_DESIRED_NEIGHBORS,
+            SOUNDWAVE_NEIGHBOR_TOLERANCE,
+        )
+        .expect("endpoint force and second kick must succeed");
+        if end_tick == LEGACY_TIMEBASE_TICKS {
+            assert_completed_snapshot_matches(
+                "t=1.5 completed endpoint",
+                &endpoint,
+                &terminal,
+                &initialized,
+            );
+        }
+        state = endpoint;
+        rates = new_rates;
+        timeline
+            .advance(synchronized)
+            .expect("completed step must advance the LONG timeline");
+        step_count += 1;
+    }
+
+    assert!(
+        compared_interior,
+        "the synchronized evolution must cross the exact corrected-C t=0.1 output tick"
+    );
+    eprintln!(
+        "corrected-C long evolution completed {step_count} synchronized steps to t={:.17e}",
+        timeline.current_time()
+    );
+}
+
+// The corrected C path casts the floating output-time coordinate directly to
+// `integertime`, which truncates toward zero. Preserve that operation instead
+// of rounding t=0.1 to the nearest LONG tick.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn legacy_output_tick(output_time: f64, time_begin: f64, tick_duration: f64) -> u64 {
+    assert!(output_time >= time_begin);
+    assert!(tick_duration.is_finite() && tick_duration > 0.0);
+    ((output_time - time_begin) / tick_duration) as u64
+}
+
+fn assert_drift_snapshot_matches(
+    phase: &str,
+    actual: &MfmDriftState1d,
+    expected: &EvolutionTable,
+    initialized: &EvolutionTable,
+) {
+    let position_error = max_absolute_error(&actual.positions, &expected.positions);
+    let velocity_error = max_absolute_error(&actual.conserved_velocities, &expected.velocities);
+    let density_error = max_relative_error(&actual.predicted_density, &expected.densities);
+    let energy_error = max_relative_error(
+        &actual.predicted_specific_internal_energy,
+        &expected.specific_internal_energy,
+    );
+    let smoothing_error = max_relative_error(
+        &actual.predicted_smoothing_lengths,
+        &expected.smoothing_lengths,
+    );
+    let position_signal = max_absolute_error(&expected.positions, &initialized.positions);
+    let velocity_signal = max_absolute_error(&expected.velocities, &initialized.velocities);
+    let density_signal = max_relative_error(&expected.densities, &initialized.densities);
+    let energy_signal = max_relative_error(
+        &expected.specific_internal_energy,
+        &initialized.specific_internal_energy,
+    );
+    let smoothing_signal =
+        max_relative_error(&expected.smoothing_lengths, &initialized.smoothing_lengths);
+    eprintln!(
+        "corrected-C {phase} parity: max |dx|/|dv|={position_error:.12e}/{velocity_error:.12e}, \
+         max rel density/u/Hsml={density_error:.12e}/{energy_error:.12e}/{smoothing_error:.12e}; \
+         C signals={position_signal:.12e}/{velocity_signal:.12e}/{density_signal:.12e}/\
+         {energy_signal:.12e}/{smoothing_signal:.12e}"
+    );
+
+    // These bounds remain at least two orders below the public perturbation.
+    // They are intentionally absolute/relative field bounds rather than
+    // error-to-signal ratios because the one-crossing terminal position can
+    // return arbitrarily close to its initial phase.
+    assert!(position_error < 1.0e-8, "{phase} position parity");
+    assert!(velocity_error < 1.0e-8, "{phase} staggered-velocity parity");
+    assert!(density_error < 1.0e-8, "{phase} predicted-density parity");
+    assert!(energy_error < 1.0e-8, "{phase} predicted-energy parity");
+    assert!(
+        smoothing_error < 1.0e-8,
+        "{phase} predicted-smoothing-length parity"
+    );
+}
+
+fn assert_completed_snapshot_matches(
+    phase: &str,
+    actual: &MfmEvolvingState1d,
+    expected: &EvolutionTable,
+    initialized: &EvolutionTable,
+) {
+    let densities: Vec<f64> = density_at_hsml_1d(
+        &actual.positions,
+        &actual.masses,
+        &actual.smoothing_lengths,
+        actual.box_size,
+    )
+    .expect("completed endpoint density must be valid")
+    .into_iter()
+    .map(|estimate| estimate.density)
+    .collect();
+    let position_error = max_absolute_error(&actual.positions, &expected.positions);
+    let velocity_error = max_absolute_error(&actual.velocities, &expected.velocities);
+    let density_error = max_relative_error(&densities, &expected.densities);
+    let energy_error = max_relative_error(
+        &actual.specific_internal_energy,
+        &expected.specific_internal_energy,
+    );
+    let smoothing_error =
+        max_relative_error(&actual.smoothing_lengths, &expected.smoothing_lengths);
+    let position_signal = max_absolute_error(&expected.positions, &initialized.positions);
+    let velocity_signal = max_absolute_error(&expected.velocities, &initialized.velocities);
+    let density_signal = max_relative_error(&expected.densities, &initialized.densities);
+    let energy_signal = max_relative_error(
+        &expected.specific_internal_energy,
+        &initialized.specific_internal_energy,
+    );
+    let smoothing_signal =
+        max_relative_error(&expected.smoothing_lengths, &initialized.smoothing_lengths);
+    eprintln!(
+        "corrected-C {phase} parity: max |dx|/|dv|={position_error:.12e}/{velocity_error:.12e}, \
+         max rel density/u/Hsml={density_error:.12e}/{energy_error:.12e}/{smoothing_error:.12e}; \
+         C signals={position_signal:.12e}/{velocity_signal:.12e}/{density_signal:.12e}/\
+         {energy_signal:.12e}/{smoothing_signal:.12e}"
+    );
+
+    assert!(position_error < 1.0e-8, "{phase} position parity");
+    assert!(velocity_error < 1.0e-8, "{phase} velocity parity");
+    assert!(density_error < 1.0e-8, "{phase} density parity");
+    assert!(energy_error < 1.0e-8, "{phase} energy parity");
+    assert!(smoothing_error < 1.0e-8, "{phase} smoothing-length parity");
 }
 
 #[derive(Debug)]
