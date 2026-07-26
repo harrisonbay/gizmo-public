@@ -377,7 +377,7 @@ fn evolve_soundwave(mut initialized: InitializedSoundwave) -> Result<(), Applica
             .map_err(ApplicationError::Hydro)?;
         let start_tick = timeline.current_tick();
         let end_tick = start_tick + synchronized.ticks;
-        let prepared = begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
+        let mut prepared = begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
             .map_err(ApplicationError::Hydro)?;
 
         while next_output_tick.is_some_and(|tick| tick <= end_tick) {

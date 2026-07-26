@@ -13,12 +13,16 @@ use std::path::Path;
 
 const SOUNDWAVE_TIME_BEGIN: f64 = 0.0;
 const SOUNDWAVE_TIME_MAX: f64 = 1.5;
+const SOUNDWAVE_OUTPUT_INTERVAL: f64 = 0.1;
 const SOUNDWAVE_MAXIMUM_TIMESTEP: f64 = 1.0e-3;
 const SOUNDWAVE_COURANT_FACTOR: f64 = 0.05;
 const SOUNDWAVE_INTEGRATION_ACCURACY: f64 = 0.01;
 const SOUNDWAVE_DESIRED_NEIGHBORS: f64 = 4.0;
 const SOUNDWAVE_NEIGHBOR_TOLERANCE: f64 = 0.05;
 const SOUNDWAVE_MINIMUM_INTERNAL_ENERGY: f64 = 0.0;
+const SOUNDWAVE_EXPECTED_STEPS: u64 = 65_536;
+const SOUNDWAVE_EXPECTED_OUTPUT_CROSSINGS: u32 = 15;
+const SOUNDWAVE_LONG_PARITY_TOLERANCE: f64 = 1.0e-9;
 
 #[test]
 #[ignore = "requires GIZMO_SOUNDWAVE_IC; run via validation oracle script"]
@@ -180,7 +184,10 @@ fn rust_density_matches_pinned_public_soundwave_state() {
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn rust_long_evolution_matches_corrected_c_snapshots() {
     let Some(terminal_path) = std::env::var_os("GIZMO_SOUNDWAVE_C_TMAX") else {
-        eprintln!("GIZMO_SOUNDWAVE_C_TMAX is absent; skipping opt-in long-evolution oracle");
+        eprintln!(
+            "SKIPPED corrected-C long-evolution oracle: set GIZMO_SOUNDWAVE_C_TMAX \
+             (and GIZMO_SOUNDWAVE_C_T0/GIZMO_SOUNDWAVE_IC) to opt in"
+        );
         return;
     };
     let initialized_path = std::env::var_os("GIZMO_SOUNDWAVE_C_T0")
@@ -236,7 +243,10 @@ fn rust_long_evolution_matches_corrected_c_snapshots() {
     let tick_duration = (SOUNDWAVE_TIME_MAX - SOUNDWAVE_TIME_BEGIN) / LEGACY_TIMEBASE_TICKS as f64;
     let interior_tick = legacy_output_tick(0.1, SOUNDWAVE_TIME_BEGIN, tick_duration);
     assert_eq!(interior_tick, 76_861_433_640_456_464);
-    let mut compared_interior = interior.is_none();
+    let mut compared_interior = false;
+    let mut next_output_time = SOUNDWAVE_TIME_BEGIN;
+    let mut next_output_tick = Some(0_u64);
+    let mut output_crossings = 0_u32;
     let mut step_count = 0_u64;
 
     while !timeline.is_finished() {
@@ -253,7 +263,7 @@ fn rust_long_evolution_matches_corrected_c_snapshots() {
             .expect("selected timestep must quantize on the LONG timeline");
         let start_tick = timeline.current_tick();
         let end_tick = start_tick + synchronized.ticks;
-        let prepared = begin_mfm_kdk_1d(
+        let mut prepared = begin_mfm_kdk_1d(
             &state,
             &rates,
             synchronized.duration,
@@ -261,35 +271,51 @@ fn rust_long_evolution_matches_corrected_c_snapshots() {
         )
         .expect("first kick and drift preparation must succeed");
 
-        if start_tick == 0 {
-            let initial_drift = prepared
-                .drift_state(0.0)
-                .expect("initial half-kick snapshot state must be valid");
-            let half_kick_error =
-                max_absolute_error(&initial_drift.conserved_velocities, &initialized.velocities);
-            let half_kick_signal = max_absolute_error(&initialized.velocities, &initial_velocities);
-            eprintln!(
-                "corrected-C t=0 half-kick parity: error/signal=\
-                 {half_kick_error:.12e}/{half_kick_signal:.12e}"
-            );
+        while next_output_tick.is_some_and(|tick| tick <= end_tick) {
+            let output_tick = next_output_tick.expect("checked above");
             assert!(
-                half_kick_error < 1.0e-6 * half_kick_signal,
-                "initial Rust half kick must match the staggered corrected-C t=0 velocity"
+                output_tick >= start_tick,
+                "scheduled output tick {output_tick} precedes step start {start_tick}"
             );
-        }
-
-        if !compared_interior && start_tick <= interior_tick && interior_tick <= end_tick {
-            let elapsed = (interior_tick - start_tick) as f64 * tick_duration;
+            let elapsed = (output_tick - start_tick) as f64 * tick_duration;
             let snapshot = prepared
                 .drift_state(elapsed)
-                .expect("t=0.1 partial drift state must be valid");
-            assert_drift_snapshot_matches(
-                "t=0.1 partial drift",
-                &snapshot,
-                interior.as_ref().expect("interior oracle was supplied"),
-                &initialized,
+                .expect("scheduled partial drift state must be valid");
+            if output_tick == 0 {
+                let half_kick_error =
+                    max_absolute_error(&snapshot.conserved_velocities, &initialized.velocities);
+                let half_kick_signal =
+                    max_absolute_error(&initialized.velocities, &initial_velocities);
+                eprintln!(
+                    "corrected-C t=0 half-kick parity: error/signal=\
+                     {half_kick_error:.12e}/{half_kick_signal:.12e}"
+                );
+                assert!(
+                    half_kick_error < 1.0e-6 * half_kick_signal,
+                    "initial Rust half kick must match the staggered corrected-C t=0 velocity"
+                );
+            }
+            if output_tick == interior_tick {
+                if let Some(expected) = &interior {
+                    assert_drift_snapshot_matches(
+                        "t=0.1 partial drift",
+                        &snapshot,
+                        expected,
+                        &initialized,
+                    );
+                }
+                compared_interior = true;
+            }
+            output_crossings = output_crossings
+                .checked_add(1)
+                .expect("scheduled output crossing count must fit u32");
+            next_output_time += SOUNDWAVE_OUTPUT_INTERVAL;
+            next_output_tick = (next_output_time <= SOUNDWAVE_TIME_MAX)
+                .then(|| legacy_output_tick(next_output_time, SOUNDWAVE_TIME_BEGIN, tick_duration));
+            assert!(
+                next_output_tick.is_none_or(|tick| tick > output_tick),
+                "snapshot cadence must advance on the integer timeline"
             );
-            compared_interior = true;
         }
 
         let (endpoint, new_rates) = finish_mfm_kdk_1d(
@@ -317,6 +343,14 @@ fn rust_long_evolution_matches_corrected_c_snapshots() {
     assert!(
         compared_interior,
         "the synchronized evolution must cross the exact corrected-C t=0.1 output tick"
+    );
+    assert_eq!(
+        step_count, SOUNDWAVE_EXPECTED_STEPS,
+        "the default synchronized sound-wave run must take exactly 65,536 steps"
+    );
+    assert_eq!(
+        output_crossings, SOUNDWAVE_EXPECTED_OUTPUT_CROSSINGS,
+        "the default corrected-C cadence must cross outputs t=0 through t=1.4"
     );
     eprintln!(
         "corrected-C long evolution completed {step_count} synchronized steps to t={:.17e}",
@@ -371,12 +405,24 @@ fn assert_drift_snapshot_matches(
     // They are intentionally absolute/relative field bounds rather than
     // error-to-signal ratios because the one-crossing terminal position can
     // return arbitrarily close to its initial phase.
-    assert!(position_error < 1.0e-8, "{phase} position parity");
-    assert!(velocity_error < 1.0e-8, "{phase} staggered-velocity parity");
-    assert!(density_error < 1.0e-8, "{phase} predicted-density parity");
-    assert!(energy_error < 1.0e-8, "{phase} predicted-energy parity");
     assert!(
-        smoothing_error < 1.0e-8,
+        position_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} position parity"
+    );
+    assert!(
+        velocity_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} staggered-velocity parity"
+    );
+    assert!(
+        density_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} predicted-density parity"
+    );
+    assert!(
+        energy_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} predicted-energy parity"
+    );
+    assert!(
+        smoothing_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
         "{phase} predicted-smoothing-length parity"
     );
 }
@@ -422,11 +468,26 @@ fn assert_completed_snapshot_matches(
          {energy_signal:.12e}/{smoothing_signal:.12e}"
     );
 
-    assert!(position_error < 1.0e-8, "{phase} position parity");
-    assert!(velocity_error < 1.0e-8, "{phase} velocity parity");
-    assert!(density_error < 1.0e-8, "{phase} density parity");
-    assert!(energy_error < 1.0e-8, "{phase} energy parity");
-    assert!(smoothing_error < 1.0e-8, "{phase} smoothing-length parity");
+    assert!(
+        position_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} position parity"
+    );
+    assert!(
+        velocity_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} velocity parity"
+    );
+    assert!(
+        density_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} density parity"
+    );
+    assert!(
+        energy_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} energy parity"
+    );
+    assert!(
+        smoothing_error < SOUNDWAVE_LONG_PARITY_TOLERANCE,
+        "{phase} smoothing-length parity"
+    );
 }
 
 #[derive(Debug)]

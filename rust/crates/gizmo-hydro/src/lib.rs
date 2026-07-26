@@ -2202,33 +2202,39 @@ pub struct MfmDriftState1d {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MfmKdkStep1d {
     start: MfmEvolvingState1d,
-    start_density: Vec<f64>,
     half_velocity: Vec<f64>,
     half_internal_energy: Vec<f64>,
     acceleration: Vec<f64>,
     specific_internal_energy_rate: Vec<f64>,
     particle_divergence: Vec<f64>,
+    drift: MfmDriftState1d,
+    elapsed: f64,
     timestep: f64,
     minimum_specific_internal_energy: f64,
 }
 
 impl MfmKdkStep1d {
-    /// Materialize the legacy predictor state at an elapsed drift time.
+    /// Advance the legacy predictor state to an elapsed drift time.
     ///
-    /// This is non-mutating, so scheduled output inside a force step can be
-    /// emitted before the endpoint force and second kick.
+    /// Calls must be monotonic. Each call mutates the predictor from its
+    /// current cursor, matching the legacy `move_particles` calls made for
+    /// scheduled outputs inside a force step. This distinction is observable
+    /// because the smoothing-length clamp and internal-energy limiter apply to
+    /// every drift segment, not once to the total elapsed interval.
     ///
     /// # Errors
     ///
-    /// Returns an error when the elapsed time lies outside this step or any
-    /// predicted field becomes invalid.
-    pub fn drift_state(&self, elapsed: f64) -> Result<MfmDriftState1d, HydroError> {
-        if !elapsed.is_finite() || elapsed < 0.0 || elapsed > self.timestep {
+    /// Returns an error when the elapsed time precedes the current cursor, lies
+    /// outside this step, or any predicted field becomes invalid. The cursor
+    /// and predictor remain unchanged on error.
+    pub fn drift_state(&mut self, elapsed: f64) -> Result<MfmDriftState1d, HydroError> {
+        if !elapsed.is_finite() || elapsed < self.elapsed || elapsed > self.timestep {
             return Err(HydroError::InvalidRiemannParameter {
                 field: "kdk_drift_elapsed",
                 value: elapsed,
             });
         }
+        let segment = elapsed - self.elapsed;
         let particle_count = self.start.positions.len();
         let mut positions = Vec::with_capacity(particle_count);
         let mut predicted_velocities = Vec::with_capacity(particle_count);
@@ -2236,19 +2242,20 @@ impl MfmKdkStep1d {
         let mut predicted_density = Vec::with_capacity(particle_count);
         let mut predicted_smoothing_lengths = Vec::with_capacity(particle_count);
         for index in 0..particle_count {
-            let position = (self.start.positions[index] + elapsed * self.half_velocity[index])
+            let position = (self.drift.positions[index] + segment * self.half_velocity[index])
                 .rem_euclid(self.start.box_size);
             let predicted_velocity =
-                self.start.velocities[index] + elapsed * self.acceleration[index];
+                self.drift.predicted_velocities[index] + segment * self.acceleration[index];
             let predicted_internal_energy = limited_internal_energy_update(
-                self.start.specific_internal_energy[index],
+                self.drift.predicted_specific_internal_energy[index],
                 self.specific_internal_energy_rate[index],
-                elapsed,
+                segment,
                 self.minimum_specific_internal_energy,
             )?;
-            let divergence_increment = (self.particle_divergence[index] * elapsed).clamp(-0.3, 0.3);
-            let density = self.start_density[index] * (-divergence_increment).exp();
-            let smoothing_length = self.start.smoothing_lengths[index] * divergence_increment.exp();
+            let divergence_increment = (self.particle_divergence[index] * segment).clamp(-0.3, 0.3);
+            let density = self.drift.predicted_density[index] * (-divergence_increment).exp();
+            let smoothing_length =
+                self.drift.predicted_smoothing_lengths[index] * divergence_increment.exp();
             if !position.is_finite()
                 || !predicted_velocity.is_finite()
                 || !density.is_finite()
@@ -2267,19 +2274,28 @@ impl MfmKdkStep1d {
             predicted_density.push(density);
             predicted_smoothing_lengths.push(smoothing_length);
         }
-        Ok(MfmDriftState1d {
+        let drift = MfmDriftState1d {
             positions,
             conserved_velocities: self.half_velocity.clone(),
             predicted_velocities,
             predicted_specific_internal_energy,
             predicted_density,
             predicted_smoothing_lengths,
-        })
+        };
+        self.drift = drift.clone();
+        self.elapsed = elapsed;
+        Ok(drift)
     }
 
     #[must_use]
     pub fn timestep(&self) -> f64 {
         self.timestep
+    }
+
+    /// Elapsed drift time already committed to this predictor.
+    #[must_use]
+    pub fn elapsed(&self) -> f64 {
+        self.elapsed
     }
 }
 
@@ -2339,14 +2355,23 @@ pub fn begin_mfm_kdk_1d(
     .into_iter()
     .map(|estimate| estimate.density)
     .collect();
+    let drift = MfmDriftState1d {
+        positions: state.positions.clone(),
+        conserved_velocities: half_velocity.clone(),
+        predicted_velocities: state.velocities.clone(),
+        predicted_specific_internal_energy: state.specific_internal_energy.clone(),
+        predicted_density: start_density,
+        predicted_smoothing_lengths: state.smoothing_lengths.clone(),
+    };
     Ok(MfmKdkStep1d {
         start: state.clone(),
-        start_density,
         half_velocity,
         half_internal_energy,
         acceleration: old_rates.acceleration.clone(),
         specific_internal_energy_rate: old_rates.specific_internal_energy.clone(),
         particle_divergence: old_rates.particle_divergence.clone(),
+        drift,
+        elapsed: 0.0,
         timestep,
         minimum_specific_internal_energy,
     })
@@ -2354,12 +2379,15 @@ pub fn begin_mfm_kdk_1d(
 
 /// Finish a prepared MFM step with endpoint density, force, and second kick.
 ///
+/// Any drift segments already committed for scheduled outputs are retained;
+/// only the interval from the current cursor to the endpoint is drifted here.
+///
 /// # Errors
 ///
 /// Returns an error for smoothing-length failure or invalid endpoint physics.
 /// No caller-owned state is mutated on failure.
 pub fn finish_mfm_kdk_1d(
-    step: MfmKdkStep1d,
+    mut step: MfmKdkStep1d,
     desired_neighbors: f64,
     neighbor_tolerance: f64,
 ) -> Result<(MfmEvolvingState1d, MfmRates1d), HydroError> {
@@ -4697,7 +4725,7 @@ mod tests {
         let timestep = global_courant_timestep_1d(state.as_view(), &rates, 0.05).unwrap();
         assert_close(timestep, 0.00625);
         let initial_positions = state.positions.clone();
-        let phase = begin_mfm_kdk_1d(&state, &rates, timestep, 0.0).unwrap();
+        let mut phase = begin_mfm_kdk_1d(&state, &rates, timestep, 0.0).unwrap();
         let at_start = phase.drift_state(0.0).unwrap();
         let at_midpoint = phase.drift_state(0.5 * timestep).unwrap();
         for (index, &initial_position) in initial_positions.iter().enumerate() {
@@ -4715,8 +4743,56 @@ mod tests {
         let (split_state, split_rates) = finish_mfm_kdk_1d(phase, 4.0, 1.0e-12).unwrap();
         let new_rates =
             advance_mfm_kdk_1d(&mut state, &rates, timestep, 4.0, 1.0e-12, 0.0).unwrap();
-        assert_eq!(state, split_state);
-        assert_eq!(new_rates, split_rates);
+        assert_eq!(state.masses, split_state.masses);
+        for (atomic, segmented) in state
+            .positions
+            .iter()
+            .chain(&state.velocities)
+            .chain(&state.specific_internal_energy)
+            .chain(&state.smoothing_lengths)
+            .zip(
+                split_state
+                    .positions
+                    .iter()
+                    .chain(&split_state.velocities)
+                    .chain(&split_state.specific_internal_energy)
+                    .chain(&split_state.smoothing_lengths),
+            )
+        {
+            assert!(
+                (*atomic - *segmented).abs() < 1.0e-13,
+                "atomic state {atomic} differs from segmented state {segmented}"
+            );
+        }
+        assert_eq!(new_rates.pair_count, split_rates.pair_count);
+        assert_eq!(
+            new_rates.entropic_pair_count,
+            split_rates.entropic_pair_count
+        );
+        for (atomic, segmented) in new_rates
+            .momentum
+            .iter()
+            .chain(&new_rates.total_energy)
+            .chain(&new_rates.acceleration)
+            .chain(&new_rates.specific_internal_energy)
+            .chain(&new_rates.maximum_signal_speed)
+            .chain(&new_rates.particle_divergence)
+            .zip(
+                split_rates
+                    .momentum
+                    .iter()
+                    .chain(&split_rates.total_energy)
+                    .chain(&split_rates.acceleration)
+                    .chain(&split_rates.specific_internal_energy)
+                    .chain(&split_rates.maximum_signal_speed)
+                    .chain(&split_rates.particle_divergence),
+            )
+        {
+            assert!(
+                (*atomic - *segmented).abs() < 1.0e-13,
+                "atomic rate {atomic} differs from segmented rate {segmented}"
+            );
+        }
         for (index, &position) in state.positions.iter().enumerate() {
             assert_close(
                 position,
@@ -4728,6 +4804,95 @@ mod tests {
             assert!(new_rates.acceleration[index].abs() < 1.0e-14);
             assert!(new_rates.specific_internal_energy[index].abs() < 1.0e-14);
         }
+    }
+
+    #[test]
+    fn scheduled_drift_crossings_mutate_predictor_limiters_and_endpoint_cursor() {
+        let state = MfmEvolvingState1d {
+            positions: vec![0.25],
+            masses: vec![1.0],
+            velocities: vec![0.1],
+            specific_internal_energy: vec![1.0],
+            smoothing_lengths: vec![0.2],
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        };
+        let rates = MfmRates1d {
+            momentum: vec![0.0],
+            total_energy: vec![0.0],
+            acceleration: vec![0.4],
+            specific_internal_energy: vec![-12.0],
+            pair_count: 0,
+            entropic_pair_count: 0,
+            maximum_signal_speed: vec![1.0],
+            particle_divergence: vec![10.0],
+        };
+        let mut segmented = begin_mfm_kdk_1d(&state, &rates, 0.1, 0.0).unwrap();
+        let first_output = segmented.drift_state(0.05).unwrap();
+        let endpoint_output = segmented.drift_state(0.1).unwrap();
+        assert_close(first_output.predicted_specific_internal_energy[0], 0.5);
+        assert_close(endpoint_output.positions[0], 0.262);
+        assert_close(endpoint_output.predicted_velocities[0], 0.14);
+        assert_close(endpoint_output.predicted_specific_internal_energy[0], 0.25);
+        assert_close(
+            endpoint_output.predicted_smoothing_lengths[0],
+            0.2 * 0.6_f64.exp(),
+        );
+        assert_close(
+            endpoint_output.predicted_density[0],
+            first_output.predicted_density[0] * (-0.3_f64).exp(),
+        );
+        assert_close(segmented.elapsed(), 0.1);
+
+        let committed = endpoint_output.clone();
+        assert!(segmented.drift_state(0.09).is_err());
+        assert_close(segmented.elapsed(), 0.1);
+        assert_eq!(segmented.drift_state(0.1).unwrap(), committed);
+
+        let mut unsegmented = begin_mfm_kdk_1d(&state, &rates, 0.1, 0.0).unwrap();
+        let direct_endpoint = unsegmented.drift_state(0.1).unwrap();
+        assert_close(direct_endpoint.predicted_specific_internal_energy[0], 0.5);
+        assert_close(
+            direct_endpoint.predicted_smoothing_lengths[0],
+            0.2 * 0.3_f64.exp(),
+        );
+        assert_ne!(direct_endpoint, endpoint_output);
+
+        let count = 8_u32;
+        let particle_count = usize::try_from(count).unwrap();
+        let finish_state = MfmEvolvingState1d {
+            positions: (0..count)
+                .map(|index| (f64::from(index) + 0.5) / f64::from(count))
+                .collect(),
+            masses: vec![1.0 / f64::from(count); particle_count],
+            velocities: vec![0.0; particle_count],
+            specific_internal_energy: vec![1.0; particle_count],
+            smoothing_lengths: vec![0.25; particle_count],
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        };
+        let mut finish_rates = single_particle_rates(1.0, 0.0, 10.0);
+        for column in [
+            &mut finish_rates.momentum,
+            &mut finish_rates.total_energy,
+            &mut finish_rates.acceleration,
+            &mut finish_rates.specific_internal_energy,
+            &mut finish_rates.maximum_signal_speed,
+            &mut finish_rates.particle_divergence,
+        ] {
+            let fill = column[0];
+            column.resize(particle_count, fill);
+        }
+        finish_rates.specific_internal_energy[0] = -12.0;
+        let mut finish_from_crossing =
+            begin_mfm_kdk_1d(&finish_state, &finish_rates, 0.1, 0.0).unwrap();
+        finish_from_crossing.drift_state(0.05).unwrap();
+        let mut explicitly_at_endpoint = finish_from_crossing.clone();
+        explicitly_at_endpoint.drift_state(0.1).unwrap();
+        let finished_from_cursor = finish_mfm_kdk_1d(finish_from_crossing, 4.0, 1.0e-12).unwrap();
+        let finished_from_endpoint =
+            finish_mfm_kdk_1d(explicitly_at_endpoint, 4.0, 1.0e-12).unwrap();
+        assert_eq!(finished_from_cursor, finished_from_endpoint);
     }
 
     #[test]
