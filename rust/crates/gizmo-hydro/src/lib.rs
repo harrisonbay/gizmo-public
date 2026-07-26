@@ -522,8 +522,49 @@ pub fn solve_public_c_initial_smoothing_lengths_1d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
-    let seeds =
+    let mut seeds =
         public_c_tree_smoothing_length_seeds_1d(positions, masses, box_size, desired_neighbors)?;
+    let mut solved = Vec::new();
+    // Restart-0 evaluates density once inside `setup_smoothinglengths()`, once
+    // again while completing `init()`, and once in the initial force
+    // evaluation before the visible t=0 drift snapshot. Each call resets its
+    // brackets but retains the previously accepted Hsml.
+    for _ in 0..3 {
+        solved = solve_public_c_smoothing_lengths_from_seeds_1d(
+            positions,
+            masses,
+            &seeds,
+            box_size,
+            desired_neighbors,
+            tolerance,
+        )?;
+        seeds = solved
+            .iter()
+            .map(|particle| particle.smoothing_length)
+            .collect();
+    }
+    Ok(solved)
+}
+
+/// Run one public-C density/Hsml iteration pass from caller-supplied seeds.
+///
+/// This is the pass used at force endpoints after the restart-0 initialization
+/// sequence. Bounds are reset for each pass, while accepted input Hsml values
+/// are retained exactly when they already satisfy the corrected constraint.
+///
+/// # Errors
+///
+/// Returns an error for invalid state or constraints, or if the legacy
+/// iteration does not converge.
+pub fn solve_public_c_smoothing_lengths_from_seeds_1d(
+    positions: &[f64],
+    masses: &[f64],
+    seeds: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
+    validate_particle_columns(positions, masses, seeds, box_size)?;
     if !tolerance.is_finite() || tolerance <= 0.0 || tolerance >= desired_neighbors {
         return Err(HydroError::InvalidNeighborConstraint {
             desired: desired_neighbors,
@@ -532,10 +573,11 @@ pub fn solve_public_c_initial_smoothing_lengths_1d(
     }
     let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
     seeds
-        .into_iter()
+        .iter()
+        .copied()
         .enumerate()
         .map(|(index, seed)| {
-            solve_public_c_initial_particle(
+            solve_public_c_particle_from_seed(
                 index,
                 positions,
                 masses,
@@ -550,7 +592,7 @@ pub fn solve_public_c_initial_smoothing_lengths_1d(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn solve_public_c_initial_particle(
+fn solve_public_c_particle_from_seed(
     index: usize,
     positions: &[f64],
     masses: &[f64],
@@ -563,63 +605,147 @@ fn solve_public_c_initial_particle(
     let mut hsml = seed;
     let mut lower = 0.0_f64;
     let mut upper = 0.0_f64;
-    let mut last_estimate =
-        estimate_particle(index, positions, masses, hsml, box_size, neighbor_index)?;
+    let mut last = estimate_public_c_density_geometry(
+        index,
+        positions,
+        masses,
+        hsml,
+        box_size,
+        neighbor_index,
+    )?;
 
     for iteration in 0..=128 {
+        let neighbor_correction = (last.face_closure_error / 0.35).clamp(1.0, 2.0);
+        let corrected_desired_neighbors = desired_neighbors * neighbor_correction;
+        let corrected_base_tolerance = base_tolerance * neighbor_correction;
         let tolerance = if iteration > 1 {
-            let growth =
-                (0.1 * (desired_neighbors / (16.0 * base_tolerance)).ln() * f64::from(iteration))
-                    .exp();
-            (base_tolerance * growth).min(0.25 * desired_neighbors)
+            let growth = (0.1
+                * (corrected_desired_neighbors / (16.0 * corrected_base_tolerance)).ln()
+                * f64::from(iteration))
+            .exp();
+            (corrected_base_tolerance * growth).min(0.25 * corrected_desired_neighbors)
         } else {
-            base_tolerance
+            corrected_base_tolerance
         };
-        if (last_estimate.effective_neighbors - desired_neighbors).abs() <= tolerance {
+        if (last.estimate.effective_neighbors - corrected_desired_neighbors).abs() <= tolerance {
             return Ok(AdaptiveDensityEstimate {
                 smoothing_length: hsml,
-                estimate: last_estimate,
+                estimate: last.estimate,
             });
         }
 
         if lower > 0.0 && upper > 0.0 && upper - lower < 1.0e-3 * lower {
             return Ok(AdaptiveDensityEstimate {
                 smoothing_length: hsml,
-                estimate: last_estimate,
+                estimate: last.estimate,
             });
         }
         if iteration == 128 {
             break;
         }
 
-        if last_estimate.effective_neighbors < desired_neighbors - tolerance {
+        if last.estimate.effective_neighbors < corrected_desired_neighbors - tolerance {
             lower = lower.max(hsml);
         } else if upper == 0.0 || hsml < upper {
             upper = hsml;
         }
 
-        hsml = public_c_initial_hsml_jump(
+        hsml = public_c_hsml_jump(
             hsml,
-            last_estimate,
-            desired_neighbors,
+            last.estimate,
+            corrected_desired_neighbors,
             iteration,
             lower,
             upper,
         );
-        last_estimate =
-            estimate_particle(index, positions, masses, hsml, box_size, neighbor_index)?;
+        last = estimate_public_c_density_geometry(
+            index,
+            positions,
+            masses,
+            hsml,
+            box_size,
+            neighbor_index,
+        )?;
     }
 
     Err(HydroError::SmoothingLengthDidNotConverge {
         index,
         lower: (lower > 0.0).then_some(lower),
         upper: (upper > 0.0).then_some(upper),
-        effective_neighbors: last_estimate.effective_neighbors,
+        effective_neighbors: last.estimate.effective_neighbors,
+    })
+}
+
+struct PublicCDensityGeometry {
+    estimate: DensityEstimate,
+    face_closure_error: f64,
+}
+
+fn estimate_public_c_density_geometry(
+    index: usize,
+    positions: &[f64],
+    masses: &[f64],
+    hsml: f64,
+    box_size: f64,
+    neighbor_index: &PeriodicNeighborIndex1d,
+) -> Result<PublicCDensityGeometry, HydroError> {
+    let position = positions[index];
+    let mut kernel_sum = 0.0;
+    let mut derivative_sum = 0.0;
+    let mut second_moment = 0.0;
+    let mut first_moment = 0.0;
+    let mut neighbors = Vec::new();
+    neighbor_index.query(position, hsml, &mut neighbors);
+    for neighbor in neighbors {
+        let displacement = periodic_displacement_1d(position, positions[neighbor], box_size)?;
+        let radius = displacement.abs();
+        let kernel = cubic_kernel_1d(radius, hsml)?;
+        kernel_sum += kernel.weight;
+        if radius < hsml {
+            derivative_sum += -(kernel.weight / hsml + (radius / hsml) * kernel.radial_derivative);
+        }
+        if radius > 0.0 && radius < hsml {
+            second_moment += kernel.weight * displacement * displacement;
+            first_moment += kernel.weight * displacement;
+        }
+    }
+    // Public MFM overwrites the raw neighbor-mass accumulator after the Hsml
+    // loop with the particle-volume density `m_i * sum_j W_ij`.
+    let particle_density = masses[index] * kernel_sum;
+    let effective_neighbors = kernel_sum * 2.0 * hsml;
+    let raw_derivative = derivative_sum * hsml / kernel_sum;
+    let dhsml_factor = if raw_derivative > -0.9 {
+        1.0 / (1.0 + raw_derivative)
+    } else {
+        1.0
+    };
+    let face_closure_error = (first_moment / second_moment / kernel_sum).abs();
+    for (field, value) in [
+        ("density", particle_density),
+        ("effective_neighbors", effective_neighbors),
+        ("dhsml_factor", dhsml_factor),
+        ("face_closure_error", face_closure_error),
+    ] {
+        if !value.is_finite() {
+            return Err(HydroError::NonFiniteDensityEstimate {
+                index,
+                field,
+                value,
+            });
+        }
+    }
+    Ok(PublicCDensityGeometry {
+        estimate: DensityEstimate {
+            density: particle_density,
+            effective_neighbors,
+            dhsml_factor,
+        },
+        face_closure_error,
     })
 }
 
 #[allow(clippy::float_cmp)]
-fn public_c_initial_hsml_jump(
+fn public_c_hsml_jump(
     mut hsml: f64,
     estimate: DensityEstimate,
     desired_neighbors: f64,
@@ -2392,7 +2518,7 @@ pub fn finish_mfm_kdk_1d(
     neighbor_tolerance: f64,
 ) -> Result<(MfmEvolvingState1d, MfmRates1d), HydroError> {
     let endpoint = step.drift_state(step.timestep)?;
-    let solved = solve_smoothing_lengths_1d(
+    let solved = solve_public_c_smoothing_lengths_from_seeds_1d(
         &endpoint.positions,
         &step.start.masses,
         &endpoint.predicted_smoothing_lengths,

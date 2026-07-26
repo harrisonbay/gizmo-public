@@ -84,11 +84,8 @@ fn rust_equal_mass_shocktube_matches_corrected_c() {
         "corrected-C shock-tube initialization: max rel density/Hsml=\
          {initial_density_error:.12e}/{initial_hsml_error:.12e}"
     );
-    // The existing public-C tree initializer specialization was proven only
-    // for the uniform sound-wave domain. Keep this discrepancy visible while
-    // seeding the trajectory differential from the corrected-C t=0 table.
-    assert!(initial_density_error.is_finite());
-    assert!(initial_hsml_error.is_finite());
+    assert!(initial_density_error < 1.0e-12);
+    assert!(initial_hsml_error < 1.0e-12);
     let density_at_c_hsml: Vec<f64> = density_at_hsml_1d(
         &positions,
         &fixture.gas.masses,
@@ -109,7 +106,7 @@ fn rust_equal_mass_shocktube_matches_corrected_c() {
         masses: fixture.gas.masses,
         velocities: velocities.clone(),
         specific_internal_energy: fixture.gas.internal_energy,
-        smoothing_lengths: initialized.smoothing_lengths.clone(),
+        smoothing_lengths,
         box_size: fixture.header.box_size,
         gamma: 1.4,
     };

@@ -172,9 +172,6 @@ fn initialize_profile(
     profile: StrictProfile,
 ) -> Result<InitializedSoundwave, ApplicationError> {
     let parameters = read_profile_parameters(parameter_file, profile)?;
-    if profile == StrictProfile::EqualMassShocktube {
-        return Err(ApplicationError::ShocktubeTreeInitializationUnavailable);
-    }
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
     let snapshot = read_soundwave(&fixture_path).map_err(ApplicationError::Input)?;
     if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
@@ -884,7 +881,6 @@ enum ApplicationError {
     Hydro(gizmo_hydro::HydroError),
     UnsupportedConfig(String),
     UnsupportedParameters(String),
-    ShocktubeTreeInitializationUnavailable,
     UnsupportedRestart(RestartFlag),
     MissingDataset(&'static str),
     StateMismatch(String),
@@ -914,12 +910,6 @@ impl std::fmt::Display for ApplicationError {
             Self::UnsupportedParameters(error) => {
                 write!(formatter, "unsupported runtime parameters: {error}")
             }
-            Self::ShocktubeTreeInitializationUnavailable => write!(
-                formatter,
-                "equal-mass shocktube restart-0 is not yet supported: the Rust dyadic tree \
-                 approximation does not reproduce public-C smoothing-length seeds for the \
-                 nonuniform particle layout"
-            ),
             Self::UnsupportedRestart(restart) => write!(
                 formatter,
                 "restart flag {} is not ported; only restart flag 0 can initialize a simulation",
@@ -1051,18 +1041,13 @@ ResubmitCommand none
     }
 
     #[test]
-    fn shocktube_parameters_are_strict_and_initialization_reports_tree_blocker() {
+    fn shocktube_parameters_are_strict() {
         let path =
             std::env::temp_dir().join(format!("gizmo-shocktube-params-{}.txt", std::process::id()));
         fs::write(&path, SHOCKTUBE_PARAMETERS).unwrap();
         let parameters = read_profile_parameters(&path, StrictProfile::EqualMassShocktube).unwrap();
         assert_eq!(parameters.box_size.to_bits(), 80.0_f64.to_bits());
         assert_eq!(parameters.time_max.to_bits(), 5.0_f64.to_bits());
-        assert!(matches!(
-            initialize_profile(&path, StrictProfile::EqualMassShocktube),
-            Err(ApplicationError::ShocktubeTreeInitializationUnavailable)
-        ));
-
         fs::write(
             &path,
             SHOCKTUBE_PARAMETERS.replace("BufferSize 8", "BufferSize 16"),
