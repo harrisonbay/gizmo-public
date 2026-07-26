@@ -78,6 +78,7 @@ dependencies = [
  "gizmo-hydro",
  "gizmo-io",
  "gizmo-params",
+ "hdf5-metno",
 ]
 
 [[package]]

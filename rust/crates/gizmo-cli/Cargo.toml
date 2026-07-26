@@ -11,6 +11,9 @@ gizmo-hydro = { path = "../gizmo-hydro" }
 gizmo-io = { path = "../gizmo-io" }
 gizmo-params = { path = "../gizmo-params" }
 
+[dev-dependencies]
+hdf5 = { package = "hdf5-metno", version = "0.14.0", features = ["static"] }
+
 [lints]
 workspace = true
 
