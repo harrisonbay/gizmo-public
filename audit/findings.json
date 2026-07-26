@@ -385,6 +385,48 @@
         }
       ],
       "dossier": "audit/findings/GZ-0010.md"
+    },
+    {
+      "id": "GZ-0011",
+      "title": "Published dusty-wave profile collapses grain timesteps to the minimum bin",
+      "status": "confirmed",
+      "confidence": "high",
+      "affected_flags": [
+        "GRAIN_FLUID",
+        "GRAIN_BACKREACTION",
+        "BOX_SPATIAL_DIMENSION=1",
+        "SELFGRAVITY_OFF"
+      ],
+      "summary": "The hosted dusty-wave IC has no grain smoothing-length field and the published parameter file leaves type-3 softening commented out. Grain timesteps use Get_Particle_Size(), so every grain obtains zero Courant length and requests a zero timestep. The non-fatal minimum-timestep path then repeatedly advances those grains by only two integer ticks.",
+      "impact": "Running the public example literally does not reproduce the published t=1.2 solution on a practical timescale: after 2,532 synchronization points it has advanced only 1.10e-14 of the requested 2.5 time units while emitting a warning for every grain.",
+      "reproduction": "Run the hosted dustywave_ics.hdf5 with the checked-in dustyboxwave.params and its documented compile flags. All gas particles select time bin 45 while all grains select time bin 1. Enabling the file's commented Softening_Type3=0.001 prompt makes all 128 particles select bin 45 and the run completes in 32,768 synchronized steps.",
+      "falsification": "Provide a hosted IC with a positive grain smoothing length, a parameter-resolution path that enables positive type-3 softening despite the commented line, or a grain-size definition that makes Get_Particle_Size() positive in this configuration.",
+      "oracle": {
+        "type": "regression",
+        "classification": "exact",
+        "rationale": "The byte-pinned public IC and parameter file deterministically produce a zero grain Courant length; the documented softening prompt is a one-line controlled reproducer and recovery."
+      },
+      "sources": [
+        {
+          "path": "scripts/test_problems/dustyboxwave.params",
+          "line_start": 11,
+          "line_end": 26,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/scripts/test_problems/dustyboxwave.params#L11-L26"
+        },
+        {
+          "path": "timestep.c",
+          "line_start": 495,
+          "line_end": 507,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/timestep.c#L495-L507"
+        },
+        {
+          "path": "timestep.c",
+          "line_start": 1051,
+          "line_end": 1090,
+          "url": "https://github.com/pfhopkins/gizmo-public/blob/a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f/timestep.c#L1051-L1090"
+        }
+      ],
+      "dossier": "audit/findings/GZ-0011.md"
     }
   ]
 }

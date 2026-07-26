@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod grain;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;

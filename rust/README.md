@@ -3,7 +3,7 @@
 This workspace is the correctness-oriented Rust replacement for GIZMO. It
 currently ports the public one-dimensional MFM sound-wave, both equal- and
 differential-mass Sod shock-tube paths, and the Woodward-Colella interacting
-blastwave: strict
+blastwave, plus the two-fluid dusty-wave grain-drag problem: strict
 configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
@@ -18,6 +18,7 @@ snapshots. Other physics/configuration profiles fail closed.
 validation/oracles/run_rust_soundwave_init.sh
 validation/oracles/run_rust_shocktube.sh
 validation/oracles/run_rust_interactblast.sh
+validation/oracles/run_rust_dustywave.sh
 ```
 
 The complete 65,536-step corrected-C differential is intentionally separate
@@ -48,6 +49,17 @@ steps through `t=0.038` and is additionally gated against the supplied
 20,000-zone reference solution. The hosted IC has 512 particles, contrary to
 the public documentation's statement that it has 400; this discrepancy is
 pinned as oracle metadata rather than silently normalized.
+
+The dusty-wave slice adds validated type-3 grain HDF5 state, gas-property
+interpolation at grain kernels, nonlinear finite-step Epstein drag, and
+kernel-weighted gas backreaction; drag heating is absent, matching the disabled
+term in the public C path. Its corrected-C oracle contains 64 gas particles
+plus 64 grains, 32,768 synchronized steps, and initial, `t=1.2`, and terminal
+differentials.
+At the public reference time, Rust and corrected C differ by only
+`1.54e-10` gas-velocity RMS and `1.48e-11` grain-velocity RMS. Both are also
+gated against the supplied 512-point solution, and every drag batch checks
+total momentum.
 
 Initialization-only mode validates either supported profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive

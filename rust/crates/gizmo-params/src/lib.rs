@@ -23,6 +23,11 @@ const SUPPORTED_TAGS: &[&str] = &[
     "MaxMemSize",
     "ErrTolTheta",
     "MaxNumNgbDeviation",
+    "Grain_Internal_Density",
+    "Grain_Size_Min",
+    "Grain_Size_Max",
+    "Grain_Size_Spectrum_Powerlaw",
+    "Softening_Type3",
     "ResubmitOn",
     "ResubmitCommand",
 ];
@@ -50,6 +55,11 @@ pub struct SoundwaveParameters {
     pub max_memory_mb: Option<u64>,
     pub tree_opening_angle: f64,
     pub max_neighbor_deviation: f64,
+    pub grain_internal_density: Option<f64>,
+    pub grain_size_min: Option<f64>,
+    pub grain_size_max: Option<f64>,
+    pub grain_size_spectrum_powerlaw: Option<f64>,
+    pub type3_softening: Option<f64>,
     pub resubmit: bool,
     pub resubmit_command: String,
 }
@@ -164,6 +174,14 @@ impl SoundwaveParameters {
                 "MaxNumNgbDeviation",
                 (desired_num_neighbors / 640.0).max(0.05),
             )?,
+            grain_internal_density: optional_present_f64(&entries, "Grain_Internal_Density")?,
+            grain_size_min: optional_present_f64(&entries, "Grain_Size_Min")?,
+            grain_size_max: optional_present_f64(&entries, "Grain_Size_Max")?,
+            grain_size_spectrum_powerlaw: optional_present_f64(
+                &entries,
+                "Grain_Size_Spectrum_Powerlaw",
+            )?,
+            type3_softening: optional_present_f64(&entries, "Softening_Type3")?,
             resubmit: optional_bool01(&entries, "ResubmitOn", false)?,
             resubmit_command: optional_string(&entries, "ResubmitCommand", "none"),
         };
@@ -242,6 +260,25 @@ impl SoundwaveParameters {
                 "must be finite, positive, and at most 10% of DesNumNgb",
             ));
         }
+        for (tag, value) in [
+            ("Grain_Internal_Density", self.grain_internal_density),
+            ("Grain_Size_Min", self.grain_size_min),
+            ("Grain_Size_Max", self.grain_size_max),
+            ("Softening_Type3", self.type3_softening),
+        ] {
+            if let Some(value) = value {
+                positive(entries, tag, value)?;
+            }
+        }
+        if let Some(value) = self.grain_size_spectrum_powerlaw
+            && !value.is_finite()
+        {
+            return Err(invalid_value(
+                entries,
+                "Grain_Size_Spectrum_Powerlaw",
+                "must be finite",
+            ));
+        }
         Ok(())
     }
 }
@@ -302,6 +339,16 @@ fn optional_f64(
     entries
         .get(tag)
         .map_or(Ok(default), |entry| parse_f64(entry, tag))
+}
+
+fn optional_present_f64(
+    entries: &BTreeMap<String, Entry>,
+    tag: &'static str,
+) -> Result<Option<f64>, ParameterError> {
+    entries
+        .get(tag)
+        .map(|entry| parse_f64(entry, tag))
+        .transpose()
 }
 
 fn optional_u64(
@@ -529,6 +576,7 @@ DesNumNgb 4
     const PINNED: &str = include_str!("../../../../validation/oracles/soundwave/legacy.params");
     const INTERACTBLAST: &str =
         include_str!("../../../../validation/oracles/interactblast/legacy.params");
+    const DUSTYWAVE: &str = include_str!("../../../../validation/oracles/dustywave/legacy.params");
     const UPSTREAM_PUBLIC: &str =
         include_str!("../../../../scripts/test_problems/soundwave.params");
 
@@ -568,6 +616,26 @@ DesNumNgb 4
         assert_eq!(parameters.min_timestep, Some(2.0e-7));
         assert_float_eq(parameters.box_size, 1.0);
         assert_float_eq(parameters.courant_factor, 0.01);
+    }
+
+    #[test]
+    fn parses_the_dustywave_grain_parameters() {
+        let retained = DUSTYWAVE
+            .lines()
+            .filter(|line| {
+                !matches!(
+                    line.split_whitespace().next(),
+                    Some("TimeBegin" | "ICFormat" | "SnapFormat" | "BufferSize")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parameters = SoundwaveParameters::parse(&retained).unwrap();
+        assert_eq!(parameters.grain_internal_density, Some(1.0));
+        assert_eq!(parameters.grain_size_min, Some(1.23608));
+        assert_eq!(parameters.grain_size_max, Some(1.23608));
+        assert_eq!(parameters.grain_size_spectrum_powerlaw, Some(0.5));
+        assert_eq!(parameters.type3_softening, Some(0.001));
     }
 
     #[test]

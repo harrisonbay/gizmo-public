@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "source_commit": "baeb169eb11a18d337a471756fe1ac0d942bdd26",
+  "corrected_c_findings": [
+    "GZ-0011"
+  ],
+  "profile": {
+    "name": "public 1-D periodic MFM dusty wave with grain backreaction",
+    "gas_particle_count": 64,
+    "grain_particle_count": 64,
+    "gamma": 1.6666666666666667,
+    "eos_enforce_adiabat": 0.6,
+    "box_size": 1.0,
+    "boundary": "periodic",
+    "grain_softening_prompt": 0.001
+  },
+  "inputs": {
+    "config": {
+      "path": "legacy-config.sh",
+      "sha256": "60b07ec9a401f440180b45665bade9327d340d0c4d58a344609aafc5f8f734fb"
+    },
+    "parameters": {
+      "path": "legacy.params",
+      "sha256": "9aad1560e64ff5b414cdfe4a21bc7721243a2ac4285f0ac0242d9c5e1064dc1f"
+    },
+    "resolved_parameters": {
+      "path": "parameters-usedvalues",
+      "sha256": "13516c25b33a1c2c0973c3dc124f4c869ede574931bed165d654aab89a29153c"
+    }
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 2.5,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 35184372088832,
+    "physical_step": 0.0000762939453125,
+    "steps": 32768,
+    "scheduled_outputs": 251,
+    "output_interval": 0.01
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "phase": "initial scheduled drift after first half-kick",
+      "raw_sha256": "8ff60f3a35616fe2a60a8fb0b5fe350e97bb962be08603358a7d0bb452e2f6ca",
+      "table": "evolution_t0.csv.gz",
+      "table_sha256": "8761ae43aae436a9cf23eaf5beb997519ee274b3a83504a61a45b0ee2a7ff4bd",
+      "total_momentum_x": 3.410605091210344e-13
+    },
+    {
+      "time": 1.2000000000000008,
+      "phase": "scheduled output drift at the public reference time",
+      "raw_sha256": "15e8a762cef35950ce175dc55c129251a5d6a2c0991bef2c37a186c32c476f43",
+      "table": "evolution_t1.2.csv.gz",
+      "table_sha256": "8ab8aa3355325c9c18381123b5fd83b949102e8db47cd2864da4bbe76bef1bb8",
+      "total_momentum_x": 3.4106762485181888e-13
+    },
+    {
+      "time": 2.4999999999999907,
+      "phase": "scheduled terminal drift before the duplicate final snapshot",
+      "raw_sha256": "168679b06f8528433596b0fdf9a42c9fd73ae5d0d82aab4c8699bd1937a7ec83",
+      "table": "evolution_t2.5.csv.gz",
+      "table_sha256": "c5d656bad0ee9ffc3567a227a1cee17810e3ecec95442130ae79151e5a025df0",
+      "total_momentum_x": 3.410667107237706e-13
+    },
+    {
+      "time": 2.5,
+      "phase": "final completed state after endpoint force and second kick",
+      "raw_sha256": "d53c65d3eeb42303e2cad041820eb3b183307892dd2f392b30124401e0e4131a",
+      "table": "evolution_tfinal.csv.gz",
+      "table_sha256": "83ab6a4a1b4db754651a22ae3b07347d0e95a784630f981a3d2a2b7db6459451",
+      "total_momentum_x": 3.570734190379073e-13
+    }
+  ],
+  "public_reference": {
+    "description": "approximately exact dusty-wave velocity solution, documented as accurate to about four significant figures",
+    "time": 1.2,
+    "velocity_scale": 0.0001,
+    "interpolation": "periodic linear interpolation",
+    "peak_normalized_rms": {
+      "grain_velocity_x": 0.0007509895324866209,
+      "gas_velocity_x": 0.0119617584452842
+    },
+    "absolute_rms": {
+      "grain_velocity_x": 2.8225488879593552e-8,
+      "gas_velocity_x": 4.4682335616929983e-7
+    }
+  },
+  "observations": {
+    "literal_public_profile_stalls": true,
+    "literal_grain_step_ticks": 2,
+    "literal_physical_step": 4.336808689942018e-18,
+    "literal_time_after_2532_sync_points": 1.098079960293319e-14,
+    "all_softened_profile_particles_shared_one_timebin": true,
+    "drag_heating_deposited_in_gas": false
+  }
+}

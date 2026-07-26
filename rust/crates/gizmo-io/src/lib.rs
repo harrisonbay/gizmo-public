@@ -138,9 +138,80 @@ impl GasParticles {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct GrainParticles {
+    pub coordinates: Vec<[f64; VECTOR_COMPONENTS]>,
+    pub velocities: Vec<[f64; VECTOR_COMPONENTS]>,
+    pub ids: Vec<u64>,
+    pub masses: Vec<f64>,
+    pub grain_size: Vec<f64>,
+    pub smoothing_length: Option<Vec<f64>>,
+}
+
+impl GrainParticles {
+    /// Validate complete grain columns and sort them by `ParticleIDs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched columns, duplicate IDs, non-finite
+    /// vectors, or non-positive masses and grain sizes.
+    pub fn validate_and_sort(&mut self) -> Result<(), ValidationError> {
+        let expected = self.ids.len();
+        for (field, actual) in [
+            ("Coordinates", self.coordinates.len()),
+            ("Velocities", self.velocities.len()),
+            ("Masses", self.masses.len()),
+            ("GrainSize", self.grain_size.len()),
+        ] {
+            validate_column_length(field, expected, actual)?;
+        }
+        if let Some(values) = &self.smoothing_length {
+            validate_column_length("SmoothingLength", expected, values.len())?;
+        }
+        for index in 0..expected {
+            validate_vector("Coordinates", index, self.coordinates[index])?;
+            validate_vector("Velocities", index, self.velocities[index])?;
+            validate_positive("Masses", index, self.masses[index])?;
+            validate_positive("GrainSize", index, self.grain_size[index])?;
+            if let Some(values) = &self.smoothing_length {
+                validate_positive("SmoothingLength", index, values[index])?;
+            }
+        }
+
+        let order = particle_id_order(&self.ids)?;
+        self.coordinates = reorder(&self.coordinates, &order);
+        self.velocities = reorder(&self.velocities, &order);
+        self.ids = reorder(&self.ids, &order);
+        self.masses = reorder(&self.masses, &order);
+        self.grain_size = reorder(&self.grain_size, &order);
+        self.smoothing_length = self
+            .smoothing_length
+            .as_ref()
+            .map(|values| reorder(values, &order));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SoundWaveSnapshot {
     pub header: SnapshotHeader,
     pub gas: GasParticles,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DustyWaveSnapshot {
+    pub header: SnapshotHeader,
+    pub gas: GasParticles,
+    pub grains: GrainParticles,
 }
 
 /// Borrowed, complete gas state to serialize as a sound-wave snapshot.
@@ -160,6 +231,37 @@ pub struct SoundWaveWriteView<'a> {
     pub internal_energy: &'a [f64],
     pub density: &'a [f64],
     pub smoothing_length: &'a [f64],
+}
+
+/// Borrowed, complete gas columns used by a multi-species snapshot writer.
+#[derive(Clone, Copy, Debug)]
+pub struct GasWriteView<'a> {
+    pub coordinates: &'a [[f64; VECTOR_COMPONENTS]],
+    pub velocities: &'a [[f64; VECTOR_COMPONENTS]],
+    pub ids: &'a [u64],
+    pub masses: &'a [f64],
+    pub internal_energy: &'a [f64],
+    pub density: &'a [f64],
+    pub smoothing_length: &'a [f64],
+}
+
+/// Borrowed, complete type-3 grain columns.
+#[derive(Clone, Copy, Debug)]
+pub struct GrainWriteView<'a> {
+    pub coordinates: &'a [[f64; VECTOR_COMPONENTS]],
+    pub velocities: &'a [[f64; VECTOR_COMPONENTS]],
+    pub ids: &'a [u64],
+    pub masses: &'a [f64],
+    pub grain_size: &'a [f64],
+    pub smoothing_length: &'a [f64],
+}
+
+/// Borrowed gas-and-grain state to serialize as a dusty-wave snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct DustyWaveWriteView<'a> {
+    pub header: &'a SnapshotHeader,
+    pub gas: GasWriteView<'a>,
+    pub grains: GrainWriteView<'a>,
 }
 
 impl<'a> TryFrom<&'a SoundWaveSnapshot> for SoundWaveWriteView<'a> {
@@ -183,6 +285,43 @@ impl<'a> TryFrom<&'a SoundWaveSnapshot> for SoundWaveWriteView<'a> {
                 .smoothing_length
                 .as_deref()
                 .ok_or(ValidationError::MissingRequiredField("SmoothingLength"))?,
+        })
+    }
+}
+
+impl<'a> TryFrom<&'a DustyWaveSnapshot> for DustyWaveWriteView<'a> {
+    type Error = ValidationError;
+
+    fn try_from(snapshot: &'a DustyWaveSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: &snapshot.header,
+            gas: GasWriteView {
+                coordinates: &snapshot.gas.coordinates,
+                velocities: &snapshot.gas.velocities,
+                ids: &snapshot.gas.ids,
+                masses: &snapshot.gas.masses,
+                internal_energy: &snapshot.gas.internal_energy,
+                density: snapshot
+                    .gas
+                    .density
+                    .as_deref()
+                    .ok_or(ValidationError::MissingRequiredField("Density"))?,
+                smoothing_length: snapshot
+                    .gas
+                    .smoothing_length
+                    .as_deref()
+                    .ok_or(ValidationError::MissingRequiredField("SmoothingLength"))?,
+            },
+            grains: GrainWriteView {
+                coordinates: &snapshot.grains.coordinates,
+                velocities: &snapshot.grains.velocities,
+                ids: &snapshot.grains.ids,
+                masses: &snapshot.grains.masses,
+                grain_size: &snapshot.grains.grain_size,
+                smoothing_length: snapshot.grains.smoothing_length.as_deref().ok_or(
+                    ValidationError::MissingRequiredField("PartType3/SmoothingLength"),
+                )?,
+            },
         })
     }
 }
@@ -225,6 +364,44 @@ impl SoundWaveSnapshot {
     }
 }
 
+impl DustyWaveSnapshot {
+    /// Validate a gas-and-type-3-grain snapshot and sort each particle type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid header counts, unexpected particle types,
+    /// malformed particle columns, or an ID duplicated within or across types.
+    pub fn validate_and_sort(&mut self) -> Result<(), ValidationError> {
+        if self.gas.is_empty() {
+            return Err(ValidationError::EmptyGasState);
+        }
+        if self.grains.is_empty() {
+            return Err(ValidationError::EmptyGrainState);
+        }
+        self.header.validate()?;
+        validate_particle_type_count(&self.header, 0, self.gas.len())?;
+        validate_particle_type_count(&self.header, 3, self.grains.len())?;
+        if let Some((particle_type, count)) = self
+            .header
+            .num_part_total
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(particle_type, count)| {
+                *count != 0 && *particle_type != 0 && *particle_type != 3
+            })
+        {
+            return Err(ValidationError::UnexpectedParticleType {
+                particle_type,
+                count,
+            });
+        }
+        self.gas.validate_and_sort()?;
+        self.grains.validate_and_sort()?;
+        validate_disjoint_particle_ids(&self.gas.ids, &self.grains.ids)
+    }
+}
+
 /// Read and validate the public gas-only sound-wave initial condition.
 ///
 /// Numeric HDF5 values are converted through HDF5's checked conversion layer
@@ -236,50 +413,74 @@ impl SoundWaveSnapshot {
 /// error for malformed shapes and physically invalid data.
 pub fn read_soundwave(path: impl AsRef<Path>) -> Result<SoundWaveSnapshot, InputError> {
     let file = hdf5::File::open(path)?;
-    let header_group = file.group("Header")?;
-    let num_part_total = read_particle_counts(&header_group, "NumPart_Total")?;
-    let double_precision_raw: i32 = header_group.attr("Flag_DoublePrecision")?.read_scalar()?;
-    let double_precision = match double_precision_raw {
-        0 => false,
-        1 => true,
-        value => {
-            return Err(ValidationError::InvalidPrecisionFlag(value).into());
-        }
-    };
-    let header = SnapshotHeader {
-        time: header_group.attr("Time")?.read_scalar()?,
-        box_size: header_group.attr("BoxSize")?.read_scalar()?,
-        num_part_total,
-        double_precision,
-        effective_kernel_neighbors: read_optional_scalar_attribute(
-            &header_group,
-            "Effective_Kernel_NeighborNumber",
-        )?,
-    };
-
-    let gas_group = file.group("PartType0")?;
-    let coordinates = read_vectors(&gas_group, "Coordinates")?;
-    let velocities = read_vectors(&gas_group, "Velocities")?;
-    let ids = read_scalar_dataset::<u64>(&gas_group, "ParticleIDs")?;
-    let masses = read_scalar_dataset::<f64>(&gas_group, "Masses")?;
-    let internal_energy = read_scalar_dataset::<f64>(&gas_group, "InternalEnergy")?;
-    let density = read_optional_scalars(&gas_group, "Density")?;
-    let smoothing_length = read_optional_scalars(&gas_group, "SmoothingLength")?;
-
     let mut snapshot = SoundWaveSnapshot {
-        header,
-        gas: GasParticles {
-            coordinates,
-            velocities,
-            ids,
-            masses,
-            internal_energy,
-            density,
-            smoothing_length,
+        header: read_snapshot_header(&file)?,
+        gas: read_gas_particles(&file)?,
+    };
+    snapshot.validate_and_sort()?;
+    Ok(snapshot)
+}
+
+/// Read and validate a gas-and-type-3-grain dusty-wave snapshot.
+///
+/// Numeric HDF5 values are converted to the canonical in-memory `f64` and
+/// `u64` representation. Dataset rows are sorted independently within each
+/// particle type, and IDs must remain globally unique.
+///
+/// # Errors
+///
+/// Returns an HDF5 error for missing or unreadable objects, or a validation
+/// error for malformed shapes, invalid counts, or invalid physical data.
+pub fn read_dustywave(path: impl AsRef<Path>) -> Result<DustyWaveSnapshot, InputError> {
+    let file = hdf5::File::open(path)?;
+    let grain_group = file.group("PartType3")?;
+    let mut snapshot = DustyWaveSnapshot {
+        header: read_snapshot_header(&file)?,
+        gas: read_gas_particles(&file)?,
+        grains: GrainParticles {
+            coordinates: read_vectors(&grain_group, "Coordinates")?,
+            velocities: read_vectors(&grain_group, "Velocities")?,
+            ids: read_scalar_dataset(&grain_group, "ParticleIDs")?,
+            masses: read_scalar_dataset(&grain_group, "Masses")?,
+            grain_size: read_scalar_dataset(&grain_group, "GrainSize")?,
+            smoothing_length: read_optional_scalars(&grain_group, "SmoothingLength")?,
         },
     };
     snapshot.validate_and_sort()?;
     Ok(snapshot)
+}
+
+fn read_snapshot_header(file: &hdf5::File) -> Result<SnapshotHeader, InputError> {
+    let header = file.group("Header")?;
+    let double_precision_raw: i32 = header.attr("Flag_DoublePrecision")?.read_scalar()?;
+    let double_precision = match double_precision_raw {
+        0 => false,
+        1 => true,
+        value => return Err(ValidationError::InvalidPrecisionFlag(value).into()),
+    };
+    Ok(SnapshotHeader {
+        time: header.attr("Time")?.read_scalar()?,
+        box_size: header.attr("BoxSize")?.read_scalar()?,
+        num_part_total: read_particle_counts(&header, "NumPart_Total")?,
+        double_precision,
+        effective_kernel_neighbors: read_optional_scalar_attribute(
+            &header,
+            "Effective_Kernel_NeighborNumber",
+        )?,
+    })
+}
+
+fn read_gas_particles(file: &hdf5::File) -> Result<GasParticles, InputError> {
+    let gas = file.group("PartType0")?;
+    Ok(GasParticles {
+        coordinates: read_vectors(&gas, "Coordinates")?,
+        velocities: read_vectors(&gas, "Velocities")?,
+        ids: read_scalar_dataset(&gas, "ParticleIDs")?,
+        masses: read_scalar_dataset(&gas, "Masses")?,
+        internal_energy: read_scalar_dataset(&gas, "InternalEnergy")?,
+        density: read_optional_scalars(&gas, "Density")?,
+        smoothing_length: read_optional_scalars(&gas, "SmoothingLength")?,
+    })
 }
 
 /// Write a complete, validated gas-only sound-wave snapshot.
@@ -365,6 +566,103 @@ pub fn write_soundwave(
     write_scalars(&gas, "InternalEnergy", snapshot.internal_energy)?;
     write_scalars(&gas, "Density", snapshot.density)?;
     write_scalars(&gas, "SmoothingLength", snapshot.smoothing_length)?;
+    Ok(())
+}
+
+/// Write a complete, validated gas-and-type-3-grain dusty-wave snapshot.
+///
+/// Both particle groups are emitted in the supplied order. IDs are stored in
+/// the public snapshot format's `u32` representation, while header totals
+/// retain their complete low/high-word encoding.
+///
+/// # Errors
+///
+/// Returns a validation error before creating the file if either particle
+/// group is inconsistent, or an HDF5 error if the destination cannot be
+/// written.
+pub fn write_dustywave(
+    path: impl AsRef<Path>,
+    snapshot: DustyWaveWriteView<'_>,
+) -> Result<(), OutputError> {
+    validate_dustywave_write_view(snapshot)?;
+
+    let gas_count = legacy_file_particle_count(snapshot.gas.ids.len())?;
+    let grain_count = legacy_file_particle_count(snapshot.grains.ids.len())?;
+    let mut num_part_this_file = [0_i32; PARTICLE_TYPES];
+    num_part_this_file[0] = gas_count;
+    num_part_this_file[3] = grain_count;
+    let num_part_total_low = snapshot
+        .header
+        .num_part_total
+        .map(legacy_particle_count_low_word);
+    let num_part_total_high = snapshot
+        .header
+        .num_part_total
+        .map(legacy_particle_count_high_word);
+    let legacy_gas_ids = legacy_particle_ids(snapshot.gas.ids)?;
+    let legacy_grain_ids = legacy_particle_ids(snapshot.grains.ids)?;
+    let effective_kernel_neighbors =
+        snapshot
+            .header
+            .effective_kernel_neighbors
+            .ok_or(ValidationError::MissingRequiredField(
+                "Effective_Kernel_NeighborNumber",
+            ))?;
+    let minimum_mass_for_merge = 0.49
+        * snapshot
+            .gas
+            .masses
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+    let maximum_mass_for_split = 3.01
+        * snapshot
+            .gas
+            .masses
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+    let mass_table = [0.0_f64; PARTICLE_TYPES];
+    let fixed_force_softening = [0.0_f64; PARTICLE_TYPES];
+
+    let file = hdf5::File::create(path)?;
+    let header = file.create_group("Header")?;
+    write_scalar_attribute(&header, "Time", &snapshot.header.time)?;
+    write_scalar_attribute(&header, "BoxSize", &snapshot.header.box_size)?;
+    write_array_attribute(&header, "NumPart_ThisFile", &num_part_this_file)?;
+    write_array_attribute(&header, "NumPart_Total", &num_part_total_low)?;
+    write_array_attribute(&header, "NumPart_Total_HighWord", &num_part_total_high)?;
+    write_array_attribute(&header, "MassTable", &mass_table)?;
+    write_scalar_attribute(&header, "NumFilesPerSnapshot", &1_i32)?;
+    write_scalar_attribute(
+        &header,
+        "Flag_DoublePrecision",
+        &i32::from(snapshot.header.double_precision),
+    )?;
+    write_legacy_compatibility_attributes(
+        &header,
+        effective_kernel_neighbors,
+        minimum_mass_for_merge,
+        maximum_mass_for_split,
+        &fixed_force_softening,
+    )?;
+
+    let gas = file.create_group("PartType0")?;
+    write_vectors(&gas, "Coordinates", snapshot.gas.coordinates)?;
+    write_vectors(&gas, "Velocities", snapshot.gas.velocities)?;
+    write_scalars(&gas, "ParticleIDs", &legacy_gas_ids)?;
+    write_scalars(&gas, "Masses", snapshot.gas.masses)?;
+    write_scalars(&gas, "InternalEnergy", snapshot.gas.internal_energy)?;
+    write_scalars(&gas, "Density", snapshot.gas.density)?;
+    write_scalars(&gas, "SmoothingLength", snapshot.gas.smoothing_length)?;
+
+    let grains = file.create_group("PartType3")?;
+    write_vectors(&grains, "Coordinates", snapshot.grains.coordinates)?;
+    write_vectors(&grains, "Velocities", snapshot.grains.velocities)?;
+    write_scalars(&grains, "ParticleIDs", &legacy_grain_ids)?;
+    write_scalars(&grains, "Masses", snapshot.grains.masses)?;
+    write_scalars(&grains, "GrainSize", snapshot.grains.grain_size)?;
+    write_scalars(&grains, "SmoothingLength", snapshot.grains.smoothing_length)?;
     Ok(())
 }
 
@@ -488,6 +786,138 @@ fn validate_write_view(snapshot: SoundWaveWriteView<'_>) -> Result<(), Validatio
         return Err(ValidationError::DuplicateParticleId(id));
     }
     Ok(())
+}
+
+fn validate_dustywave_write_view(snapshot: DustyWaveWriteView<'_>) -> Result<(), ValidationError> {
+    snapshot.header.validate()?;
+    if snapshot.gas.ids.is_empty() {
+        return Err(ValidationError::EmptyGasState);
+    }
+    if snapshot.grains.ids.is_empty() {
+        return Err(ValidationError::EmptyGrainState);
+    }
+    validate_particle_type_count(snapshot.header, 0, snapshot.gas.ids.len())?;
+    validate_particle_type_count(snapshot.header, 3, snapshot.grains.ids.len())?;
+    if let Some((particle_type, count)) = snapshot
+        .header
+        .num_part_total
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(particle_type, count)| *count != 0 && *particle_type != 0 && *particle_type != 3)
+    {
+        return Err(ValidationError::UnexpectedParticleType {
+            particle_type,
+            count,
+        });
+    }
+
+    let gas_count = snapshot.gas.ids.len();
+    for (field, actual) in [
+        ("Coordinates", snapshot.gas.coordinates.len()),
+        ("Velocities", snapshot.gas.velocities.len()),
+        ("Masses", snapshot.gas.masses.len()),
+        ("InternalEnergy", snapshot.gas.internal_energy.len()),
+        ("Density", snapshot.gas.density.len()),
+        ("SmoothingLength", snapshot.gas.smoothing_length.len()),
+    ] {
+        validate_column_length(field, gas_count, actual)?;
+    }
+    for index in 0..gas_count {
+        validate_vector("Coordinates", index, snapshot.gas.coordinates[index])?;
+        validate_vector("Velocities", index, snapshot.gas.velocities[index])?;
+        validate_positive("Masses", index, snapshot.gas.masses[index])?;
+        validate_positive("InternalEnergy", index, snapshot.gas.internal_energy[index])?;
+        validate_positive("Density", index, snapshot.gas.density[index])?;
+        validate_positive(
+            "SmoothingLength",
+            index,
+            snapshot.gas.smoothing_length[index],
+        )?;
+    }
+
+    let grain_count = snapshot.grains.ids.len();
+    for (field, actual) in [
+        ("Coordinates", snapshot.grains.coordinates.len()),
+        ("Velocities", snapshot.grains.velocities.len()),
+        ("Masses", snapshot.grains.masses.len()),
+        ("GrainSize", snapshot.grains.grain_size.len()),
+        ("SmoothingLength", snapshot.grains.smoothing_length.len()),
+    ] {
+        validate_column_length(field, grain_count, actual)?;
+    }
+    for index in 0..grain_count {
+        validate_vector("Coordinates", index, snapshot.grains.coordinates[index])?;
+        validate_vector("Velocities", index, snapshot.grains.velocities[index])?;
+        validate_positive("Masses", index, snapshot.grains.masses[index])?;
+        validate_positive("GrainSize", index, snapshot.grains.grain_size[index])?;
+        validate_positive(
+            "SmoothingLength",
+            index,
+            snapshot.grains.smoothing_length[index],
+        )?;
+    }
+
+    particle_id_order(snapshot.gas.ids)?;
+    particle_id_order(snapshot.grains.ids)?;
+    validate_disjoint_particle_ids(snapshot.gas.ids, snapshot.grains.ids)
+}
+
+fn validate_particle_type_count(
+    header: &SnapshotHeader,
+    particle_type: usize,
+    dataset: usize,
+) -> Result<(), ValidationError> {
+    let declared = header.num_part_total[particle_type];
+    let header_count =
+        usize::try_from(declared).map_err(|_| ValidationError::ParticleCountOverflow(declared))?;
+    if header_count == dataset {
+        Ok(())
+    } else {
+        Err(ValidationError::ParticleTypeCountMismatch {
+            particle_type,
+            header: header_count,
+            dataset,
+        })
+    }
+}
+
+fn particle_id_order(ids: &[u64]) -> Result<Vec<usize>, ValidationError> {
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    order.sort_unstable_by_key(|&index| ids[index]);
+    if let Some(id) = order.windows(2).find_map(|pair| {
+        let left = ids[pair[0]];
+        (left == ids[pair[1]]).then_some(left)
+    }) {
+        return Err(ValidationError::DuplicateParticleId(id));
+    }
+    Ok(order)
+}
+
+fn validate_disjoint_particle_ids(left: &[u64], right: &[u64]) -> Result<(), ValidationError> {
+    let mut ids = Vec::with_capacity(left.len() + right.len());
+    ids.extend_from_slice(left);
+    ids.extend_from_slice(right);
+    ids.sort_unstable();
+    if let Some(id) = ids
+        .windows(2)
+        .find_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
+    {
+        Err(ValidationError::DuplicateParticleId(id))
+    } else {
+        Ok(())
+    }
+}
+
+fn legacy_file_particle_count(count: usize) -> Result<i32, ValidationError> {
+    i32::try_from(count).map_err(|_| ValidationError::LegacyFileParticleCountOverflow(count))
+}
+
+fn legacy_particle_ids(ids: &[u64]) -> Result<Vec<u32>, ValidationError> {
+    ids.iter()
+        .copied()
+        .map(|id| u32::try_from(id).map_err(|_| ValidationError::LegacyParticleIdOverflow(id)))
+        .collect()
 }
 
 fn write_scalar_attribute<T: hdf5::H5Type>(
@@ -696,6 +1126,7 @@ fn reorder<T: Copy>(values: &[T], order: &[usize]) -> Vec<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidationError {
     EmptyGasState,
+    EmptyGrainState,
     MissingRequiredField(&'static str),
     InvalidHeaderScalar {
         field: &'static str,
@@ -716,6 +1147,11 @@ pub enum ValidationError {
     LegacyFileParticleCountOverflow(usize),
     LegacyParticleIdOverflow(u64),
     ParticleCountMismatch {
+        header: usize,
+        dataset: usize,
+    },
+    ParticleTypeCountMismatch {
+        particle_type: usize,
         header: usize,
         dataset: usize,
     },
@@ -740,8 +1176,9 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyGasState => formatter.write_str("sound-wave gas state is empty"),
+            Self::EmptyGrainState => formatter.write_str("dusty-wave grain state is empty"),
             Self::MissingRequiredField(field) => {
-                write!(formatter, "sound-wave output requires `{field}`")
+                write!(formatter, "snapshot output requires `{field}`")
             }
             Self::InvalidHeaderScalar { field, value } => {
                 write!(formatter, "header `{field}` has invalid value {value}")
@@ -774,7 +1211,7 @@ impl fmt::Display for ValidationError {
             }
             Self::LegacyFileParticleCountOverflow(count) => write!(
                 formatter,
-                "gas particle count {count} does not fit in GIZMO's per-file header count"
+                "particle count {count} does not fit in GIZMO's per-file header count"
             ),
             Self::LegacyParticleIdOverflow(id) => {
                 write!(
@@ -785,6 +1222,15 @@ impl fmt::Display for ValidationError {
             Self::ParticleCountMismatch { header, dataset } => write!(
                 formatter,
                 "header declares {header} gas particles, datasets contain {dataset}"
+            ),
+            Self::ParticleTypeCountMismatch {
+                particle_type,
+                header,
+                dataset,
+            } => write!(
+                formatter,
+                "header declares {header} particles of type {particle_type}, \
+                 datasets contain {dataset}"
             ),
             Self::UnexpectedParticleType {
                 particle_type,
@@ -929,6 +1375,25 @@ mod tests {
         }
     }
 
+    fn valid_dustywave_snapshot() -> DustyWaveSnapshot {
+        let soundwave = valid_snapshot();
+        DustyWaveSnapshot {
+            header: SnapshotHeader {
+                num_part_total: [3, 0, 0, 2, 0, 0],
+                ..soundwave.header
+            },
+            gas: soundwave.gas,
+            grains: GrainParticles {
+                coordinates: vec![[0.5, 0.0, 0.0], [0.4, 0.0, 0.0]],
+                velocities: vec![[50.0, 0.0, 0.0], [40.0, 0.0, 0.0]],
+                ids: vec![5, 4],
+                masses: vec![0.5, 0.4],
+                grain_size: vec![0.05, 0.04],
+                smoothing_length: Some(vec![0.005, 0.004]),
+            },
+        }
+    }
+
     fn temporary_hdf5_path(test_name: &str) -> std::path::PathBuf {
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -1034,6 +1499,65 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn dustywave_validation_sorts_both_types_and_requires_global_id_uniqueness() {
+        let mut snapshot = valid_dustywave_snapshot();
+        snapshot.validate_and_sort().unwrap();
+        assert_eq!(snapshot.gas.ids, [1, 2, 3]);
+        assert_eq!(snapshot.grains.ids, [4, 5]);
+        assert_float_slice_eq(&snapshot.grains.masses, &[0.4, 0.5]);
+        assert_float_slice_eq(&snapshot.grains.grain_size, &[0.04, 0.05]);
+        assert_float_slice_eq(
+            snapshot.grains.smoothing_length.as_deref().unwrap(),
+            &[0.004, 0.005],
+        );
+        assert_float_slice_eq(&snapshot.grains.coordinates[0], &[0.4, 0.0, 0.0]);
+
+        let mut duplicate = valid_dustywave_snapshot();
+        duplicate.grains.ids[0] = 2;
+        assert_eq!(
+            duplicate.validate_and_sort(),
+            Err(ValidationError::DuplicateParticleId(2))
+        );
+    }
+
+    #[test]
+    fn dustywave_validation_rejects_bad_grain_count_and_fields() {
+        let mut wrong_count = valid_dustywave_snapshot();
+        wrong_count.header.num_part_total[3] = 3;
+        assert_eq!(
+            wrong_count.validate_and_sort(),
+            Err(ValidationError::ParticleTypeCountMismatch {
+                particle_type: 3,
+                header: 3,
+                dataset: 2,
+            })
+        );
+
+        let mut invalid_size = valid_dustywave_snapshot();
+        invalid_size.grains.grain_size[0] = 0.0;
+        assert!(matches!(
+            invalid_size.validate_and_sort(),
+            Err(ValidationError::NonPositiveValue {
+                field: "GrainSize",
+                ..
+            })
+        ));
+
+        let mut empty = valid_dustywave_snapshot();
+        empty.header.num_part_total[3] = 0;
+        empty.grains.coordinates.clear();
+        empty.grains.velocities.clear();
+        empty.grains.ids.clear();
+        empty.grains.masses.clear();
+        empty.grains.grain_size.clear();
+        empty.grains.smoothing_length = Some(Vec::new());
+        assert_eq!(
+            empty.validate_and_sort(),
+            Err(ValidationError::EmptyGrainState)
+        );
     }
 
     #[test]
@@ -1253,6 +1777,105 @@ mod tests {
     }
 
     #[test]
+    fn dustywave_writer_roundtrips_both_particle_types() {
+        let mut expected = valid_dustywave_snapshot();
+        expected.validate_and_sort().unwrap();
+        expected.header.time = 1.2;
+
+        let path = temporary_hdf5_path("dustywave-roundtrip");
+        write_dustywave(&path, DustyWaveWriteView::try_from(&expected).unwrap()).unwrap();
+        let actual = read_dustywave(&path).unwrap();
+        assert_eq!(actual, expected);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let header = file.group("Header").unwrap();
+        assert_eq!(
+            header
+                .attr("NumPart_ThisFile")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            [3, 0, 0, 2, 0, 0]
+        );
+        assert_eq!(
+            header
+                .attr("NumPart_Total")
+                .unwrap()
+                .read_raw::<u32>()
+                .unwrap(),
+            [3, 0, 0, 2, 0, 0]
+        );
+        let grains = file.group("PartType3").unwrap();
+        let mut dataset_names = grains.member_names().unwrap();
+        dataset_names.sort();
+        assert_eq!(
+            dataset_names,
+            [
+                "Coordinates",
+                "GrainSize",
+                "Masses",
+                "ParticleIDs",
+                "SmoothingLength",
+                "Velocities",
+            ]
+        );
+        assert!(
+            grains
+                .dataset("ParticleIDs")
+                .unwrap()
+                .dtype()
+                .unwrap()
+                .is::<u32>()
+        );
+        assert_eq!(
+            grains
+                .dataset("ParticleIDs")
+                .unwrap()
+                .read_raw::<u32>()
+                .unwrap(),
+            [4, 5]
+        );
+        assert_eq!(
+            grains.dataset("Coordinates").unwrap().shape(),
+            [expected.grains.len(), VECTOR_COMPONENTS]
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dustywave_writer_rejects_invalid_state_before_creating_file() {
+        let mut missing_hsml = valid_dustywave_snapshot();
+        missing_hsml.grains.smoothing_length = None;
+        assert_eq!(
+            DustyWaveWriteView::try_from(&missing_hsml).unwrap_err(),
+            ValidationError::MissingRequiredField("PartType3/SmoothingLength")
+        );
+
+        let path = temporary_hdf5_path("dustywave-invalid");
+        let mut snapshot = valid_dustywave_snapshot();
+        snapshot.grains.ids[0] = 2;
+        assert!(matches!(
+            write_dustywave(&path, DustyWaveWriteView::try_from(&snapshot).unwrap()),
+            Err(OutputError::Validation(
+                ValidationError::DuplicateParticleId(2)
+            ))
+        ));
+        assert!(!path.exists());
+
+        let path = temporary_hdf5_path("dustywave-wide-grain-id");
+        let mut wide_id = valid_dustywave_snapshot();
+        wide_id.grains.ids[0] = u64::from(u32::MAX) + 1;
+        assert!(matches!(
+            write_dustywave(&path, DustyWaveWriteView::try_from(&wide_id).unwrap()),
+            Err(OutputError::Validation(
+                ValidationError::LegacyParticleIdOverflow(_)
+            ))
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
     #[ignore = "requires GIZMO_SOUNDWAVE_IC; run via validation oracle script"]
     fn reads_external_soundwave_fixture_when_configured() {
         let path = std::env::var_os("GIZMO_SOUNDWAVE_IC")
@@ -1263,6 +1886,26 @@ mod tests {
         assert_eq!(
             snapshot.header.num_part_total[0],
             u64::try_from(snapshot.gas.len()).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GIZMO_DUSTYWAVE_IC; run via validation oracle script"]
+    fn reads_external_dustywave_fixture_when_configured() {
+        let path = std::env::var_os("GIZMO_DUSTYWAVE_IC")
+            .expect("GIZMO_DUSTYWAVE_IC must identify the pinned fixture");
+        let snapshot = read_dustywave(path).unwrap();
+        assert_eq!(snapshot.gas.len(), 64);
+        assert_eq!(snapshot.grains.len(), 64);
+        assert_eq!(snapshot.header.num_part_total, [64, 0, 0, 64, 0, 0]);
+        assert!(snapshot.gas.ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(snapshot.grains.ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            snapshot
+                .gas
+                .ids
+                .iter()
+                .all(|id| snapshot.grains.ids.binary_search(id).is_err())
         );
     }
 }

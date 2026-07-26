@@ -8,14 +8,21 @@ use std::process::ExitCode;
 
 use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
+use gizmo_hydro::grain::{
+    EpsteinDragParameters, GrainGasPoint1d, GrainPoint1d, compute_epstein_drag_batch_1d,
+};
 use gizmo_hydro::{
     BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
     MfmEvolvingState1d, SynchronizedTimeline1d, begin_mfm_kdk_1d, begin_mfm_reflective_kdk_1d,
-    density_at_hsml_1d, density_at_hsml_1d_with_boundary, finish_mfm_kdk_1d, gradients_at_hsml_1d,
-    inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d_with_boundary,
+    cubic_kernel_1d, density_at_hsml_1d, density_at_hsml_1d_with_boundary, finish_mfm_kdk_1d,
+    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d,
+    mfm_spatial_rates_1d_with_boundary, periodic_displacement_1d,
     select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d_with_boundary,
 };
-use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
+use gizmo_io::{
+    DustyWaveWriteView, GasWriteView, GrainWriteView, SnapshotHeader, SoundWaveWriteView,
+    read_dustywave, read_soundwave, write_dustywave, write_soundwave,
+};
 use gizmo_params::SoundwaveParameters;
 
 fn main() -> ExitCode {
@@ -76,12 +83,13 @@ enum StrictProfile {
     Soundwave,
     EqualMassShocktube,
     InteractingBlast,
+    Dustywave,
 }
 
 impl StrictProfile {
     const fn gamma(self) -> f64 {
         match self {
-            Self::Soundwave => 5.0 / 3.0,
+            Self::Soundwave | Self::Dustywave => 5.0 / 3.0,
             Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
@@ -91,33 +99,38 @@ impl StrictProfile {
             Self::Soundwave => "soundwave",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
+            Self::Dustywave => "dusty wave",
         }
     }
 
     const fn boundary(self) -> BoundaryMode1d {
         match self {
-            Self::Soundwave | Self::EqualMassShocktube => BoundaryMode1d::Periodic,
+            Self::Soundwave | Self::EqualMassShocktube | Self::Dustywave => {
+                BoundaryMode1d::Periodic
+            }
             Self::InteractingBlast => BoundaryMode1d::Reflective,
         }
     }
 }
 
 fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
-    const REQUIRED_FLAGS: [&str; 5] = [
+    const REQUIRED_FLAGS: [&str; 4] = [
         "DEVELOPER_MODE",
         "HYDRO_MESHLESS_FINITE_MASS",
-        "INPUT_IN_DOUBLEPRECISION",
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
-    const ALLOWED: [&str; 11] = [
+    const ALLOWED: [&str; 14] = [
         "BOX_BND_PARTICLES",
         "BOX_PERIODIC",
         "BOX_REFLECT_X",
         "BOX_SPATIAL_DIMENSION",
         "DEVELOPER_MODE",
+        "EOS_ENFORCE_ADIABAT",
         "EOS_GAMMA",
         "FORCE_EQUAL_TIMESTEPS",
+        "GRAIN_BACKREACTION",
+        "GRAIN_FLUID",
         "HYDRO_MESHLESS_FINITE_MASS",
         "INPUT_IN_DOUBLEPRECISION",
         "OUTPUT_IN_DOUBLEPRECISION",
@@ -139,10 +152,15 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         "BOX_PERIODIC",
         "BOX_REFLECT_X",
         "FORCE_EQUAL_TIMESTEPS",
+        "GRAIN_BACKREACTION",
+        "GRAIN_FLUID",
     ] {
         if manifest.get(topology_flag).is_some() {
             require_config_flag(manifest, topology_flag)?;
         }
+    }
+    if manifest.get("INPUT_IN_DOUBLEPRECISION").is_some() {
+        require_config_flag(manifest, "INPUT_IN_DOUBLEPRECISION")?;
     }
     require_config_value(manifest, "BOX_SPATIAL_DIMENSION", "1")?;
     let gamma = manifest
@@ -152,6 +170,17 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     let equal_timesteps = manifest.get("FORCE_EQUAL_TIMESTEPS").is_some();
     let reflective_x = manifest.get("BOX_REFLECT_X").is_some();
     let boundary_particles = manifest.get("BOX_BND_PARTICLES").is_some();
+    let grain_fluid = manifest.get("GRAIN_FLUID").is_some();
+    let grain_backreaction = manifest.get("GRAIN_BACKREACTION").is_some();
+    let enforce_adiabat = manifest
+        .get("EOS_ENFORCE_ADIABAT")
+        .and_then(|option| option.value.as_deref());
+    let input_double = manifest.get("INPUT_IN_DOUBLEPRECISION").is_some();
+    if !grain_fluid && !input_double {
+        return Err(ApplicationError::UnsupportedConfig(
+            "required option `INPUT_IN_DOUBLEPRECISION` is missing".to_owned(),
+        ));
+    }
 
     match (
         gamma,
@@ -159,15 +188,31 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         equal_timesteps,
         reflective_x,
         boundary_particles,
+        grain_fluid,
+        grain_backreaction,
+        enforce_adiabat,
+        input_double,
     ) {
-        (Some("(5.0/3.0)"), true, true, false, false) => Ok(StrictProfile::Soundwave),
-        (Some("(1.4)"), true, true, false, false) => Ok(StrictProfile::EqualMassShocktube),
-        (Some("(1.4)"), false, false, true, true) => Ok(StrictProfile::InteractingBlast),
+        (Some("(5.0/3.0)"), true, true, false, false, false, false, None, true) => {
+            Ok(StrictProfile::Soundwave)
+        }
+        (Some("(1.4)"), true, true, false, false, false, false, None, true) => {
+            Ok(StrictProfile::EqualMassShocktube)
+        }
+        (Some("(1.4)"), false, false, true, true, false, false, None, true) => {
+            Ok(StrictProfile::InteractingBlast)
+        }
+        (Some("(5./3.)"), true, false, false, false, true, true, Some("(3./5.)"), false) => {
+            Ok(StrictProfile::Dustywave)
+        }
         _ => Err(ApplicationError::UnsupportedConfig(format!(
             "configuration does not exactly match a ported profile: \
              EOS_GAMMA={gamma:?}, BOX_PERIODIC={periodic}, \
              FORCE_EQUAL_TIMESTEPS={equal_timesteps}, BOX_REFLECT_X={reflective_x}, \
-             BOX_BND_PARTICLES={boundary_particles}"
+             BOX_BND_PARTICLES={boundary_particles}, GRAIN_FLUID={grain_fluid}, \
+             GRAIN_BACKREACTION={grain_backreaction}, \
+             EOS_ENFORCE_ADIABAT={enforce_adiabat:?}, \
+             INPUT_IN_DOUBLEPRECISION={input_double}"
         ))),
     }
 }
@@ -208,6 +253,9 @@ fn initialize_profile(
 ) -> Result<InitializedSoundwave, ApplicationError> {
     let parameters = read_profile_parameters(parameter_file, profile)?;
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
+    if profile == StrictProfile::Dustywave {
+        return initialize_dustywave(&fixture_path, parameters, profile);
+    }
     let snapshot = read_soundwave(&fixture_path).map_err(ApplicationError::Input)?;
     if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
         return Err(ApplicationError::StateMismatch(format!(
@@ -299,10 +347,178 @@ fn initialize_profile(
         particle_ids,
         transverse_vectors,
         state,
+        grains: None,
         summary,
     })
 }
 
+#[allow(clippy::too_many_lines)]
+fn initialize_dustywave(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+    profile: StrictProfile,
+) -> Result<InitializedSoundwave, ApplicationError> {
+    let snapshot = read_dustywave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    let gas_positions: Vec<f64> = snapshot
+        .gas
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate[0])
+        .collect();
+    let solved_gas = solve_public_c_initial_smoothing_lengths_1d_with_boundary(
+        &gas_positions,
+        &snapshot.gas.masses,
+        snapshot.header.box_size,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+        BoundaryMode1d::Periodic,
+    )
+    .map_err(ApplicationError::Hydro)?;
+    let gas_smoothing_lengths: Vec<f64> = solved_gas
+        .iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    let gas_density: Vec<f64> = solved_gas
+        .iter()
+        .map(|particle| particle.estimate.density)
+        .collect();
+    let gas_internal_energy: Vec<f64> = gas_density
+        .iter()
+        .map(|density| 0.9 * density.powf(2.0 / 3.0))
+        .collect();
+    let grain_positions: Vec<f64> = snapshot
+        .grains
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate[0])
+        .collect();
+    let grain_smoothing_lengths = grain_smoothing_lengths_1d(
+        &grain_positions,
+        &gas_positions,
+        snapshot.header.box_size,
+        parameters.desired_num_neighbors,
+        parameters.max_neighbor_deviation,
+    )?;
+    let gas_transverse_vectors = snapshot
+        .gas
+        .coordinates
+        .into_iter()
+        .zip(&snapshot.gas.velocities)
+        .map(|(position, velocity)| TransverseVectorShell {
+            position: [position[1], position[2]],
+            velocity: [velocity[1], velocity[2]],
+        })
+        .collect();
+    let grain_count = snapshot.grains.len();
+    let grain_transverse_vectors = snapshot
+        .grains
+        .coordinates
+        .into_iter()
+        .zip(&snapshot.grains.velocities)
+        .map(|(position, velocity)| TransverseVectorShell {
+            position: [position[1], position[2]],
+            velocity: [velocity[1], velocity[2]],
+        })
+        .collect();
+    let configured_grain_size = parameters
+        .grain_size_max
+        .expect("strict dusty-wave parameters");
+    Ok(InitializedSoundwave {
+        profile,
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        transverse_vectors: gas_transverse_vectors,
+        state: MfmEvolvingState1d {
+            positions: gas_positions,
+            masses: snapshot.gas.masses,
+            velocities: snapshot
+                .gas
+                .velocities
+                .iter()
+                .map(|velocity| velocity[0])
+                .collect(),
+            specific_internal_energy: gas_internal_energy,
+            smoothing_lengths: gas_smoothing_lengths,
+            box_size: snapshot.header.box_size,
+            gamma: profile.gamma(),
+        },
+        grains: Some(GrainRuntimeState1d {
+            particle_ids: snapshot.grains.ids,
+            transverse_vectors: grain_transverse_vectors,
+            positions: grain_positions,
+            masses: snapshot.grains.masses,
+            velocities: snapshot
+                .grains
+                .velocities
+                .iter()
+                .map(|velocity| velocity[0])
+                .collect(),
+            smoothing_lengths: grain_smoothing_lengths,
+            grain_sizes: vec![configured_grain_size; grain_count],
+        }),
+        summary: None,
+    })
+}
+
+fn grain_smoothing_lengths_1d(
+    grain_positions: &[f64],
+    gas_positions: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+) -> Result<Vec<f64>, ApplicationError> {
+    let mut output = Vec::with_capacity(grain_positions.len());
+    for &grain_position in grain_positions {
+        let mut lower = box_size * 2.0_f64.powi(-40);
+        let mut upper = box_size;
+        let mut best = upper;
+        let mut best_error = f64::INFINITY;
+        for _ in 0..160 {
+            let smoothing_length = 0.5 * (lower + upper);
+            let mut kernel_sum = 0.0;
+            for &gas_position in gas_positions {
+                let radius = periodic_displacement_1d(grain_position, gas_position, box_size)
+                    .map_err(ApplicationError::Hydro)?
+                    .abs();
+                if radius < smoothing_length {
+                    kernel_sum += cubic_kernel_1d(radius, smoothing_length)
+                        .map_err(ApplicationError::Hydro)?
+                        .weight;
+                }
+            }
+            let effective_neighbors = 2.0 * smoothing_length * kernel_sum;
+            let error = (effective_neighbors - desired_neighbors).abs();
+            if error < best_error {
+                best = smoothing_length;
+                best_error = error;
+            }
+            if error <= tolerance {
+                break;
+            }
+            if effective_neighbors < desired_neighbors {
+                lower = smoothing_length;
+            } else {
+                upper = smoothing_length;
+            }
+        }
+        if best_error > tolerance {
+            return Err(ApplicationError::StateMismatch(format!(
+                "grain smoothing-length solve missed neighbor target: error={best_error}, \
+                 tolerance={tolerance}"
+            )));
+        }
+        output.push(best);
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_lines)]
 fn read_profile_parameters(
     parameter_file: &Path,
     profile: StrictProfile,
@@ -404,6 +620,67 @@ fn read_profile_parameters(
             )));
         }
     }
+    if profile == StrictProfile::Dustywave {
+        let required_scalars: [(&str, f64, f64); 11] = [
+            ("TimeMax", parameters.time_max, 2.5),
+            ("BoxSize", parameters.box_size, 1.0),
+            ("TimeBetSnapshot", parameters.time_between_snapshots, 0.01),
+            ("MaxSizeTimestep", parameters.max_timestep, 0.0001),
+            ("DesNumNgb", parameters.desired_num_neighbors, 4.0),
+            ("ErrTolIntAccuracy", parameters.integration_accuracy, 0.01),
+            ("CourantFac", parameters.courant_factor, 0.1),
+            (
+                "MaxRMSDisplacementFac",
+                parameters.max_rms_displacement_factor,
+                0.125,
+            ),
+            ("ErrTolForceAcc", parameters.force_accuracy, 0.0025),
+            (
+                "MaxNumNgbDeviation",
+                parameters.max_neighbor_deviation,
+                0.05,
+            ),
+            (
+                "Softening_Type3",
+                parameters.type3_softening.unwrap_or(f64::NAN),
+                0.001,
+            ),
+        ];
+        for (field, actual, expected) in required_scalars {
+            if actual.to_bits() != expected.to_bits() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "dusty wave requires `{field} {expected}`, found `{actual}`"
+                )));
+            }
+        }
+        let required_optional_scalars: [(&str, Option<f64>, f64); 4] = [
+            (
+                "Grain_Internal_Density",
+                parameters.grain_internal_density,
+                1.0,
+            ),
+            ("Grain_Size_Min", parameters.grain_size_min, 1.23608),
+            ("Grain_Size_Max", parameters.grain_size_max, 1.23608),
+            (
+                "Grain_Size_Spectrum_Powerlaw",
+                parameters.grain_size_spectrum_powerlaw,
+                0.5,
+            ),
+        ];
+        for (field, actual, expected) in required_optional_scalars {
+            if actual.is_none_or(|value| value.to_bits() != expected.to_bits()) {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "dusty wave requires `{field} {expected}`, found {actual:?}"
+                )));
+            }
+        }
+        if parameters.init_cond_file != "dustywave_ics" {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "dusty wave requires `InitCondFile dustywave_ics`, found `{}`",
+                parameters.init_cond_file
+            )));
+        }
+    }
     Ok(parameters)
 }
 
@@ -463,12 +740,24 @@ struct TransverseVectorShell {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct GrainRuntimeState1d {
+    particle_ids: Vec<u64>,
+    transverse_vectors: Vec<TransverseVectorShell>,
+    positions: Vec<f64>,
+    masses: Vec<f64>,
+    velocities: Vec<f64>,
+    smoothing_lengths: Vec<f64>,
+    grain_sizes: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct InitializedSoundwave {
     profile: StrictProfile,
     parameters: SoundwaveParameters,
     particle_ids: Vec<u64>,
     transverse_vectors: Vec<TransverseVectorShell>,
     state: MfmEvolvingState1d,
+    grains: Option<GrainRuntimeState1d>,
     summary: Option<InitializationSummary>,
 }
 
@@ -508,6 +797,41 @@ impl InitializedSoundwave {
                     .to_owned(),
             ));
         }
+        if (self.profile == StrictProfile::Dustywave) != self.grains.is_some() {
+            return Err(ApplicationError::StateMismatch(
+                "grain state must exist exactly for the dusty-wave profile".to_owned(),
+            ));
+        }
+        if let Some(grains) = &self.grains {
+            let grain_count = grains.positions.len();
+            for (field, actual) in [
+                ("grain ParticleIDs", grains.particle_ids.len()),
+                ("grain transverse vectors", grains.transverse_vectors.len()),
+                ("grain masses", grains.masses.len()),
+                ("grain velocities", grains.velocities.len()),
+                ("grain smoothing lengths", grains.smoothing_lengths.len()),
+                ("grain sizes", grains.grain_sizes.len()),
+            ] {
+                if actual != grain_count {
+                    return Err(ApplicationError::StateMismatch(format!(
+                        "{field} has {actual} entries, expected {grain_count}"
+                    )));
+                }
+            }
+            if grains
+                .particle_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+                || self
+                    .particle_ids
+                    .iter()
+                    .any(|id| grains.particle_ids.binary_search(id).is_ok())
+            {
+                return Err(ApplicationError::StateMismatch(
+                    "gas and grain ParticleIDs must be globally unique and sorted".to_owned(),
+                ));
+            }
+        }
         if self.parameters.box_size.to_bits() != self.state.box_size.to_bits()
             || self
                 .summary
@@ -544,6 +868,9 @@ impl InitializedSoundwave {
         println!("  \"config_sha256\": \"{config_sha256}\",");
         println!("  \"profile\": \"{}\",", self.profile.name());
         println!("  \"particles\": {},", self.state.positions.len());
+        if let Some(grains) = &self.grains {
+            println!("  \"grains\": {},", grains.positions.len());
+        }
         println!("  \"box_size\": {},", self.state.box_size);
         println!("  \"gamma\": {}", self.state.gamma);
         println!("}}");
@@ -552,6 +879,9 @@ impl InitializedSoundwave {
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
+    if initialized.profile == StrictProfile::Dustywave {
+        return evolve_dustywave(initialized);
+    }
     let output_dir = PathBuf::from(&initialized.parameters.output_dir);
     fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
     let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
@@ -667,6 +997,232 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
     Ok(())
 }
 
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn evolve_dustywave(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
+    const MOMENTUM_RESIDUAL_LIMIT: f64 = 1.0e-18;
+
+    let output_dir = PathBuf::from(&initialized.parameters.output_dir);
+    fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
+    let mut grains = initialized.grains.take().ok_or_else(|| {
+        ApplicationError::StateMismatch("dusty-wave grain state is missing".to_owned())
+    })?;
+    let mut grain_acceleration = vec![0.0; grains.positions.len()];
+    let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
+        .map_err(ApplicationError::Hydro)?;
+    let tick_duration = initialized.parameters.time_max / LEGACY_TIMEBASE_TICKS as f64;
+    let mut rates =
+        mfm_spatial_rates_1d_with_boundary(initialized.state.as_view(), BoundaryMode1d::Periodic)
+            .map_err(ApplicationError::Hydro)?;
+    let drag_parameters = EpsteinDragParameters {
+        gamma: initialized.profile.gamma(),
+        grain_internal_density: initialized
+            .parameters
+            .grain_internal_density
+            .expect("strict dusty-wave parameters"),
+    };
+    let mut next_output_time = 0.0_f64;
+    let mut next_output_tick = Some(0_u64);
+    let mut snapshot_number = 0_u32;
+    let mut last_output_tick = None;
+    let mut step_count = 0_u64;
+    let mut maximum_momentum_residual = 0.0_f64;
+
+    while !timeline.is_finished() {
+        let synchronized = timeline
+            .select_step(
+                initialized.parameters.max_timestep,
+                initialized.parameters.max_timestep,
+            )
+            .map_err(ApplicationError::Hydro)?;
+        let start_tick = timeline.current_tick();
+        let end_tick = start_tick + synchronized.ticks;
+        let mut prepared = begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
+            .map_err(ApplicationError::Hydro)?;
+        let grain_start_positions = grains.positions.clone();
+        let grain_half_velocities: Vec<f64> = grains
+            .velocities
+            .iter()
+            .zip(&grain_acceleration)
+            .map(|(&velocity, &acceleration)| velocity + 0.5 * synchronized.duration * acceleration)
+            .collect();
+
+        while next_output_tick.is_some_and(|tick| tick <= end_tick) {
+            let output_tick = next_output_tick.expect("checked above");
+            let elapsed = (output_tick - start_tick) as f64 * tick_duration;
+            let gas_drift = prepared
+                .drift_state(elapsed)
+                .map_err(ApplicationError::Hydro)?;
+            let grain_positions: Vec<f64> = grain_start_positions
+                .iter()
+                .zip(&grain_half_velocities)
+                .map(|(&position, &velocity)| {
+                    (position + elapsed * velocity).rem_euclid(initialized.state.box_size)
+                })
+                .collect();
+            write_dusty_snapshot_columns(
+                &initialized,
+                &grains,
+                &gas_drift.positions,
+                &gas_drift.conserved_velocities,
+                &gas_drift.predicted_specific_internal_energy,
+                &gas_drift.predicted_density,
+                &gas_drift.predicted_smoothing_lengths,
+                &grain_positions,
+                &grain_half_velocities,
+                &grains.smoothing_lengths,
+                output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                output_tick as f64 * tick_duration,
+            )?;
+            last_output_tick = Some(output_tick);
+            snapshot_number = snapshot_number.checked_add(1).ok_or_else(|| {
+                ApplicationError::StateMismatch("snapshot number overflow".to_owned())
+            })?;
+            next_output_time += initialized.parameters.time_between_snapshots;
+            next_output_tick = (next_output_time <= initialized.parameters.time_max)
+                .then(|| legacy_output_tick(next_output_time, tick_duration));
+        }
+
+        let gas_drift = prepared
+            .drift_state(synchronized.duration)
+            .map_err(ApplicationError::Hydro)?;
+        let endpoint_grain_positions: Vec<f64> = grain_start_positions
+            .iter()
+            .zip(&grain_half_velocities)
+            .map(|(&position, &velocity)| {
+                (position + synchronized.duration * velocity).rem_euclid(initialized.state.box_size)
+            })
+            .collect();
+        let endpoint_grain_hsml = grain_smoothing_lengths_1d(
+            &endpoint_grain_positions,
+            &gas_drift.positions,
+            initialized.state.box_size,
+            initialized.parameters.desired_num_neighbors,
+            initialized.parameters.max_neighbor_deviation,
+        )?;
+        let gas_points: Vec<GrainGasPoint1d> = gas_drift
+            .positions
+            .iter()
+            .zip(&initialized.state.masses)
+            .zip(&gas_drift.predicted_velocities)
+            .zip(&gas_drift.predicted_specific_internal_energy)
+            .map(
+                |(((&position, &mass), &velocity), &specific_internal_energy)| GrainGasPoint1d {
+                    position,
+                    mass,
+                    velocity,
+                    specific_internal_energy,
+                },
+            )
+            .collect();
+        let grain_points: Vec<GrainPoint1d> = (0..grains.positions.len())
+            .map(|index| GrainPoint1d {
+                position: endpoint_grain_positions[index],
+                mass: grains.masses[index],
+                velocity: grain_half_velocities[index],
+                smoothing_length: endpoint_grain_hsml[index],
+                radius: grains.grain_sizes[index],
+            })
+            .collect();
+        let drag_batch = compute_epstein_drag_batch_1d(
+            &grain_points,
+            &gas_points,
+            initialized.state.box_size,
+            synchronized.duration,
+            drag_parameters,
+        )
+        .map_err(ApplicationError::Grain)?;
+        let momentum_residual = drag_batch.momentum_residual.abs();
+        if !momentum_residual.is_finite() || momentum_residual > MOMENTUM_RESIDUAL_LIMIT {
+            return Err(ApplicationError::StateMismatch(format!(
+                "drag batch momentum residual {momentum_residual:.17e} exceeds \
+                 {MOMENTUM_RESIDUAL_LIMIT:.1e}"
+            )));
+        }
+        maximum_momentum_residual = maximum_momentum_residual.max(momentum_residual);
+        let grain_velocity_deltas: Vec<f64> = drag_batch
+            .grains
+            .iter()
+            .map(|grain| grain.impulse.grain_velocity_delta)
+            .collect();
+        let gas_velocity_deltas = drag_batch.gas_velocity_deltas;
+
+        let (mut endpoint, new_rates) = finish_mfm_kdk_1d(
+            prepared,
+            initialized.parameters.desired_num_neighbors,
+            initialized.parameters.max_neighbor_deviation,
+        )
+        .map_err(ApplicationError::Hydro)?;
+        for (velocity, delta) in endpoint.velocities.iter_mut().zip(&gas_velocity_deltas) {
+            *velocity += delta;
+        }
+        let gas_density: Vec<f64> = density_at_hsml_1d(
+            &endpoint.positions,
+            &endpoint.masses,
+            &endpoint.smoothing_lengths,
+            endpoint.box_size,
+        )
+        .map_err(ApplicationError::Hydro)?
+        .into_iter()
+        .map(|estimate| estimate.density)
+        .collect();
+        endpoint.specific_internal_energy = gas_density
+            .iter()
+            .map(|density| 0.9 * density.powf(2.0 / 3.0))
+            .collect();
+        grains.positions = endpoint_grain_positions;
+        grains.velocities = grain_half_velocities
+            .iter()
+            .zip(&grain_velocity_deltas)
+            .map(|(&velocity, &delta)| velocity + 0.5 * delta)
+            .collect();
+        grain_acceleration = grain_velocity_deltas
+            .iter()
+            .map(|delta| delta / synchronized.duration)
+            .collect();
+        grains.smoothing_lengths = endpoint_grain_hsml;
+        initialized.state = endpoint;
+        rates = new_rates;
+        timeline
+            .advance(synchronized)
+            .map_err(ApplicationError::Hydro)?;
+        step_count += 1;
+    }
+
+    if last_output_tick != Some(LEGACY_TIMEBASE_TICKS) {
+        let density: Vec<f64> = density_at_hsml_1d(
+            &initialized.state.positions,
+            &initialized.state.masses,
+            &initialized.state.smoothing_lengths,
+            initialized.state.box_size,
+        )
+        .map_err(ApplicationError::Hydro)?
+        .into_iter()
+        .map(|estimate| estimate.density)
+        .collect();
+        write_dusty_snapshot_columns(
+            &initialized,
+            &grains,
+            &initialized.state.positions,
+            &initialized.state.velocities,
+            &initialized.state.specific_internal_energy,
+            &density,
+            &initialized.state.smoothing_lengths,
+            &grains.positions,
+            &grains.velocities,
+            &grains.smoothing_lengths,
+            output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+            initialized.parameters.time_max,
+        )?;
+        snapshot_number += 1;
+    }
+    eprintln!(
+        "completed {step_count} synchronized dusty-wave steps to t={:.17e}; \
+         wrote {snapshot_number} snapshots; maximum drag momentum residual={maximum_momentum_residual:.3e}",
+        timeline.current_time()
+    );
+    Ok(())
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -763,6 +1319,78 @@ fn write_snapshot_columns(
             internal_energy,
             density,
             smoothing_length: smoothing_lengths,
+        },
+    )
+    .map_err(ApplicationError::Output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_dusty_snapshot_columns(
+    initialized: &InitializedSoundwave,
+    grains: &GrainRuntimeState1d,
+    gas_positions: &[f64],
+    gas_velocities: &[f64],
+    gas_internal_energy: &[f64],
+    gas_density: &[f64],
+    gas_smoothing_lengths: &[f64],
+    grain_positions: &[f64],
+    grain_velocities: &[f64],
+    grain_smoothing_lengths: &[f64],
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let gas_coordinates: Vec<[f64; 3]> = gas_positions
+        .iter()
+        .zip(&initialized.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.position[0], shell.position[1]])
+        .collect();
+    let gas_velocity_vectors: Vec<[f64; 3]> = gas_velocities
+        .iter()
+        .zip(&initialized.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.velocity[0], shell.velocity[1]])
+        .collect();
+    let grain_coordinates: Vec<[f64; 3]> = grain_positions
+        .iter()
+        .zip(&grains.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.position[0], shell.position[1]])
+        .collect();
+    let grain_velocity_vectors: Vec<[f64; 3]> = grain_velocities
+        .iter()
+        .zip(&grains.transverse_vectors)
+        .map(|(&x, shell)| [x, shell.velocity[0], shell.velocity[1]])
+        .collect();
+    let gas_count = u64::try_from(initialized.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("gas count exceeds u64".to_owned()))?;
+    let grain_count = u64::try_from(grains.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("grain count exceeds u64".to_owned()))?;
+    let header = SnapshotHeader {
+        time,
+        box_size: initialized.state.box_size,
+        num_part_total: [gas_count, 0, 0, grain_count, 0, 0],
+        double_precision: true,
+        effective_kernel_neighbors: Some(initialized.parameters.desired_num_neighbors),
+    };
+    write_dustywave(
+        path,
+        DustyWaveWriteView {
+            header: &header,
+            gas: GasWriteView {
+                coordinates: &gas_coordinates,
+                velocities: &gas_velocity_vectors,
+                ids: &initialized.particle_ids,
+                masses: &initialized.state.masses,
+                internal_energy: gas_internal_energy,
+                density: gas_density,
+                smoothing_length: gas_smoothing_lengths,
+            },
+            grains: GrainWriteView {
+                coordinates: &grain_coordinates,
+                velocities: &grain_velocity_vectors,
+                ids: &grains.particle_ids,
+                masses: &grains.masses,
+                grain_size: &grains.grain_sizes,
+                smoothing_length: grain_smoothing_lengths,
+            },
         },
     )
     .map_err(ApplicationError::Output)
@@ -994,6 +1622,7 @@ enum ApplicationError {
     Output(gizmo_io::OutputError),
     OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
+    Grain(gizmo_hydro::grain::GrainError),
     UnsupportedConfig(String),
     UnsupportedParameters(String),
     UnsupportedRestart(RestartFlag),
@@ -1019,6 +1648,7 @@ impl std::fmt::Display for ApplicationError {
                 )
             }
             Self::Hydro(error) => error.fmt(formatter),
+            Self::Grain(error) => error.fmt(formatter),
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
             }
@@ -1066,6 +1696,8 @@ DEVELOPER_MODE
 ";
     const INTERACTBLAST_CONFIG: &str =
         include_str!("../../../../validation/oracles/interactblast/legacy-config.sh");
+    const DUSTYWAVE_CONFIG: &str =
+        include_str!("../../../../validation/oracles/dustywave/legacy-config.sh");
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -1174,6 +1806,31 @@ ResubmitCommand none
                     if message.contains(forbidden)
             ));
         }
+    }
+
+    #[test]
+    fn exact_dustywave_profile_and_parameters_are_accepted() {
+        assert_eq!(
+            validate_strict_config(&ConfigManifest::parse(DUSTYWAVE_CONFIG).unwrap()).unwrap(),
+            StrictProfile::Dustywave
+        );
+        let path =
+            std::env::temp_dir().join(format!("gizmo-dustywave-params-{}.txt", std::process::id()));
+        let parameters = include_str!("../../../../validation/oracles/dustywave/legacy.params");
+        fs::write(&path, parameters).unwrap();
+        let parsed = read_profile_parameters(&path, StrictProfile::Dustywave).unwrap();
+        assert_eq!(parsed.type3_softening, Some(0.001));
+        fs::write(
+            &path,
+            parameters.replace("Softening_Type3                    0.001", "% missing"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_profile_parameters(&path, StrictProfile::Dustywave),
+            Err(ApplicationError::UnsupportedParameters(message))
+                if message.contains("Softening_Type3")
+        ));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

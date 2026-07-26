@@ -58,6 +58,9 @@ jobs:
       - name: Run pinned interacting-blast evolution oracle
         if: steps.rust.outputs.present == 'true'
         run: validation/oracles/run_rust_interactblast.sh
+      - name: Run pinned dusty-wave gas-grain evolution oracle
+        if: steps.rust.outputs.present == 'true'
+        run: validation/oracles/run_rust_dustywave.sh
       - name: Deny Clippy warnings
         if: steps.rust.outputs.present == 'true'
         working-directory: rust

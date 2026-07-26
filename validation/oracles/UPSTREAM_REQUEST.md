@@ -40,6 +40,33 @@ tolerance applied to `interactblast_exact.txt`. A known-good reduced snapshot
 at `t=0.038` would also disambiguate reflective-wall and output-phase
 semantics.
 
+For `dustywave`, please provide the exact positive grain numerical-size setup
+used for the published curve. The hosted IC has no type-3
+`SmoothingLength`, while `dustyboxwave.params` leaves
+`Softening_Type3 0.001` commented out. Running those public files literally
+makes the grain Courant length and desired timestep zero; after 2,532
+synchronization points the run has advanced only
+`1.098079960293319e-14`. Enabling that commented prompt produces a practical
+32,768-step run, but it is not clear whether this was the authoritative setup.
+Please also provide the generator/analyzer for `dustwave_exact.txt` and the
+intended gas/dust velocity norms and tolerances.
+
+For `square`, please clarify which problem is authoritative. The prose
+describes `64^2` particles and boost `(142.3,-31.4)`, while the hosted IC has
+`128^2` particles and boost `(1243,-358)` with differently normalized density
+and pressure.
+
+For `gresho`, please replace or explain `gresho_ics_grid.hdf5`. Its internal
+energy encodes the documented equilibrium for gamma `5/3`, while the supplied
+configuration and parameter-file comments require gamma `1.4`. The ring IC is
+consistent with gamma `1.4`.
+
+For `brio-wu` and `toth`, please provide the machine-readable exact/reference
+curves used in the published plots; no corresponding tables are present in the
+hosted directory. For `zeldovich`, please document the headerless reference
+table's column transforms and explain why the hosted IC contains 262,208
+particles rather than `64^3`.
+
 The most useful delivery is a versioned archive or repository containing the
 generators, configs, analyzers, thresholds, and a checksum manifest. Large raw
 snapshots are optional if compact reference tables preserve the scientific
