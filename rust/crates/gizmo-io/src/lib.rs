@@ -62,6 +62,120 @@ pub struct GasParticles {
     pub smoothing_length: Option<Vec<f64>>,
 }
 
+/// Complete gas columns required by the public one-dimensional MHD-wave
+/// fixture.
+///
+/// `magnetic_field` contains the magnetic field exactly as stored in GIZMO's
+/// `PartType0/MagneticField` dataset. This I/O layer deliberately performs no
+/// `4π`, density, volume, or unit-system conversion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MhdGasParticles {
+    pub coordinates: Vec<[f64; VECTOR_COMPONENTS]>,
+    pub velocities: Vec<[f64; VECTOR_COMPONENTS]>,
+    pub magnetic_field: Vec<[f64; VECTOR_COMPONENTS]>,
+    pub ids: Vec<u64>,
+    pub masses: Vec<f64>,
+    pub internal_energy: Vec<f64>,
+    pub density: Vec<f64>,
+    pub smoothing_length: Vec<f64>,
+    /// Dedner-cleaning scalar from `DivBcleaningFunctionPhi`, when present.
+    pub cleaning_phi: Option<Vec<f64>>,
+    /// Spatial gradient of `cleaning_phi` from
+    /// `DivBcleaningFunctionGradPhi`, when present.
+    pub cleaning_grad_phi: Option<Vec<[f64; VECTOR_COMPONENTS]>>,
+    /// Diagnostic ∇·B from `DivergenceOfMagneticField`, when present.
+    pub divergence_of_magnetic_field: Option<Vec<f64>>,
+}
+
+impl MhdGasParticles {
+    /// Validate every MHD column and sort all fields together by particle ID.
+    ///
+    /// The three cleaning datasets are optional independently because public
+    /// initial conditions commonly contain all three while ordinary GIZMO
+    /// output snapshots may omit any or all of them. Their meanings are kept
+    /// distinct; none is synthesized from another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched columns, duplicate IDs, non-finite
+    /// values, or non-positive mass, thermodynamic, density, and size fields.
+    pub fn validate_and_sort(&mut self) -> Result<(), ValidationError> {
+        let expected = self.ids.len();
+        for (field, actual) in [
+            ("Coordinates", self.coordinates.len()),
+            ("Velocities", self.velocities.len()),
+            ("MagneticField", self.magnetic_field.len()),
+            ("Masses", self.masses.len()),
+            ("InternalEnergy", self.internal_energy.len()),
+            ("Density", self.density.len()),
+            ("SmoothingLength", self.smoothing_length.len()),
+        ] {
+            validate_column_length(field, expected, actual)?;
+        }
+        if let Some(values) = &self.cleaning_phi {
+            validate_column_length("DivBcleaningFunctionPhi", expected, values.len())?;
+        }
+        if let Some(values) = &self.cleaning_grad_phi {
+            validate_column_length("DivBcleaningFunctionGradPhi", expected, values.len())?;
+        }
+        if let Some(values) = &self.divergence_of_magnetic_field {
+            validate_column_length("DivergenceOfMagneticField", expected, values.len())?;
+        }
+
+        for index in 0..expected {
+            validate_vector("Coordinates", index, self.coordinates[index])?;
+            validate_vector("Velocities", index, self.velocities[index])?;
+            validate_vector("MagneticField", index, self.magnetic_field[index])?;
+            validate_positive("Masses", index, self.masses[index])?;
+            validate_positive("InternalEnergy", index, self.internal_energy[index])?;
+            validate_positive("Density", index, self.density[index])?;
+            validate_positive("SmoothingLength", index, self.smoothing_length[index])?;
+            if let Some(values) = &self.cleaning_phi {
+                validate_finite("DivBcleaningFunctionPhi", index, values[index])?;
+            }
+            if let Some(values) = &self.cleaning_grad_phi {
+                validate_vector("DivBcleaningFunctionGradPhi", index, values[index])?;
+            }
+            if let Some(values) = &self.divergence_of_magnetic_field {
+                validate_finite("DivergenceOfMagneticField", index, values[index])?;
+            }
+        }
+
+        let order = particle_id_order(&self.ids)?;
+        self.coordinates = reorder(&self.coordinates, &order);
+        self.velocities = reorder(&self.velocities, &order);
+        self.magnetic_field = reorder(&self.magnetic_field, &order);
+        self.ids = reorder(&self.ids, &order);
+        self.masses = reorder(&self.masses, &order);
+        self.internal_energy = reorder(&self.internal_energy, &order);
+        self.density = reorder(&self.density, &order);
+        self.smoothing_length = reorder(&self.smoothing_length, &order);
+        self.cleaning_phi = self
+            .cleaning_phi
+            .as_ref()
+            .map(|values| reorder(values, &order));
+        self.cleaning_grad_phi = self
+            .cleaning_grad_phi
+            .as_ref()
+            .map(|values| reorder(values, &order));
+        self.divergence_of_magnetic_field = self
+            .divergence_of_magnetic_field
+            .as_ref()
+            .map(|values| reorder(values, &order));
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
 impl GasParticles {
     /// Validate complete particle columns and sort them by `ParticleIDs`.
     ///
@@ -208,6 +322,12 @@ pub struct SoundWaveSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MhdWaveSnapshot {
+    pub header: SnapshotHeader,
+    pub gas: MhdGasParticles,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct DustyWaveSnapshot {
     pub header: SnapshotHeader,
     pub gas: GasParticles,
@@ -231,6 +351,24 @@ pub struct SoundWaveWriteView<'a> {
     pub internal_energy: &'a [f64],
     pub density: &'a [f64],
     pub smoothing_length: &'a [f64],
+}
+
+/// Borrowed, complete MHD gas state to serialize without changing magnetic
+/// units or vector widths.
+#[derive(Clone, Copy, Debug)]
+pub struct MhdWaveWriteView<'a> {
+    pub header: &'a SnapshotHeader,
+    pub coordinates: &'a [[f64; VECTOR_COMPONENTS]],
+    pub velocities: &'a [[f64; VECTOR_COMPONENTS]],
+    pub magnetic_field: &'a [[f64; VECTOR_COMPONENTS]],
+    pub ids: &'a [u64],
+    pub masses: &'a [f64],
+    pub internal_energy: &'a [f64],
+    pub density: &'a [f64],
+    pub smoothing_length: &'a [f64],
+    pub cleaning_phi: Option<&'a [f64]>,
+    pub cleaning_grad_phi: Option<&'a [[f64; VECTOR_COMPONENTS]]>,
+    pub divergence_of_magnetic_field: Option<&'a [f64]>,
 }
 
 /// Borrowed, complete gas columns used by a multi-species snapshot writer.
@@ -286,6 +424,25 @@ impl<'a> TryFrom<&'a SoundWaveSnapshot> for SoundWaveWriteView<'a> {
                 .as_deref()
                 .ok_or(ValidationError::MissingRequiredField("SmoothingLength"))?,
         })
+    }
+}
+
+impl<'a> From<&'a MhdWaveSnapshot> for MhdWaveWriteView<'a> {
+    fn from(snapshot: &'a MhdWaveSnapshot) -> Self {
+        Self {
+            header: &snapshot.header,
+            coordinates: &snapshot.gas.coordinates,
+            velocities: &snapshot.gas.velocities,
+            magnetic_field: &snapshot.gas.magnetic_field,
+            ids: &snapshot.gas.ids,
+            masses: &snapshot.gas.masses,
+            internal_energy: &snapshot.gas.internal_energy,
+            density: &snapshot.gas.density,
+            smoothing_length: &snapshot.gas.smoothing_length,
+            cleaning_phi: snapshot.gas.cleaning_phi.as_deref(),
+            cleaning_grad_phi: snapshot.gas.cleaning_grad_phi.as_deref(),
+            divergence_of_magnetic_field: snapshot.gas.divergence_of_magnetic_field.as_deref(),
+        }
     }
 }
 
@@ -364,6 +521,37 @@ impl SoundWaveSnapshot {
     }
 }
 
+impl MhdWaveSnapshot {
+    /// Validate a gas-only MHD-wave snapshot and sort all columns by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid header counts, unexpected particle types,
+    /// or malformed required and optional MHD columns.
+    pub fn validate_and_sort(&mut self) -> Result<(), ValidationError> {
+        if self.gas.is_empty() {
+            return Err(ValidationError::EmptyGasState);
+        }
+        self.header.validate()?;
+        validate_particle_type_count(&self.header, 0, self.gas.len())?;
+        if let Some((particle_type, count)) = self
+            .header
+            .num_part_total
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(1)
+            .find(|(_, count)| *count != 0)
+        {
+            return Err(ValidationError::UnexpectedParticleType {
+                particle_type,
+                count,
+            });
+        }
+        self.gas.validate_and_sort()
+    }
+}
+
 impl DustyWaveSnapshot {
     /// Validate a gas-and-type-3-grain snapshot and sort each particle type.
     ///
@@ -416,6 +604,41 @@ pub fn read_soundwave(path: impl AsRef<Path>) -> Result<SoundWaveSnapshot, Input
     let mut snapshot = SoundWaveSnapshot {
         header: read_snapshot_header(&file)?,
         gas: read_gas_particles(&file)?,
+    };
+    snapshot.validate_and_sort()?;
+    Ok(snapshot)
+}
+
+/// Read and validate the public gas-only MHD-wave initial condition.
+///
+/// All hydrodynamic and magnetic evolution fields are required. Dedner
+/// cleaning and ∇·B diagnostic fields are read when present and otherwise
+/// remain explicitly absent. `MagneticField` is returned bit-for-bit in the
+/// file's numeric convention, with no hidden `4π` or conserved-variable
+/// conversion.
+///
+/// # Errors
+///
+/// Returns an HDF5 error for a missing required dataset or unreadable object,
+/// or a validation error for malformed shapes and invalid values.
+pub fn read_mhd_wave(path: impl AsRef<Path>) -> Result<MhdWaveSnapshot, InputError> {
+    let file = hdf5::File::open(path)?;
+    let gas = file.group("PartType0")?;
+    let mut snapshot = MhdWaveSnapshot {
+        header: read_snapshot_header(&file)?,
+        gas: MhdGasParticles {
+            coordinates: read_vectors(&gas, "Coordinates")?,
+            velocities: read_vectors(&gas, "Velocities")?,
+            magnetic_field: read_vectors(&gas, "MagneticField")?,
+            ids: read_scalar_dataset(&gas, "ParticleIDs")?,
+            masses: read_scalar_dataset(&gas, "Masses")?,
+            internal_energy: read_scalar_dataset(&gas, "InternalEnergy")?,
+            density: read_scalar_dataset(&gas, "Density")?,
+            smoothing_length: read_scalar_dataset(&gas, "SmoothingLength")?,
+            cleaning_phi: read_optional_scalars(&gas, "DivBcleaningFunctionPhi")?,
+            cleaning_grad_phi: read_optional_vectors(&gas, "DivBcleaningFunctionGradPhi")?,
+            divergence_of_magnetic_field: read_optional_scalars(&gas, "DivergenceOfMagneticField")?,
+        },
     };
     snapshot.validate_and_sort()?;
     Ok(snapshot)
@@ -566,6 +789,53 @@ pub fn write_soundwave(
     write_scalars(&gas, "InternalEnergy", snapshot.internal_energy)?;
     write_scalars(&gas, "Density", snapshot.density)?;
     write_scalars(&gas, "SmoothingLength", snapshot.smoothing_length)?;
+    Ok(())
+}
+
+/// Write a complete, validated gas-only MHD-wave snapshot.
+///
+/// The core gas fields use the same public snapshot schema as
+/// [`write_soundwave`]. Magnetic and optional cleaning datasets are then
+/// written with their canonical public GIZMO names. Values are serialized
+/// directly; in particular, `MagneticField` is not multiplied or divided by
+/// `4π`, density, mass, or volume.
+///
+/// # Errors
+///
+/// Returns a validation error before creating the file if any supplied column
+/// is inconsistent, or an HDF5 error if the destination cannot be written.
+pub fn write_mhd_wave(
+    path: impl AsRef<Path>,
+    snapshot: MhdWaveWriteView<'_>,
+) -> Result<(), OutputError> {
+    validate_mhd_wave_write_view(snapshot)?;
+    let path = path.as_ref();
+    write_soundwave(
+        path,
+        SoundWaveWriteView {
+            header: snapshot.header,
+            coordinates: snapshot.coordinates,
+            velocities: snapshot.velocities,
+            ids: snapshot.ids,
+            masses: snapshot.masses,
+            internal_energy: snapshot.internal_energy,
+            density: snapshot.density,
+            smoothing_length: snapshot.smoothing_length,
+        },
+    )?;
+
+    let file = hdf5::File::open_rw(path)?;
+    let gas = file.group("PartType0")?;
+    write_vectors(&gas, "MagneticField", snapshot.magnetic_field)?;
+    if let Some(values) = snapshot.cleaning_phi {
+        write_scalars(&gas, "DivBcleaningFunctionPhi", values)?;
+    }
+    if let Some(values) = snapshot.cleaning_grad_phi {
+        write_vectors(&gas, "DivBcleaningFunctionGradPhi", values)?;
+    }
+    if let Some(values) = snapshot.divergence_of_magnetic_field {
+        write_scalars(&gas, "DivergenceOfMagneticField", values)?;
+    }
     Ok(())
 }
 
@@ -784,6 +1054,43 @@ fn validate_write_view(snapshot: SoundWaveWriteView<'_>) -> Result<(), Validatio
         }
     }) {
         return Err(ValidationError::DuplicateParticleId(id));
+    }
+    Ok(())
+}
+
+fn validate_mhd_wave_write_view(snapshot: MhdWaveWriteView<'_>) -> Result<(), ValidationError> {
+    validate_write_view(SoundWaveWriteView {
+        header: snapshot.header,
+        coordinates: snapshot.coordinates,
+        velocities: snapshot.velocities,
+        ids: snapshot.ids,
+        masses: snapshot.masses,
+        internal_energy: snapshot.internal_energy,
+        density: snapshot.density,
+        smoothing_length: snapshot.smoothing_length,
+    })?;
+    let expected = snapshot.ids.len();
+    validate_column_length("MagneticField", expected, snapshot.magnetic_field.len())?;
+    if let Some(values) = snapshot.cleaning_phi {
+        validate_column_length("DivBcleaningFunctionPhi", expected, values.len())?;
+    }
+    if let Some(values) = snapshot.cleaning_grad_phi {
+        validate_column_length("DivBcleaningFunctionGradPhi", expected, values.len())?;
+    }
+    if let Some(values) = snapshot.divergence_of_magnetic_field {
+        validate_column_length("DivergenceOfMagneticField", expected, values.len())?;
+    }
+    for index in 0..expected {
+        validate_vector("MagneticField", index, snapshot.magnetic_field[index])?;
+        if let Some(values) = snapshot.cleaning_phi {
+            validate_finite("DivBcleaningFunctionPhi", index, values[index])?;
+        }
+        if let Some(values) = snapshot.cleaning_grad_phi {
+            validate_vector("DivBcleaningFunctionGradPhi", index, values[index])?;
+        }
+        if let Some(values) = snapshot.divergence_of_magnetic_field {
+            validate_finite("DivergenceOfMagneticField", index, values[index])?;
+        }
     }
     Ok(())
 }
@@ -1032,6 +1339,17 @@ fn read_optional_scalars(
     }
 }
 
+fn read_optional_vectors(
+    group: &hdf5::Group,
+    name: &'static str,
+) -> Result<Option<Vec<[f64; VECTOR_COMPONENTS]>>, InputError> {
+    if group.link_exists(name) {
+        read_vectors(group, name).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn read_optional_scalar_attribute<T>(
     group: &hdf5::Group,
     name: &str,
@@ -1119,6 +1437,18 @@ fn validate_positive(field: &'static str, index: usize, value: f64) -> Result<()
     }
 }
 
+fn validate_finite(field: &'static str, index: usize, value: f64) -> Result<(), ValidationError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ValidationError::NonFiniteValue {
+            field,
+            index,
+            value,
+        })
+    }
+}
+
 fn reorder<T: Copy>(values: &[T], order: &[usize]) -> Vec<T> {
     order.iter().map(|&index| values[index]).collect()
 }
@@ -1166,6 +1496,11 @@ pub enum ValidationError {
         value: [f64; VECTOR_COMPONENTS],
     },
     NonPositiveValue {
+        field: &'static str,
+        index: usize,
+        value: f64,
+    },
+    NonFiniteValue {
         field: &'static str,
         index: usize,
         value: f64,
@@ -1255,6 +1590,14 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "particle row {index} has non-positive or non-finite `{field}` value {value}"
+            ),
+            Self::NonFiniteValue {
+                field,
+                index,
+                value,
+            } => write!(
+                formatter,
+                "particle row {index} has non-finite `{field}` value {value}"
             ),
         }
     }
@@ -1371,6 +1714,30 @@ mod tests {
                 internal_energy: vec![300.0, 100.0, 200.0],
                 density: Some(vec![30.0, 10.0, 20.0]),
                 smoothing_length: Some(vec![0.03, 0.01, 0.02]),
+            },
+        }
+    }
+
+    fn valid_mhd_wave_snapshot() -> MhdWaveSnapshot {
+        let soundwave = valid_snapshot();
+        MhdWaveSnapshot {
+            header: soundwave.header,
+            gas: MhdGasParticles {
+                coordinates: soundwave.gas.coordinates,
+                velocities: soundwave.gas.velocities,
+                magnetic_field: vec![[1.0, 30.0, -3.0], [1.0, 10.0, -1.0], [1.0, 20.0, -2.0]],
+                ids: soundwave.gas.ids,
+                masses: soundwave.gas.masses,
+                internal_energy: soundwave.gas.internal_energy,
+                density: soundwave.gas.density.unwrap(),
+                smoothing_length: soundwave.gas.smoothing_length.unwrap(),
+                cleaning_phi: Some(vec![0.3, 0.1, 0.2]),
+                cleaning_grad_phi: Some(vec![
+                    [3.0, 30.0, 300.0],
+                    [1.0, 10.0, 100.0],
+                    [2.0, 20.0, 200.0],
+                ]),
+                divergence_of_magnetic_field: Some(vec![-0.3, -0.1, -0.2]),
             },
         }
     }
@@ -1571,6 +1938,152 @@ mod tests {
             reshape_vectors(&[0.0; 6], &[6], "Coordinates"),
             Err(ValidationError::InvalidShape { .. })
         ));
+    }
+
+    #[test]
+    fn mhd_validation_sorts_magnetic_and_cleaning_columns_with_ids() {
+        let mut snapshot = valid_mhd_wave_snapshot();
+        snapshot.validate_and_sort().unwrap();
+
+        assert_eq!(snapshot.gas.ids, [1, 2, 3]);
+        assert_float_slice_eq(&snapshot.gas.magnetic_field[0], &[1.0, 10.0, -1.0]);
+        assert_float_slice_eq(
+            snapshot.gas.cleaning_phi.as_deref().unwrap(),
+            &[0.1, 0.2, 0.3],
+        );
+        assert_float_slice_eq(
+            &snapshot.gas.cleaning_grad_phi.as_ref().unwrap()[1],
+            &[2.0, 20.0, 200.0],
+        );
+        assert_float_slice_eq(
+            snapshot
+                .gas
+                .divergence_of_magnetic_field
+                .as_deref()
+                .unwrap(),
+            &[-0.1, -0.2, -0.3],
+        );
+    }
+
+    #[test]
+    fn mhd_validation_rejects_malformed_or_non_finite_optional_fields() {
+        let mut short = valid_mhd_wave_snapshot();
+        short.gas.cleaning_phi.as_mut().unwrap().pop();
+        assert_eq!(
+            short.validate_and_sort(),
+            Err(ValidationError::ColumnLength {
+                field: "DivBcleaningFunctionPhi",
+                expected: 3,
+                actual: 2,
+            })
+        );
+
+        let mut non_finite = valid_mhd_wave_snapshot();
+        non_finite
+            .gas
+            .divergence_of_magnetic_field
+            .as_mut()
+            .unwrap()[0] = f64::NAN;
+        assert!(matches!(
+            non_finite.validate_and_sort(),
+            Err(ValidationError::NonFiniteValue {
+                field: "DivergenceOfMagneticField",
+                ..
+            })
+        ));
+
+        let mut non_finite_b = valid_mhd_wave_snapshot();
+        non_finite_b.gas.magnetic_field[0][2] = f64::INFINITY;
+        assert!(matches!(
+            non_finite_b.validate_and_sort(),
+            Err(ValidationError::NonFiniteVector {
+                field: "MagneticField",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mhd_writer_roundtrips_raw_magnetic_units_and_optional_cleaning_fields() {
+        let mut expected = valid_mhd_wave_snapshot();
+        expected.validate_and_sort().unwrap();
+        expected.header.time = 0.25;
+        // Non-round values make an accidental sqrt(4π), 4π, density, or
+        // volume conversion visible in exact-bit comparisons.
+        expected.gas.magnetic_field = vec![
+            [0.125, std::f64::consts::SQRT_2, -0.625],
+            [1.25, -2.75, 3.5],
+            [-4.125, 5.25, 6.875],
+        ];
+
+        let path = temporary_hdf5_path("mhd-roundtrip");
+        write_mhd_wave(&path, MhdWaveWriteView::from(&expected)).unwrap();
+        let actual = read_mhd_wave(&path).unwrap();
+        assert_eq!(actual, expected);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let gas = file.group("PartType0").unwrap();
+        for name in ["MagneticField", "DivBcleaningFunctionGradPhi"] {
+            assert_eq!(
+                gas.dataset(name).unwrap().shape(),
+                [expected.gas.len(), VECTOR_COMPONENTS]
+            );
+        }
+        assert_eq!(
+            gas.dataset("MagneticField")
+                .unwrap()
+                .read_raw::<f64>()
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .gas
+                .magnetic_field
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mhd_writer_preserves_explicitly_absent_cleaning_fields() {
+        let mut expected = valid_mhd_wave_snapshot();
+        expected.validate_and_sort().unwrap();
+        expected.gas.cleaning_phi = None;
+        expected.gas.cleaning_grad_phi = None;
+        expected.gas.divergence_of_magnetic_field = None;
+
+        let path = temporary_hdf5_path("mhd-no-cleaning");
+        write_mhd_wave(&path, MhdWaveWriteView::from(&expected)).unwrap();
+        let actual = read_mhd_wave(&path).unwrap();
+        assert_eq!(actual, expected);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let gas = file.group("PartType0").unwrap();
+        for name in [
+            "DivBcleaningFunctionPhi",
+            "DivBcleaningFunctionGradPhi",
+            "DivergenceOfMagneticField",
+        ] {
+            assert!(!gas.link_exists(name));
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mhd_reader_fails_closed_when_magnetic_field_is_missing() {
+        let mut snapshot = valid_snapshot();
+        snapshot.validate_and_sort().unwrap();
+        let path = temporary_hdf5_path("mhd-missing-magnetic");
+        write_soundwave(&path, SoundWaveWriteView::try_from(&snapshot).unwrap()).unwrap();
+
+        assert!(matches!(read_mhd_wave(&path), Err(InputError::Hdf5(_))));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1886,6 +2399,27 @@ mod tests {
         assert_eq!(
             snapshot.header.num_part_total[0],
             u64::try_from(snapshot.gas.len()).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GIZMO_MHD_WAVE_IC; run via validation oracle script"]
+    fn reads_external_mhd_wave_fixture_when_configured() {
+        let path = std::env::var_os("GIZMO_MHD_WAVE_IC")
+            .expect("GIZMO_MHD_WAVE_IC must identify the pinned fixture");
+        let snapshot = read_mhd_wave(path).unwrap();
+        assert_eq!(snapshot.gas.len(), 2_048);
+        assert_eq!(snapshot.header.num_part_total, [2_048, 0, 0, 0, 0, 0]);
+        assert!(snapshot.gas.ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(snapshot.gas.cleaning_phi.is_some());
+        assert!(snapshot.gas.cleaning_grad_phi.is_some());
+        assert!(snapshot.gas.divergence_of_magnetic_field.is_some());
+        assert!(
+            snapshot
+                .gas
+                .magnetic_field
+                .iter()
+                .all(|field| (field[0] - 1.0).abs() < 1.0e-10)
         );
     }
 

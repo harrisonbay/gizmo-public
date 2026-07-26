@@ -1,0 +1,14 @@
+InitCondFile                       mhd_wave_ics
+OutputDir                          output
+TimeMax                            0.5
+BoxSize                            1
+TimeBetSnapshot                    0.05
+MaxSizeTimestep                    0.1
+DesNumNgb                          4
+MaxMemSize                         1024
+Softening_Type0                    0.001
+Softening_Type1                    0.001
+Softening_Type2                    0.001
+Softening_Type3                    0.001
+Softening_Type4                    0.001
+Softening_Type5                    0.001

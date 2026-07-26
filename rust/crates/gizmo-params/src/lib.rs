@@ -23,6 +23,8 @@ const SUPPORTED_TAGS: &[&str] = &[
     "MaxMemSize",
     "ErrTolTheta",
     "MaxNumNgbDeviation",
+    "DivBcleaningParabolicSigma",
+    "DivBcleaningHyperbolicSigma",
     "Grain_Internal_Density",
     "Grain_Size_Min",
     "Grain_Size_Max",
@@ -55,6 +57,8 @@ pub struct SoundwaveParameters {
     pub max_memory_mb: Option<u64>,
     pub tree_opening_angle: f64,
     pub max_neighbor_deviation: f64,
+    pub divb_cleaning_parabolic_sigma: Option<f64>,
+    pub divb_cleaning_hyperbolic_sigma: Option<f64>,
     pub grain_internal_density: Option<f64>,
     pub grain_size_min: Option<f64>,
     pub grain_size_max: Option<f64>,
@@ -74,6 +78,7 @@ impl SoundwaveParameters {
     ///
     /// Returns a line-numbered error for malformed, unsupported, repeated, or
     /// invalid values, and reports required fields that are absent.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &str) -> Result<Self, ParameterError> {
         let mut entries = BTreeMap::<String, Entry>::new();
 
@@ -174,6 +179,14 @@ impl SoundwaveParameters {
                 "MaxNumNgbDeviation",
                 (desired_num_neighbors / 640.0).max(0.05),
             )?,
+            divb_cleaning_parabolic_sigma: optional_present_f64(
+                &entries,
+                "DivBcleaningParabolicSigma",
+            )?,
+            divb_cleaning_hyperbolic_sigma: optional_present_f64(
+                &entries,
+                "DivBcleaningHyperbolicSigma",
+            )?,
             grain_internal_density: optional_present_f64(&entries, "Grain_Internal_Density")?,
             grain_size_min: optional_present_f64(&entries, "Grain_Size_Min")?,
             grain_size_max: optional_present_f64(&entries, "Grain_Size_Max")?,
@@ -259,6 +272,20 @@ impl SoundwaveParameters {
                 "MaxNumNgbDeviation",
                 "must be finite, positive, and at most 10% of DesNumNgb",
             ));
+        }
+        for (tag, value) in [
+            (
+                "DivBcleaningParabolicSigma",
+                self.divb_cleaning_parabolic_sigma,
+            ),
+            (
+                "DivBcleaningHyperbolicSigma",
+                self.divb_cleaning_hyperbolic_sigma,
+            ),
+        ] {
+            if let Some(value) = value {
+                positive(entries, tag, value)?;
+            }
         }
         for (tag, value) in [
             ("Grain_Internal_Density", self.grain_internal_density),
@@ -577,6 +604,8 @@ DesNumNgb 4
     const INTERACTBLAST: &str =
         include_str!("../../../../validation/oracles/interactblast/legacy.params");
     const DUSTYWAVE: &str = include_str!("../../../../validation/oracles/dustywave/legacy.params");
+    const MHD_WAVE: &str =
+        include_str!("../../../../validation/oracles/mhd_wave/frontier.params");
     const UPSTREAM_PUBLIC: &str =
         include_str!("../../../../scripts/test_problems/soundwave.params");
 
@@ -645,6 +674,15 @@ DesNumNgb 4
         assert_float_eq(parameters.max_timestep, 0.001);
         assert_float_eq(parameters.desired_num_neighbors, 4.0);
         assert_eq!(parameters.max_memory_mb, None);
+    }
+
+    #[test]
+    fn parses_the_pinned_mhd_cleaning_parameters() {
+        let parameters = SoundwaveParameters::parse(MHD_WAVE).unwrap();
+        assert_float_eq(parameters.time_max, 0.5);
+        assert_float_eq(parameters.courant_factor, 0.2);
+        assert_eq!(parameters.divb_cleaning_parabolic_sigma, Some(0.2));
+        assert_eq!(parameters.divb_cleaning_hyperbolic_sigma, Some(1.0));
     }
 
     #[test]
@@ -768,6 +806,8 @@ DesNumNgb 4
             "ErrTolForceAcc 0.01",
             "ErrTolTheta 0.1",
             "MaxNumNgbDeviation 0.41",
+            "DivBcleaningParabolicSigma 0",
+            "DivBcleaningHyperbolicSigma -1",
             "ResubmitOn 2",
         ] {
             let error = SoundwaveParameters::parse(&format!("{REQUIRED}{extra}\n")).unwrap_err();

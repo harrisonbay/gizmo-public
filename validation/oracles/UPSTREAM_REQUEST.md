@@ -60,6 +60,18 @@ second endpoint file after gas backreaction but before the matching grain
 half-kick. Those two files differ in total gas-plus-dust momentum by
 `2.36915e-7` for the hosted IC.
 
+For `mhd_wave`, please publish the initial-condition generator, analytic
+analyzer, exact configuration, and acceptance norm. The hosted fixture uses a
+normalized fast-mode eigenvector whose density amplitude is
+`1e-6/sqrt(5)`, while Hopkins & Raives (2015) describes
+`delta rho/rho=1e-6`. Please clarify which convention is authoritative. The
+public `TimeMax 0.5` is exactly one wavelength at fast speed 2, so comparing
+only the initial and final states cannot distinguish a real solver from a
+no-op; intermediate-time phase and polarization criteria are essential.
+Please also clarify whether the intended norm is the paper's particle L1 norm:
+the current public C trajectory has small L1 errors but sparse elementwise
+outliers large enough to fail a `1e-7` max/allclose-style gate.
+
 For `square`, please clarify which problem is authoritative. The prose
 describes `64^2` particles and boost `(142.3,-31.4)`, while the hosted IC has
 `128^2` particles and boost `(1243,-358)` with differently normalized density
