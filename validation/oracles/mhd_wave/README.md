@@ -33,6 +33,20 @@ The Rust port must additionally:
 - preserve the `mu0=1` magnetic convention (no extra `sqrt(4*pi)` factor);
 - pass conservation, covariance, Dedner-cleaning, and resolution gates.
 
+Run the complete Rust profile (2,048 particles, all 11 outputs, analytic
+phase/amplitude at every output, and corrected-C L1 checkpoints) with:
+
+```sh
+validation/oracles/run_rust_mhd_wave.sh
+```
+
+The pinned optimized run completed 10,250 global KDK steps and 11 snapshots
+through `t=0.5`. Every analytic gate passed; at the terminal time the largest
+field L1 was `2.41e-9`, the fast-mode amplitudes retained at least `99.47%`,
+and the largest phase error was `8.72e-4` radians. These intermediate gates
+make a frozen/no-op implementation fail even though the terminal state is one
+full wave period from the initial state.
+
 The current `gizmo-public` C baseline is also not equivalent to the newer test:
 with four MPI ranks its terminal snapshot violates the newer tolerance for
 27 density, 12 internal-energy, and 10 magnetic components. This is recorded
