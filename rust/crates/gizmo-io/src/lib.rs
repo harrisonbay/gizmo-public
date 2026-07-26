@@ -130,6 +130,50 @@ pub struct SoundWaveSnapshot {
     pub gas: GasParticles,
 }
 
+/// Borrowed, complete gas state to serialize as a sound-wave snapshot.
+///
+/// Unlike [`GasParticles`], density and smoothing length are required here:
+/// evolved snapshots must be self-contained rather than relying on a reader to
+/// reconstruct hydrodynamic state. The vector fields retain all three
+/// components, so a one-dimensional evolution can update x while preserving y
+/// and z from its input snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct SoundWaveWriteView<'a> {
+    pub header: &'a SnapshotHeader,
+    pub coordinates: &'a [[f64; VECTOR_COMPONENTS]],
+    pub velocities: &'a [[f64; VECTOR_COMPONENTS]],
+    pub ids: &'a [u64],
+    pub masses: &'a [f64],
+    pub internal_energy: &'a [f64],
+    pub density: &'a [f64],
+    pub smoothing_length: &'a [f64],
+}
+
+impl<'a> TryFrom<&'a SoundWaveSnapshot> for SoundWaveWriteView<'a> {
+    type Error = ValidationError;
+
+    fn try_from(snapshot: &'a SoundWaveSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: &snapshot.header,
+            coordinates: &snapshot.gas.coordinates,
+            velocities: &snapshot.gas.velocities,
+            ids: &snapshot.gas.ids,
+            masses: &snapshot.gas.masses,
+            internal_energy: &snapshot.gas.internal_energy,
+            density: snapshot
+                .gas
+                .density
+                .as_deref()
+                .ok_or(ValidationError::MissingRequiredField("Density"))?,
+            smoothing_length: snapshot
+                .gas
+                .smoothing_length
+                .as_deref()
+                .ok_or(ValidationError::MissingRequiredField("SmoothingLength"))?,
+        })
+    }
+}
+
 impl SoundWaveSnapshot {
     /// Validate the snapshot as the gas-only public sound-wave fixture.
     ///
@@ -219,6 +263,143 @@ pub fn read_soundwave(path: impl AsRef<Path>) -> Result<SoundWaveSnapshot, Input
     };
     snapshot.validate_and_sort()?;
     Ok(snapshot)
+}
+
+/// Write a complete, validated gas-only sound-wave snapshot.
+///
+/// Dataset rows are emitted in the supplied order. No implicit sorting or
+/// scalar-to-vector expansion occurs, which makes particle identity and the
+/// transverse coordinate and velocity components explicit at the call site.
+///
+/// # Errors
+///
+/// Returns a validation error before creating the file if the view is
+/// inconsistent, or an HDF5 error if the destination cannot be written.
+pub fn write_soundwave(
+    path: impl AsRef<Path>,
+    snapshot: SoundWaveWriteView<'_>,
+) -> Result<(), OutputError> {
+    validate_write_view(snapshot)?;
+
+    let file = hdf5::File::create(path)?;
+    let header = file.create_group("Header")?;
+    write_scalar_attribute(&header, "Time", &snapshot.header.time)?;
+    write_scalar_attribute(&header, "BoxSize", &snapshot.header.box_size)?;
+    header
+        .new_attr::<u64>()
+        .shape([PARTICLE_TYPES])
+        .create("NumPart_Total")?
+        .write_raw(&snapshot.header.num_part_total)?;
+    let precision_flag = i32::from(snapshot.header.double_precision);
+    write_scalar_attribute(&header, "Flag_DoublePrecision", &precision_flag)?;
+
+    let gas = file.create_group("PartType0")?;
+    write_vectors(&gas, "Coordinates", snapshot.coordinates)?;
+    write_vectors(&gas, "Velocities", snapshot.velocities)?;
+    write_scalars(&gas, "ParticleIDs", snapshot.ids)?;
+    write_scalars(&gas, "Masses", snapshot.masses)?;
+    write_scalars(&gas, "InternalEnergy", snapshot.internal_energy)?;
+    write_scalars(&gas, "Density", snapshot.density)?;
+    write_scalars(&gas, "SmoothingLength", snapshot.smoothing_length)?;
+    Ok(())
+}
+
+fn validate_write_view(snapshot: SoundWaveWriteView<'_>) -> Result<(), ValidationError> {
+    snapshot.header.validate()?;
+    let expected = snapshot.ids.len();
+    if expected == 0 {
+        return Err(ValidationError::EmptyGasState);
+    }
+    let header_gas_count = usize::try_from(snapshot.header.num_part_total[0])
+        .map_err(|_| ValidationError::ParticleCountOverflow(snapshot.header.num_part_total[0]))?;
+    if header_gas_count != expected {
+        return Err(ValidationError::ParticleCountMismatch {
+            header: header_gas_count,
+            dataset: expected,
+        });
+    }
+    if let Some((particle_type, count)) = snapshot
+        .header
+        .num_part_total
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(1)
+        .find(|(_, count)| *count != 0)
+    {
+        return Err(ValidationError::UnexpectedParticleType {
+            particle_type,
+            count,
+        });
+    }
+
+    for (field, actual) in [
+        ("Coordinates", snapshot.coordinates.len()),
+        ("Velocities", snapshot.velocities.len()),
+        ("Masses", snapshot.masses.len()),
+        ("InternalEnergy", snapshot.internal_energy.len()),
+        ("Density", snapshot.density.len()),
+        ("SmoothingLength", snapshot.smoothing_length.len()),
+    ] {
+        validate_column_length(field, expected, actual)?;
+    }
+    for index in 0..expected {
+        validate_vector("Coordinates", index, snapshot.coordinates[index])?;
+        validate_vector("Velocities", index, snapshot.velocities[index])?;
+        validate_positive("Masses", index, snapshot.masses[index])?;
+        validate_positive("InternalEnergy", index, snapshot.internal_energy[index])?;
+        validate_positive("Density", index, snapshot.density[index])?;
+        validate_positive("SmoothingLength", index, snapshot.smoothing_length[index])?;
+    }
+    let mut ids = snapshot.ids.to_vec();
+    ids.sort_unstable();
+    if let Some(id) = ids.windows(2).find_map(|pair| {
+        if pair[0] == pair[1] {
+            Some(pair[0])
+        } else {
+            None
+        }
+    }) {
+        return Err(ValidationError::DuplicateParticleId(id));
+    }
+    Ok(())
+}
+
+fn write_scalar_attribute<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    value: &T,
+) -> Result<(), hdf5::Error> {
+    group
+        .new_attr::<T>()
+        .shape(())
+        .create(name)?
+        .write_scalar(value)
+}
+
+fn write_scalars<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    values: &[T],
+) -> Result<(), hdf5::Error> {
+    group
+        .new_dataset::<T>()
+        .shape([values.len()])
+        .create(name)?
+        .write_raw(values)
+}
+
+fn write_vectors(
+    group: &hdf5::Group,
+    name: &str,
+    values: &[[f64; VECTOR_COMPONENTS]],
+) -> Result<(), hdf5::Error> {
+    let flattened: Vec<f64> = values.iter().flatten().copied().collect();
+    group
+        .new_dataset::<f64>()
+        .shape([values.len(), VECTOR_COMPONENTS])
+        .create(name)?
+        .write_raw(&flattened)
 }
 
 fn read_particle_counts(
@@ -350,6 +531,7 @@ fn reorder<T: Copy>(values: &[T], order: &[usize]) -> Vec<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidationError {
     EmptyGasState,
+    MissingRequiredField(&'static str),
     InvalidHeaderScalar {
         field: &'static str,
         value: f64,
@@ -391,6 +573,9 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyGasState => formatter.write_str("sound-wave gas state is empty"),
+            Self::MissingRequiredField(field) => {
+                write!(formatter, "sound-wave output requires `{field}`")
+            }
             Self::InvalidHeaderScalar { field, value } => {
                 write!(formatter, "header `{field}` has invalid value {value}")
             }
@@ -490,9 +675,48 @@ impl From<ValidationError> for InputError {
     }
 }
 
+#[derive(Debug)]
+pub enum OutputError {
+    Hdf5(hdf5::Error),
+    Validation(ValidationError),
+}
+
+impl fmt::Display for OutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hdf5(error) => write!(formatter, "HDF5 output error: {error}"),
+            Self::Validation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for OutputError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Hdf5(error) => Some(error),
+            Self::Validation(error) => Some(error),
+        }
+    }
+}
+
+impl From<hdf5::Error> for OutputError {
+    fn from(error: hdf5::Error) -> Self {
+        Self::Hdf5(error)
+    }
+}
+
+impl From<ValidationError> for OutputError {
+    fn from(error: ValidationError) -> Self {
+        Self::Validation(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn assert_float_slice_eq(actual: &[f64], expected: &[f64]) {
         assert_eq!(
@@ -525,6 +749,14 @@ mod tests {
                 smoothing_length: Some(vec![0.03, 0.01, 0.02]),
             },
         }
+    }
+
+    fn temporary_hdf5_path(test_name: &str) -> std::path::PathBuf {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "gizmo-io-{test_name}-{}-{sequence}.hdf5",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -637,6 +869,75 @@ mod tests {
             reshape_vectors(&[0.0; 6], &[6], "Coordinates"),
             Err(ValidationError::InvalidShape { .. })
         ));
+    }
+
+    #[test]
+    fn soundwave_writer_roundtrips_complete_state_exactly() {
+        let mut expected = valid_snapshot();
+        expected.validate_and_sort().unwrap();
+        expected.header.time = 0.125;
+        expected.header.box_size = 2.5;
+        expected.gas.coordinates[1] = [0.2, -4.0, 8.0];
+        expected.gas.velocities[1] = [20.0, 1.25, -2.5];
+
+        let path = temporary_hdf5_path("roundtrip");
+        write_soundwave(&path, SoundWaveWriteView::try_from(&expected).unwrap()).unwrap();
+
+        let actual = read_soundwave(&path).unwrap();
+        assert_eq!(actual, expected);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let header = file.group("Header").unwrap();
+        assert_eq!(
+            header
+                .attr("Flag_DoublePrecision")
+                .unwrap()
+                .read_scalar::<i32>()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            header
+                .attr("NumPart_Total")
+                .unwrap()
+                .read_raw::<u64>()
+                .unwrap(),
+            vec![3, 0, 0, 0, 0, 0]
+        );
+        let gas = file.group("PartType0").unwrap();
+        assert_eq!(
+            gas.dataset("Coordinates").unwrap().shape(),
+            [expected.gas.len(), VECTOR_COMPONENTS]
+        );
+        assert_eq!(
+            gas.dataset("Velocities").unwrap().shape(),
+            [expected.gas.len(), VECTOR_COMPONENTS]
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn soundwave_writer_checks_required_fields_before_creating_file() {
+        let mut snapshot = valid_snapshot();
+        snapshot.gas.density = None;
+        assert_eq!(
+            SoundWaveWriteView::try_from(&snapshot).unwrap_err(),
+            ValidationError::MissingRequiredField("Density")
+        );
+
+        let path = temporary_hdf5_path("invalid");
+        let mut complete = valid_snapshot();
+        complete.gas.smoothing_length.as_mut().unwrap().pop();
+        let view = SoundWaveWriteView::try_from(&complete).unwrap();
+        assert!(matches!(
+            write_soundwave(&path, view),
+            Err(OutputError::Validation(ValidationError::ColumnLength {
+                field: "SmoothingLength",
+                ..
+            }))
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
