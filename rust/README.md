@@ -17,8 +17,11 @@ MFM geometry, adaptive smoothing lengths, limited planar MLS gradients,
 arbitrary-normal HLLD, Powell/Dedner terms, synchronized 2-D KDK, exact
 per-particle time-bin selection, active-target cached force evaluation,
 hierarchical KDK kick/drift events, literal public wakeup/reverse-kick
-semantics, and a hierarchy-backed strict CLI trajectory. Other
-physics/configuration profiles fail closed.
+semantics, and a hierarchy-backed strict CLI trajectory. The Gresho slice adds
+a genuine nonmagnetic 2.5-D Euler operator over the same planar meshless
+geometry, deterministic threaded active-target forces, two-dimensional
+smoothing-length prediction, and phase-correct scheduled drifts between
+hierarchy events. Other physics/configuration profiles fail closed.
 
 ```console
 validation/oracles/run_rust_soundwave_init.sh
@@ -27,6 +30,7 @@ validation/oracles/run_rust_interactblast.sh
 validation/oracles/run_rust_dustybox.sh
 validation/oracles/run_rust_dustywave.sh
 validation/oracles/run_rust_briowu_init.sh
+validation/oracles/run_rust_gresho.sh
 ```
 
 The longer Brio-Wu terminal gate runs all 2,048 individual-particle hierarchy
@@ -41,6 +45,12 @@ Every terminal field is within `1.43%` normalized L1 of corrected C and
 `3.10%` of the published curves. Per-ID mass remains exact; the non-formal
 thermal+kinetic+magnetic diagnostic, which excludes Dedner cleaning energy,
 decreases `0.415%` and is explicitly gated at `0.5%`.
+
+The Gresho gate runs all 8,192 individual-bin events through `t=3`, writes the
+seven public output times without splitting the event cadence, and checks the
+analytic centrifugal equilibrium as well as a pinned corrected-C trajectory.
+It preserves all three velocity components while using strictly
+two-dimensional geometry; zero-field HLLD is not used as a hydro substitute.
 
 The complete 65,536-step corrected-C differential is intentionally separate
 from the fast initialization check:

@@ -80,7 +80,12 @@ and pressure.
 For `gresho`, please replace or explain `gresho_ics_grid.hdf5`. Its internal
 energy encodes the documented equilibrium for gamma `5/3`, while the supplied
 configuration and parameter-file comments require gamma `1.4`. The ring IC is
-consistent with gamma `1.4`.
+consistent with gamma `1.4`. Please also provide the exact `Config.sh`,
+resolved `parameters-usedvalues`, analyzer, norm, tolerances, and reduced
+outputs at `t=0,0.5,...,3` used for the published ring result. In the literal
+non-`DEVELOPER_MODE` public profile, `ErrTolIntAccuracy`, `CourantFac`, and
+`MaxRMSDisplacementFac` in `gresho.params` are not consumed, so the intended
+effective defaults should be stated explicitly.
 
 For `brio-wu` and `toth`, please provide the machine-readable exact/reference
 curves used in the published plots; no corresponding tables are present in the

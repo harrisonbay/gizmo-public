@@ -11,6 +11,12 @@ use gizmo_config::ConfigManifest;
 use gizmo_hydro::grain::{
     EpsteinDragParameters, GrainGasPoint1d, GrainPoint1d, compute_epstein_drag_batch_1d,
 };
+use gizmo_hydro::hydro_evolution_2d::{
+    HydroMfmState2d, PublicHydroDriftState2d, begin_public_hydro_initial_hierarchy_2d,
+    hydro_mfm_directed_spatial_rates_2d, public_hydro_particle_timestep_bounds_2d,
+    public_hydro_particle_timestep_bounds_from_primitive_2d,
+    quantize_public_hydro_initial_timebins_2d,
+};
 use gizmo_hydro::meshless_2d::{Box2d, Vector2, solve_public_c_smoothing_lengths_from_seeds_2d};
 use gizmo_hydro::mhd::Vector3;
 use gizmo_hydro::mhd_evolution::{
@@ -96,6 +102,7 @@ enum StrictProfile {
     Soundwave,
     MhdWave,
     BrioWu,
+    Gresho,
     EqualMassShocktube,
     InteractingBlast,
     Dustywave,
@@ -106,7 +113,7 @@ impl StrictProfile {
         match self {
             Self::Soundwave | Self::MhdWave | Self::Dustywave => 5.0 / 3.0,
             Self::BrioWu => 2.0,
-            Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
+            Self::Gresho | Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
 
@@ -115,6 +122,7 @@ impl StrictProfile {
             Self::Soundwave => "soundwave",
             Self::MhdWave => "MHD wave",
             Self::BrioWu => "Brio-Wu",
+            Self::Gresho => "Gresho vortex",
             Self::EqualMassShocktube => "equal-mass shocktube",
             Self::InteractingBlast => "interacting blastwave",
             Self::Dustywave => "dusty wave",
@@ -126,6 +134,7 @@ impl StrictProfile {
             Self::Soundwave
             | Self::MhdWave
             | Self::BrioWu
+            | Self::Gresho
             | Self::EqualMassShocktube
             | Self::Dustywave => BoundaryMode1d::Periodic,
             Self::InteractingBlast => BoundaryMode1d::Reflective,
@@ -162,7 +171,7 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
         .get("BOX_SPATIAL_DIMENSION")
         .is_some_and(|option| option.value.as_deref() == Some("2"))
     {
-        return validate_briowu_config(manifest);
+        return validate_planar_config(manifest);
     }
     for option in manifest.iter() {
         if !ALLOWED.contains(&option.name.as_str()) {
@@ -251,19 +260,11 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     }
 }
 
-fn validate_briowu_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
-    const REQUIRED_FLAGS: [&str; 4] = [
+fn validate_planar_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
+    const COMMON_REQUIRED_FLAGS: [&str; 3] = [
         "HYDRO_MESHLESS_FINITE_MASS",
         "BOX_PERIODIC",
-        "MAGNETIC",
         "SELFGRAVITY_OFF",
-    ];
-    const REQUIRED_VALUES: [(&str, &str); 5] = [
-        ("BOX_LONG_X", "16"),
-        ("BOX_LONG_Y", "1"),
-        ("BOX_LONG_Z", "1"),
-        ("BOX_SPATIAL_DIMENSION", "2"),
-        ("EOS_GAMMA", "(2.0)"),
     ];
     const ALLOWED: [&str; 11] = [
         "HYDRO_MESHLESS_FINITE_MASS",
@@ -281,12 +282,12 @@ fn validate_briowu_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     for option in manifest.iter() {
         if !ALLOWED.contains(&option.name.as_str()) {
             return Err(ApplicationError::UnsupportedConfig(format!(
-                "option `{}` is outside the exact public Brio-Wu profile",
+                "option `{}` is outside the strict two-dimensional profiles",
                 option.name
             )));
         }
     }
-    for required in REQUIRED_FLAGS {
+    for required in COMMON_REQUIRED_FLAGS {
         require_config_flag(manifest, required)?;
     }
     if manifest.get("OUTPUT_IN_DOUBLEPRECISION").is_some() {
@@ -295,10 +296,43 @@ fn validate_briowu_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     if manifest.get("DEVELOPER_MODE").is_some() {
         require_config_flag(manifest, "DEVELOPER_MODE")?;
     }
-    for (name, value) in REQUIRED_VALUES {
-        require_config_value(manifest, name, value)?;
+    require_config_value(manifest, "BOX_SPATIAL_DIMENSION", "2")?;
+    let gamma = manifest
+        .get("EOS_GAMMA")
+        .and_then(|option| option.value.as_deref());
+    let magnetic = manifest.get("MAGNETIC").is_some();
+    let box_long_x = manifest
+        .get("BOX_LONG_X")
+        .and_then(|option| option.value.as_deref());
+    let box_long_y = manifest
+        .get("BOX_LONG_Y")
+        .and_then(|option| option.value.as_deref());
+    let box_long_z = manifest
+        .get("BOX_LONG_Z")
+        .and_then(|option| option.value.as_deref());
+    let developer_mode = manifest.get("DEVELOPER_MODE").is_some();
+    let output_double = manifest.get("OUTPUT_IN_DOUBLEPRECISION").is_some();
+    match (
+        gamma,
+        magnetic,
+        box_long_x,
+        box_long_y,
+        box_long_z,
+        developer_mode,
+        output_double,
+    ) {
+        (Some("(2.0)"), true, Some("16"), Some("1"), Some("1"), _, _) => {
+            require_config_flag(manifest, "MAGNETIC")?;
+            Ok(StrictProfile::BrioWu)
+        }
+        (Some("(1.4)"), false, None, None, None, false, false) => Ok(StrictProfile::Gresho),
+        _ => Err(ApplicationError::UnsupportedConfig(format!(
+            "configuration does not exactly match a ported two-dimensional profile: \
+             EOS_GAMMA={gamma:?}, MAGNETIC={magnetic}, BOX_LONG_X={box_long_x:?}, \
+             BOX_LONG_Y={box_long_y:?}, BOX_LONG_Z={box_long_z:?}, \
+             DEVELOPER_MODE={developer_mode}, OUTPUT_IN_DOUBLEPRECISION={output_double}"
+        ))),
     }
-    Ok(StrictProfile::BrioWu)
 }
 
 fn require_config_flag(manifest: &ConfigManifest, name: &str) -> Result<(), ApplicationError> {
@@ -340,6 +374,9 @@ fn initialize_profile(
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
     if profile == StrictProfile::BrioWu {
         return initialize_briowu(&fixture_path, parameters).map(InitializedProfile::BrioWu);
+    }
+    if profile == StrictProfile::Gresho {
+        return initialize_gresho(&fixture_path, parameters).map(InitializedProfile::Gresho);
     }
     if profile == StrictProfile::MhdWave {
         return initialize_mhd_wave(&fixture_path, parameters).map(InitializedProfile::Mhd);
@@ -442,6 +479,151 @@ fn initialize_profile(
         grains: None,
         summary,
     }))
+}
+
+fn initialize_gresho(
+    fixture_path: &Path,
+    parameters: SoundwaveParameters,
+) -> Result<InitializedGresho, ApplicationError> {
+    let snapshot = read_soundwave(fixture_path).map_err(ApplicationError::Input)?;
+    if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
+        return Err(ApplicationError::StateMismatch(format!(
+            "parameter BoxSize={} differs from HDF5 BoxSize={}",
+            parameters.box_size, snapshot.header.box_size
+        )));
+    }
+    if snapshot.header.double_precision {
+        return Err(ApplicationError::StateMismatch(
+            "the pinned public Gresho initial condition must use float32 HDF5 fields".to_owned(),
+        ));
+    }
+    let particle_count = snapshot.gas.len();
+    if particle_count != 4_092 {
+        return Err(ApplicationError::StateMismatch(format!(
+            "Gresho fixture has {particle_count} particles, expected 4092"
+        )));
+    }
+    let density = snapshot
+        .gas
+        .density
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("Density"))?;
+    let initial_smoothing_lengths = snapshot
+        .gas
+        .smoothing_length
+        .as_deref()
+        .ok_or(ApplicationError::MissingDataset("SmoothingLength"))?;
+    for (index, (&coordinates, &velocities)) in snapshot
+        .gas
+        .coordinates
+        .iter()
+        .zip(&snapshot.gas.velocities)
+        .enumerate()
+    {
+        validate_gresho_particle(
+            snapshot.gas.ids[index],
+            coordinates,
+            velocities,
+            density[index],
+            snapshot.gas.internal_energy[index],
+        )?;
+    }
+    let domain = Box2d::new(parameters.box_size, parameters.box_size)
+        .map_err(ApplicationError::Geometry2d)?;
+    let positions: Vec<_> = snapshot
+        .gas
+        .coordinates
+        .iter()
+        .map(|value| Vector2::new(value[0], value[1]))
+        .collect();
+    let mut smoothing_lengths = initial_smoothing_lengths.to_vec();
+    // Restart flag zero follows the public initialization's repeated density
+    // schedule rather than accepting restart-derived H and density verbatim.
+    for _ in 0..3 {
+        smoothing_lengths = solve_public_c_smoothing_lengths_from_seeds_2d(
+            &positions,
+            &snapshot.gas.masses,
+            &smoothing_lengths,
+            domain,
+            parameters.desired_num_neighbors,
+            parameters.max_neighbor_deviation,
+        )
+        .map_err(ApplicationError::Geometry2d)?
+        .into_iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    }
+    let velocities = snapshot
+        .gas
+        .velocities
+        .iter()
+        .map(|value| Vector3::new(value[0], value[1], value[2]))
+        .collect();
+    let state = HydroMfmState2d::from_primitive(
+        positions,
+        snapshot.gas.masses,
+        velocities,
+        snapshot.gas.internal_energy,
+        smoothing_lengths,
+        domain,
+        StrictProfile::Gresho.gamma(),
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    Ok(InitializedGresho {
+        parameters,
+        particle_ids: snapshot.gas.ids,
+        state,
+    })
+}
+
+fn validate_gresho_particle(
+    particle_id: u64,
+    [x, y, z]: [f64; 3],
+    [velocity_x, velocity_y, velocity_z]: [f64; 3],
+    density: f64,
+    internal_energy: f64,
+) -> Result<(), ApplicationError> {
+    if z.to_bits() != 0.0_f64.to_bits() || velocity_z.to_bits() != 0.0_f64.to_bits() {
+        return Err(ApplicationError::StateMismatch(
+            "Gresho fixture must be exactly two-dimensional".to_owned(),
+        ));
+    }
+    let dx = x - 0.5;
+    let dy = y - 0.5;
+    let radius = dx.hypot(dy);
+    let expected_tangential = if radius < 0.2 {
+        5.0 * radius
+    } else if radius < 0.4 {
+        2.0 - 5.0 * radius
+    } else {
+        0.0
+    };
+    let expected_pressure = if radius < 0.2 {
+        5.0 + 12.5 * radius * radius
+    } else if radius < 0.4 {
+        9.0 + 12.5 * radius * radius - 20.0 * radius + 4.0 * (5.0 * radius).ln()
+    } else {
+        3.0 + 4.0 * 2.0_f64.ln()
+    };
+    let (expected_velocity_x, expected_velocity_y) = if radius > 0.0 {
+        (
+            -expected_tangential * dy / radius,
+            expected_tangential * dx / radius,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let expected_internal = expected_pressure / (StrictProfile::Gresho.gamma() - 1.0);
+    if density.to_bits() != 1.0_f64.to_bits()
+        || (velocity_x - expected_velocity_x).abs() > 3.0e-7
+        || (velocity_y - expected_velocity_y).abs() > 3.0e-7
+        || (internal_energy - expected_internal).abs() > 3.0e-6
+    {
+        return Err(ApplicationError::StateMismatch(format!(
+            "Gresho particle {particle_id} does not match the gamma=1.4 analytic ring state"
+        )));
+    }
+    Ok(())
 }
 
 fn initialize_briowu(
@@ -747,6 +929,9 @@ fn read_profile_parameters(
     if profile == StrictProfile::BrioWu {
         return read_briowu_parameters(&input);
     }
+    if profile == StrictProfile::Gresho {
+        return read_gresho_parameters(&input);
+    }
     if profile == StrictProfile::MhdWave {
         return read_mhd_wave_parameters(&input);
     }
@@ -906,6 +1091,132 @@ fn read_profile_parameters(
                 parameters.init_cond_file
             )));
         }
+    }
+    Ok(parameters)
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_gresho_parameters(input: &str) -> Result<SoundwaveParameters, ApplicationError> {
+    const REQUIRED_TAGS: [&str; 13] = [
+        "InitCondFile",
+        "OutputDir",
+        "TimeMax",
+        "BoxSize",
+        "TimeBetSnapshot",
+        "DesNumNgb",
+        "ErrTolIntAccuracy",
+        "CourantFac",
+        "MaxRMSDisplacementFac",
+        "MaxSizeTimestep",
+        "ArtCondConstant",
+        "ViscosityAMin",
+        "ViscosityAMax",
+    ];
+    // These tags are present in the hosted example, but the public C parser
+    // explicitly warns that they are ignored unless DEVELOPER_MODE or the
+    // associated optional viscosity/conductivity flags are compiled. The
+    // strict public configuration enables none of those flags, so preserve
+    // the vocabulary without silently applying different runtime semantics.
+    const INERT_PUBLIC_CONTROLS: [(&str, &str); 6] = [
+        ("ErrTolIntAccuracy", "0.001"),
+        ("CourantFac", "0.025"),
+        ("MaxRMSDisplacementFac", "0.125"),
+        ("ArtCondConstant", "0.25"),
+        ("ViscosityAMin", "0.025"),
+        ("ViscosityAMax", "2"),
+    ];
+    let mut retained = Vec::new();
+    let mut actual_tags = BTreeSet::new();
+    let mut inert_controls = BTreeSet::new();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let definition = raw_line
+            .split_once('%')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if definition.is_empty() {
+            retained.push(raw_line);
+            continue;
+        }
+        let mut tokens = definition.split_whitespace();
+        let tag = tokens.next().unwrap_or_default();
+        if !actual_tags.insert(tag) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "line {}: duplicate Gresho parameter `{tag}`",
+                line_index + 1
+            )));
+        }
+        if let Some((_, expected)) = INERT_PUBLIC_CONTROLS
+            .iter()
+            .find(|(candidate, _)| *candidate == tag)
+        {
+            if tokens.next() != Some(*expected) || tokens.next().is_some() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: `{tag}` must equal `{expected}` in the public Gresho profile",
+                    line_index + 1
+                )));
+            }
+            inert_controls.insert(tag);
+        } else {
+            retained.push(raw_line);
+        }
+    }
+    let expected_tags: BTreeSet<&str> = REQUIRED_TAGS.into_iter().collect();
+    if actual_tags != expected_tags {
+        let missing: Vec<_> = expected_tags.difference(&actual_tags).copied().collect();
+        let unexpected: Vec<_> = actual_tags.difference(&expected_tags).copied().collect();
+        return Err(ApplicationError::UnsupportedParameters(format!(
+            "Gresho requires the exact public parameter vocabulary; \
+             missing={missing:?}, unexpected={unexpected:?}"
+        )));
+    }
+    if inert_controls.len() != INERT_PUBLIC_CONTROLS.len() {
+        return Err(ApplicationError::UnsupportedParameters(
+            "Gresho public viscosity/conductivity controls are incomplete".to_owned(),
+        ));
+    }
+    let parameters = SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    let required_scalars: [(&str, f64, f64); 9] = [
+        ("TimeMax", parameters.time_max, 3.0),
+        ("BoxSize", parameters.box_size, 1.0),
+        ("TimeBetSnapshot", parameters.time_between_snapshots, 0.5),
+        ("MaxSizeTimestep", parameters.max_timestep, 5.0e-4),
+        ("DesNumNgb", parameters.desired_num_neighbors, 20.0),
+        ("ErrTolIntAccuracy", parameters.integration_accuracy, 0.02),
+        ("CourantFac", parameters.courant_factor, 0.4),
+        (
+            "MaxRMSDisplacementFac",
+            parameters.max_rms_displacement_factor,
+            0.25,
+        ),
+        (
+            "MaxNumNgbDeviation",
+            parameters.max_neighbor_deviation,
+            0.05,
+        ),
+    ];
+    for (field, actual, expected) in required_scalars {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "Gresho requires `{field} {expected}`, found `{actual}`"
+            )));
+        }
+    }
+    if parameters.init_cond_file != "gresho_ics"
+        || parameters.output_dir != "output"
+        || parameters.min_timestep.is_some()
+        || parameters.divb_cleaning_parabolic_sigma.is_some()
+        || parameters.divb_cleaning_hyperbolic_sigma.is_some()
+        || parameters.grain_internal_density.is_some()
+        || parameters.grain_size_min.is_some()
+        || parameters.grain_size_max.is_some()
+        || parameters.grain_size_spectrum_powerlaw.is_some()
+        || parameters.type3_softening.is_some()
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "Gresho string, cleaning, or non-gas parameters differ from the public profile"
+                .to_owned(),
+        ));
     }
     Ok(parameters)
 }
@@ -1247,6 +1558,13 @@ struct InitializedMhdWave {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct InitializedGresho {
+    parameters: SoundwaveParameters,
+    particle_ids: Vec<u64>,
+    state: HydroMfmState2d,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct InitializedBrioWu {
     parameters: SoundwaveParameters,
     particle_ids: Vec<u64>,
@@ -1267,6 +1585,7 @@ struct InitializedBrioWu {
 enum InitializedProfile {
     Hydro(InitializedSoundwave),
     Mhd(InitializedMhdWave),
+    Gresho(InitializedGresho),
     BrioWu(InitializedBrioWu),
 }
 
@@ -1275,6 +1594,7 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.validate_owned_state(),
             Self::Mhd(initialized) => initialized.validate_owned_state(),
+            Self::Gresho(initialized) => initialized.validate_owned_state(),
             Self::BrioWu(initialized) => initialized.validate_owned_state(),
         }
     }
@@ -1283,8 +1603,65 @@ impl InitializedProfile {
         match self {
             Self::Hydro(initialized) => initialized.print_initialization(config_sha256),
             Self::Mhd(initialized) => initialized.print_initialization(config_sha256),
+            Self::Gresho(initialized) => initialized.print_initialization(config_sha256),
             Self::BrioWu(initialized) => initialized.print_initialization(config_sha256),
         }
+    }
+}
+
+impl InitializedGresho {
+    fn validate_owned_state(&self) -> Result<(), ApplicationError> {
+        if self.particle_ids.len() != self.state.positions.len() {
+            return Err(ApplicationError::StateMismatch(format!(
+                "Gresho ParticleIDs have {} entries, expected {}",
+                self.particle_ids.len(),
+                self.state.positions.len()
+            )));
+        }
+        if self.particle_ids.len() != 4_092
+            || self
+                .particle_ids
+                .iter()
+                .enumerate()
+                .any(|(index, &id)| id != u64::try_from(index).expect("4092 fits u64"))
+        {
+            return Err(ApplicationError::StateMismatch(
+                "Gresho ParticleIDs must be exactly 0..4091".to_owned(),
+            ));
+        }
+        if self.state.domain.lengths() != Vector2::new(1.0, 1.0)
+            || self.state.gamma.to_bits() != StrictProfile::Gresho.gamma().to_bits()
+            || self.parameters.box_size.to_bits() != 1.0_f64.to_bits()
+        {
+            return Err(ApplicationError::StateMismatch(
+                "Gresho runtime bundle must use the unit periodic box and gamma=1.4".to_owned(),
+            ));
+        }
+        self.state
+            .validate()
+            .map_err(ApplicationError::HydroEvolution2d)
+    }
+
+    fn print_initialization(&self, config_sha256: &str) {
+        let primitive = self
+            .state
+            .primitive_columns()
+            .expect("validated Gresho state has valid primitive columns");
+        let density_range = primitive.density.iter().copied().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+        );
+        println!("{{");
+        println!("  \"config_sha256\": \"{config_sha256}\",");
+        println!("  \"profile\": \"Gresho vortex\",");
+        println!("  \"particles\": {},", self.state.positions.len());
+        println!("  \"box_lengths\": [1, 1, 1],");
+        println!("  \"gamma\": 1.4,");
+        println!(
+            "  \"density_range_after_public_initialization\": [{:.17e}, {:.17e}]",
+            density_range.0, density_range.1
+        );
+        println!("}}");
     }
 }
 
@@ -1609,8 +1986,201 @@ fn evolve_profile(initialized: InitializedProfile) -> Result<(), ApplicationErro
     match initialized {
         InitializedProfile::Hydro(initialized) => evolve_hydro_profile(initialized),
         InitializedProfile::Mhd(initialized) => evolve_mhd_wave(initialized),
+        InitializedProfile::Gresho(initialized) => evolve_gresho(&initialized),
         InitializedProfile::BrioWu(initialized) => evolve_briowu(&initialized),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn evolve_gresho(initialized: &InitializedGresho) -> Result<(), ApplicationError> {
+    const OUTPUT_COUNT: u32 = 6;
+    const EXPECTED_EVENTS: u64 = 8_192;
+    let output_dir = PathBuf::from(&initialized.parameters.output_dir);
+    fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
+    let rates = hydro_mfm_directed_spatial_rates_2d(&initialized.state)
+        .map_err(ApplicationError::HydroEvolution2d)?;
+    let initial_bounds = public_hydro_particle_timestep_bounds_2d(
+        &initialized.state,
+        &rates,
+        initialized.parameters.courant_factor,
+        initialized.parameters.integration_accuracy,
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    let initial_timebins = quantize_public_hydro_initial_timebins_2d(
+        &initial_bounds,
+        0.0,
+        initialized.parameters.time_max,
+        initialized.parameters.max_timestep,
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    let mut hierarchy = begin_public_hydro_initial_hierarchy_2d(
+        &initialized.state,
+        &rates,
+        &initial_timebins,
+        0.0,
+        initialized.parameters.time_max,
+        0.0,
+    )
+    .map_err(ApplicationError::HydroEvolution2d)?;
+    let mut snapshot_number = 0_u32;
+    let mut step_count = 0_u64;
+    write_gresho_drift_snapshot(
+        initialized,
+        &initialized.state.masses,
+        hierarchy.current_drift_state(),
+        output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+        0.0,
+    )?;
+    snapshot_number += 1;
+    let mut next_output_index = 1_u32;
+    let mut sync = hierarchy
+        .drift_to_first_sync()
+        .map_err(ApplicationError::HydroEvolution2d)?;
+    loop {
+        hierarchy
+            .refresh_arriving_active_caches(
+                initialized.parameters.desired_num_neighbors,
+                initialized.parameters.max_neighbor_deviation,
+            )
+            .map_err(ApplicationError::HydroEvolution2d)?;
+        let endpoint = hierarchy
+            .evaluate_arriving_active_rates()
+            .map_err(ApplicationError::HydroEvolution2d)?;
+        let kicked = hierarchy
+            .finish_arriving_active_kicks(endpoint)
+            .map_err(ApplicationError::HydroEvolution2d)?;
+        step_count = step_count.checked_add(1).ok_or_else(|| {
+            ApplicationError::StateMismatch("Gresho hierarchy event count overflow".to_owned())
+        })?;
+        let terminal_sync = hierarchy.current_tick() >= LEGACY_TIMEBASE_TICKS;
+        if step_count % 256 == 0 || terminal_sync {
+            let active_count = sync.active.iter().filter(|&&is_active| is_active).count();
+            eprintln!(
+                "Gresho hierarchy progress: event={step_count} tick={} time={:.17e} active={active_count}",
+                hierarchy.current_tick(),
+                hierarchy.current_time()
+            );
+        }
+        if terminal_sync {
+            break;
+        }
+
+        let bounds = public_hydro_particle_timestep_bounds_from_primitive_2d(
+            &kicked.state,
+            hierarchy.predicted_primitive_cache(),
+            &kicked.rates,
+            initialized.parameters.courant_factor,
+            initialized.parameters.integration_accuracy,
+        )
+        .map_err(ApplicationError::HydroEvolution2d)?;
+        let active = hierarchy.active_mask();
+        let active_bounds: Vec<_> = active
+            .iter()
+            .zip(&bounds)
+            .map(|(&is_active, bound)| {
+                is_active.then_some(bound.selected.min(initialized.parameters.max_timestep))
+            })
+            .collect();
+        let next_sync_tick = hierarchy
+            .prepare_next_drift(&active_bounds)
+            .map_err(ApplicationError::HydroEvolution2d)?;
+        while next_output_index <= OUTPUT_COUNT {
+            let requested_output_time = if next_output_index == OUTPUT_COUNT {
+                initialized.parameters.time_max
+            } else {
+                f64::from(next_output_index) * initialized.parameters.time_between_snapshots
+            };
+            let terminal = next_output_index == OUTPUT_COUNT;
+            let output_tick = hierarchy
+                .output_time_to_integer_tick(requested_output_time, terminal)
+                .map_err(ApplicationError::HydroEvolution2d)?;
+            if output_tick > next_sync_tick {
+                break;
+            }
+            if output_tick < hierarchy.current_tick() {
+                return Err(ApplicationError::StateMismatch(format!(
+                    "hierarchical Gresho schedule passed output tick {output_tick}"
+                )));
+            }
+            let drift = hierarchy
+                .drift_prepared_to_output_tick(output_tick)
+                .map_err(ApplicationError::HydroEvolution2d)?;
+            let output_time = hierarchy
+                .output_physical_time_at_tick(output_tick)
+                .map_err(ApplicationError::HydroEvolution2d)?;
+            write_gresho_drift_snapshot(
+                initialized,
+                &initialized.state.masses,
+                &drift,
+                output_dir.join(format!("snapshot_{snapshot_number:03}.hdf5")),
+                output_time,
+            )?;
+            snapshot_number += 1;
+            next_output_index += 1;
+        }
+        sync = hierarchy
+            .finish_prepared_next_sync()
+            .map_err(ApplicationError::HydroEvolution2d)?;
+    }
+    if snapshot_number != OUTPUT_COUNT + 1 {
+        return Err(ApplicationError::StateMismatch(format!(
+            "hierarchical Gresho wrote {snapshot_number} snapshots, expected {}",
+            OUTPUT_COUNT + 1
+        )));
+    }
+    if step_count != EXPECTED_EVENTS {
+        return Err(ApplicationError::StateMismatch(format!(
+            "hierarchical Gresho completed {step_count} events, expected {EXPECTED_EVENTS}"
+        )));
+    }
+    let time = hierarchy.current_time();
+    eprintln!(
+        "completed {step_count} hierarchical 2-D hydro KDK events to t={time:.17e}; \
+         wrote {snapshot_number} snapshots"
+    );
+    Ok(())
+}
+
+fn write_gresho_drift_snapshot(
+    initialized: &InitializedGresho,
+    masses: &[f64],
+    drift: &PublicHydroDriftState2d,
+    path: PathBuf,
+    time: f64,
+) -> Result<(), ApplicationError> {
+    let coordinates: Vec<[f64; 3]> = drift
+        .positions
+        .iter()
+        .map(|value| [value.x, value.y, 0.0])
+        .collect();
+    let velocities: Vec<[f64; 3]> = drift
+        .actual_velocities
+        .iter()
+        .map(|value| [value.x, value.y, value.z])
+        .collect();
+    let gas_count = u64::try_from(initialized.particle_ids.len())
+        .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u64".to_owned()))?;
+    let header = SnapshotHeader {
+        time,
+        box_size: initialized.parameters.box_size,
+        num_part_total: [gas_count, 0, 0, 0, 0, 0],
+        double_precision: true,
+        effective_kernel_neighbors: Some(initialized.parameters.desired_num_neighbors),
+    };
+    write_soundwave(
+        path,
+        SoundWaveWriteView {
+            header: &header,
+            coordinates: &coordinates,
+            velocities: &velocities,
+            ids: &initialized.particle_ids,
+            masses,
+            internal_energy: &drift.predicted_specific_internal_energy,
+            density: &drift.predicted_density,
+            smoothing_length: &drift.predicted_smoothing_lengths,
+        },
+    )
+    .map_err(ApplicationError::Output)
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
@@ -2801,6 +3371,7 @@ enum ApplicationError {
     Output(gizmo_io::OutputError),
     OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
+    HydroEvolution2d(gizmo_hydro::hydro_evolution_2d::HydroEvolution2dError),
     Geometry2d(gizmo_hydro::meshless_2d::GeometryError),
     MhdEvolution(gizmo_hydro::mhd_evolution::MhdEvolutionError),
     MhdEvolution2d(gizmo_hydro::mhd_evolution_2d::MhdEvolution2dError),
@@ -2830,6 +3401,7 @@ impl std::fmt::Display for ApplicationError {
                 )
             }
             Self::Hydro(error) => error.fmt(formatter),
+            Self::HydroEvolution2d(error) => error.fmt(formatter),
             Self::Geometry2d(error) => error.fmt(formatter),
             Self::MhdEvolution(error) => error.fmt(formatter),
             Self::MhdEvolution2d(error) => error.fmt(formatter),
@@ -2893,6 +3465,28 @@ DEVELOPER_MODE
         include_str!("../../../../validation/oracles/briowu/public.params");
     const BRIOWU_FRONTIER_PARAMETERS: &str =
         include_str!("../../../../validation/oracles/briowu/frontier.params");
+    const GRESHO_CONFIG: &str = "\
+HYDRO_MESHLESS_FINITE_MASS
+BOX_SPATIAL_DIMENSION=2
+BOX_PERIODIC
+SELFGRAVITY_OFF
+EOS_GAMMA=(1.4)
+";
+    const GRESHO_PARAMETERS: &str = "\
+InitCondFile                       gresho_ics
+OutputDir                          output
+TimeMax                            3
+BoxSize                            1
+TimeBetSnapshot                    0.5
+DesNumNgb                          20
+ErrTolIntAccuracy                  0.001
+CourantFac                         0.025
+MaxRMSDisplacementFac              0.125
+MaxSizeTimestep                    5.0e-4
+ArtCondConstant                    0.25
+ViscosityAMin                      0.025
+ViscosityAMax                      2
+";
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -3025,6 +3619,48 @@ ResubmitCommand none
             validate_strict_config(&ConfigManifest::parse(frontier).unwrap()).unwrap(),
             StrictProfile::BrioWu
         );
+    }
+
+    #[test]
+    fn exact_public_gresho_profile_preserves_inert_parameter_semantics() {
+        let manifest = ConfigManifest::parse(GRESHO_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::Gresho
+        );
+        for invalid in [
+            format!("{GRESHO_CONFIG}MAGNETIC\n"),
+            format!("{GRESHO_CONFIG}DEVELOPER_MODE\n"),
+            format!("{GRESHO_CONFIG}OUTPUT_IN_DOUBLEPRECISION\n"),
+            GRESHO_CONFIG.replace("EOS_GAMMA=(1.4)", "EOS_GAMMA=(5.0/3.0)"),
+        ] {
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&invalid).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(_))
+            ));
+        }
+
+        let parameters = read_gresho_parameters(GRESHO_PARAMETERS).unwrap();
+        assert_eq!(parameters.max_timestep.to_bits(), 5.0e-4_f64.to_bits());
+        assert_eq!(
+            parameters.integration_accuracy.to_bits(),
+            0.02_f64.to_bits()
+        );
+        assert_eq!(parameters.courant_factor.to_bits(), 0.4_f64.to_bits());
+        assert_eq!(
+            parameters.max_rms_displacement_factor.to_bits(),
+            0.25_f64.to_bits()
+        );
+        for invalid in [
+            GRESHO_PARAMETERS.replace("ViscosityAMax                      2", "ViscosityAMax 1"),
+            GRESHO_PARAMETERS.replace("CourantFac                         0.025\n", ""),
+            format!("{GRESHO_PARAMETERS}MaxNumNgbDeviation 0.1\n"),
+        ] {
+            assert!(matches!(
+                read_gresho_parameters(&invalid),
+                Err(ApplicationError::UnsupportedParameters(_))
+            ));
+        }
     }
 
     #[test]

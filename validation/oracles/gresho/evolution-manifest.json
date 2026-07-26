@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "description": "Corrected-C semantic evolution oracle for the pinned public two-dimensional MFM Gresho vortex",
+  "upstream_repository": "https://github.com/pfhopkins/gizmo-public",
+  "upstream_base_commit": "a828c4ba79d67093bd1a3d04f6f90b5d2d94d65f",
+  "source_repository": "https://github.com/harrisonbay/gizmo-public",
+  "source_commit": "f40611353d02f68d8714eb380e92fef1c1c34c9c",
+  "c_correction_commits": [
+    "5ebc9a8",
+    "46300b3",
+    "7847189",
+    "758fbc9",
+    "8334f23",
+    "b4949ca"
+  ],
+  "source_note": "The C executable was materialized from the local correctness fork, not an upstream pfhopkins commit. The listed commits are every fork commit through source_commit that modified production C, headers, or its build/output path and can affect this profile.",
+  "compiler": {
+    "driver": "mpicc",
+    "implementation": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+    "target": "arm64-apple-darwin24.6.0",
+    "mpi_implementation": "Open MPI 5.0.9",
+    "mpi_ranks": 1,
+    "optimization": "-O1 -funroll-loops -g -Wall",
+    "additional_defines": [
+      "DISABLE_ALIGNED_ALLOC",
+      "CHIMES_USE_DOUBLE_PRECISION"
+    ]
+  },
+  "source_materialization": "git archive f40611353d02f68d8714eb380e92fef1c1c34c9c",
+  "build_command": "make -j8 CONFIG=Config.sh EXEC=GIZMO",
+  "run_command": "mpirun -np 1 ./GIZMO gresho.params 0",
+  "executable": {
+    "sha256": "6cf2fe25c0e12ef4de786ba03f115ebe0fdf0db46f8a22f410e1cfc424dddd9a"
+  },
+  "inputs": {
+    "config": {
+      "path": "corrected-c-config.sh",
+      "sha256": "7ffc5035883ccb542ccd99ed8f4a4cc7d4a81eab0054d1fd86d00094ab2853a4"
+    },
+    "parameters": {
+      "path": "corrected-c.params",
+      "sha256": "31a4a2537aea40e4317e75020d1a0eaae8dddf0587fc79edfaed1c1864803992"
+    },
+    "resolved_parameters": {
+      "path": "parameters-usedvalues",
+      "sha256": "c05fb09457008b0280748d509a5956e158531e226e9d31925cb25dfd74e1684a"
+    },
+    "initial_conditions": {
+      "path": "gresho_ics.hdf5",
+      "sha256": "9109bbce2a58eef3cb13d665582fa636e667a1098ae491b80f8f39c2fae1a43c"
+    }
+  },
+  "parameter_resolution": {
+    "developer_mode": false,
+    "consumed": [
+      "InitCondFile",
+      "OutputDir",
+      "TimeMax",
+      "BoxSize",
+      "TimeBetSnapshot",
+      "DesNumNgb",
+      "MaxMemSize",
+      "MaxSizeTimestep"
+    ],
+    "ignored_without_developer_mode": [
+      "ErrTolIntAccuracy",
+      "CourantFac",
+      "MaxRMSDisplacementFac"
+    ],
+    "note": "GIZMO emitted only consumed keys to parameters-usedvalues; the three public numerical-control prompts were present in the input but are inactive without DEVELOPER_MODE."
+  },
+  "timeline": {
+    "time_begin": 0.0,
+    "time_max": 3.0,
+    "timebase_ticks": 1152921504606846976,
+    "shared_step_ticks": 140737488355328,
+    "shared_step": 0.0003662109375,
+    "steps": 8192,
+    "all_particles_remained_active": true,
+    "scheduled_outputs": 7,
+    "output_ticks": [
+      0,
+      192153584101141152,
+      384307168202282304,
+      576460752303423488,
+      768614336404564608,
+      960767920505705856,
+      1152921504606846976
+    ]
+  },
+  "output_phase": {
+    "scheduled_snapshots": "mutable all-particle predictor drift at the integer output tick before the next force synchronization; velocities remain on their public half-step phase",
+    "time_zero": "after the initial force and first half-kick; it is not the unevolved hosted IC"
+  },
+  "tools": {
+    "reducer": {
+      "path": "../reduce_gresho_snapshot.py",
+      "sha256": "6fb6a6e50d2c24e7989dff0f7b34401b2b5c6dfed75d7991afe8a63da9803f74"
+    },
+    "analytic_comparator": {
+      "path": "../compare_gresho_analytic.py",
+      "sha256": "c9f4dc7fa6cda31373ebad8d4353c440c06e7864d7dc74adaa8520499cbfe2f4"
+    }
+  },
+  "table_format": {
+    "compression": "gzip with mtime=0 and empty embedded filename",
+    "ordering": "ascending ParticleIDs",
+    "columns": [
+      "particle_id",
+      "x",
+      "y",
+      "velocity_x",
+      "velocity_y",
+      "density",
+      "specific_internal_energy",
+      "smoothing_length",
+      "mass"
+    ],
+    "float_encoding": "17 significant decimal digits"
+  },
+  "analytic_metric_definition": {
+    "weighting": "particle mass normalized by total mass",
+    "center": [
+      0.5,
+      0.5
+    ],
+    "coordinate_distance": "periodic minimum image in the unit box",
+    "pressure": "(gamma-1)*density*specific_internal_energy with gamma=1.4",
+    "pressure_normalization": "4*log(2)-2",
+    "velocity_normalization": "analytic peak tangential speed 1"
+  },
+  "snapshots": [
+    {
+      "time": 0.0,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "87557c508f40c2acca322b86658f7780edd866f64acaff427e3eea3ec7157c76",
+      "table": "evolution_t0.csv.gz",
+      "table_size_bytes": 272442,
+      "table_sha256": "f46b215c2bc4cd1895a3ade15203df4dd871fd969583e8d83391ecee094393ac",
+      "analytic": {
+        "density_l1": 1.3130569727347843e-05,
+        "pressure_l1": 7.516092919449152e-05,
+        "pressure_normalized_l1": 9.728452801717772e-05,
+        "specific_internal_energy_normalized_l1": 6.172657994010877e-08,
+        "radial_velocity_rms": 0.005114239669896714,
+        "tangential_velocity_l1": 0.0013566949482406777,
+        "velocity_vector_l1": 0.002380413042412749,
+        "peak_tangential_velocity": 0.9657608880907903
+      }
+    },
+    {
+      "time": 0.5,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "8f27655688fe880b92eb6325af0ecefbf394e57ab5e60ed4895d5e0c26e533bf",
+      "table": "evolution_t1.csv.gz",
+      "table_size_bytes": 308681,
+      "table_sha256": "497927f8cefbf54bdc4b28eb9ffde0348776e5e1250b540c32b6e0730af856a3",
+      "analytic": {
+        "density_l1": 0.007227381077145473,
+        "pressure_l1": 0.039824556021294415,
+        "pressure_normalized_l1": 0.05154690312568973,
+        "specific_internal_energy_normalized_l1": 0.01771381254438176,
+        "radial_velocity_rms": 0.010132517246290077,
+        "tangential_velocity_l1": 0.014047448642618638,
+        "velocity_vector_l1": 0.017510713434121836,
+        "peak_tangential_velocity": 0.9412001508789656
+      }
+    },
+    {
+      "time": 1.0,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "0d58b3bfabff26a1a1039dcc2e91f23e183247b923a4ec210e1f999af4ef04eb",
+      "table": "evolution_t2.csv.gz",
+      "table_size_bytes": 308521,
+      "table_sha256": "7577624593114abce9f48bc9e6905494d83ba39c18727bb0183b4692225f5a5b",
+      "analytic": {
+        "density_l1": 0.007472963449168275,
+        "pressure_l1": 0.04246505659633916,
+        "pressure_normalized_l1": 0.05496463431828309,
+        "specific_internal_energy_normalized_l1": 0.020599163347974108,
+        "radial_velocity_rms": 0.01302114548041816,
+        "tangential_velocity_l1": 0.019787037973381973,
+        "velocity_vector_l1": 0.023851446112826177,
+        "peak_tangential_velocity": 0.9391024926003051
+      }
+    },
+    {
+      "time": 1.5,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "c8f09a9d42be759670738973b06f945e4f0280c85c1c8662cc8335b730aacea1",
+      "table": "evolution_t3.csv.gz",
+      "table_size_bytes": 308547,
+      "table_sha256": "4e70f43432f42ff7d805e4c9c67bc5f1fe7f51abe3a9c91e2937a4c19b4ad8c1",
+      "analytic": {
+        "density_l1": 0.007821490906969784,
+        "pressure_l1": 0.04429774717687878,
+        "pressure_normalized_l1": 0.057336776866813356,
+        "specific_internal_energy_normalized_l1": 0.02344557801089253,
+        "radial_velocity_rms": 0.016521445768135395,
+        "tangential_velocity_l1": 0.02450251887643546,
+        "velocity_vector_l1": 0.02954691633644582,
+        "peak_tangential_velocity": 0.9282522086275676
+      }
+    },
+    {
+      "time": 2.0,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "5ed0e626768be8fb1997f34af1981c81fc93d42bfcd6c2a21808a13c2961a314",
+      "table": "evolution_t4.csv.gz",
+      "table_size_bytes": 308555,
+      "table_sha256": "d7e3be5aec6bcf3bf2ee16245076765aa08789c208314d260b1f115021d9edca",
+      "analytic": {
+        "density_l1": 0.00793382254423249,
+        "pressure_l1": 0.04263483036905886,
+        "pressure_normalized_l1": 0.05518438095427788,
+        "specific_internal_energy_normalized_l1": 0.025553146941108832,
+        "radial_velocity_rms": 0.01979238007476948,
+        "tangential_velocity_l1": 0.02820096720236027,
+        "velocity_vector_l1": 0.034245270361286925,
+        "peak_tangential_velocity": 0.9325199252341365
+      }
+    },
+    {
+      "time": 2.5,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "20c8a97a51d7974a7bce72901ab3d9abac98eaa37927e4eba9c189ff0555c383",
+      "table": "evolution_t5.csv.gz",
+      "table_size_bytes": 308419,
+      "table_sha256": "27da7bb46bedd4a927b1935c2301d720d35ac12c44271299d1f969091900e2af",
+      "analytic": {
+        "density_l1": 0.008060420062730344,
+        "pressure_l1": 0.04525866627984982,
+        "pressure_normalized_l1": 0.05858054224328079,
+        "specific_internal_energy_normalized_l1": 0.029787094182112468,
+        "radial_velocity_rms": 0.023861501176884434,
+        "tangential_velocity_l1": 0.03226095592184783,
+        "velocity_vector_l1": 0.039774261661768194,
+        "peak_tangential_velocity": 0.8875125213483723
+      }
+    },
+    {
+      "time": 3.0,
+      "raw_size_bytes": 384656,
+      "raw_sha256": "01332ef6010b8fbb64f7c28a52ee97b84a0976494b3dfe756964af81e186f938",
+      "table": "evolution_t6.csv.gz",
+      "table_size_bytes": 308569,
+      "table_sha256": "a868c497fa2594e8c68a00191c89f17f907220bd5e07fcefea32216ecb34bb9d",
+      "analytic": {
+        "density_l1": 0.008376919881428328,
+        "pressure_l1": 0.04767359603639956,
+        "pressure_normalized_l1": 0.061706305909036495,
+        "specific_internal_energy_normalized_l1": 0.03290350281342925,
+        "radial_velocity_rms": 0.030079714389200755,
+        "tangential_velocity_l1": 0.03760171962015853,
+        "velocity_vector_l1": 0.04759813747024933,
+        "peak_tangential_velocity": 0.9086191694277951
+      }
+    }
+  ]
+}

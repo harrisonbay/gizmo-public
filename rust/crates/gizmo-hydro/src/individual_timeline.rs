@@ -191,6 +191,51 @@ impl IndividualParticleTimeline {
         self.time_begin + self.tick_duration() * self.current_tick as f64
     }
 
+    /// Convert an output time using public C's truncating integer semantics.
+    ///
+    /// Explicitly terminal outputs snap to the final `2^60` tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-finite/out-of-range request or a terminal
+    /// request that is not numerically the configured end time.
+    pub fn output_time_to_integer_tick(
+        &self,
+        output_time: f64,
+        terminal: bool,
+    ) -> Result<u64, IndividualTimelineError> {
+        if !output_time.is_finite() {
+            return Err(IndividualTimelineError::InvalidBound);
+        }
+        if terminal {
+            let tolerance = 64.0 * f64::EPSILON * self.time_max.abs().max(1.0);
+            if (output_time - self.time_max).abs() > tolerance {
+                return Err(IndividualTimelineError::InvalidBound);
+            }
+            return Ok(LEGACY_TIMEBASE_TICKS);
+        }
+        if output_time < self.time_begin || output_time >= self.time_max {
+            return Err(IndividualTimelineError::InvalidBound);
+        }
+        let tick = ((output_time - self.time_begin) / self.tick_duration()) as u64;
+        if tick >= LEGACY_TIMEBASE_TICKS {
+            return Err(IndividualTimelineError::BeyondTimelineEnd);
+        }
+        Ok(tick)
+    }
+
+    /// Physical snapshot time represented by an integer timeline tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tick is beyond the public timebase.
+    pub fn physical_time_at_tick(&self, tick: u64) -> Result<f64, IndividualTimelineError> {
+        if tick > LEGACY_TIMEBASE_TICKS {
+            return Err(IndividualTimelineError::BeyondTimelineEnd);
+        }
+        Ok(self.time_begin + self.tick_duration() * tick as f64)
+    }
+
     #[must_use]
     pub fn duration_for_ticks(&self, ticks: u64) -> f64 {
         self.tick_duration() * ticks as f64
@@ -438,6 +483,28 @@ mod tests {
                 .unwrap();
         assert_eq!(timeline.step_ticks(), &[2]);
         assert_eq!(timeline.time_bins(), &[1]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn output_ticks_truncate_nonterminal_times_and_snap_the_terminal() {
+        let timeline = IndividualParticleTimeline::from_initial_steps(0.0, 3.0, &[2]).unwrap();
+        let half = timeline.output_time_to_integer_tick(0.5, false).unwrap();
+        assert_eq!(half, 192_153_584_101_141_152);
+        assert_eq!(
+            timeline.physical_time_at_tick(half).unwrap().to_bits(),
+            (half as f64 * (3.0 / LEGACY_TIMEBASE_TICKS as f64)).to_bits()
+        );
+        assert_eq!(
+            timeline.output_time_to_integer_tick(3.0, true).unwrap(),
+            LEGACY_TIMEBASE_TICKS
+        );
+        assert!(timeline.output_time_to_integer_tick(3.0, false).is_err());
+        assert!(timeline.output_time_to_integer_tick(2.5, true).is_err());
     }
 
     #[test]
