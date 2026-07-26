@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,12 +9,13 @@ use std::process::ExitCode;
 use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d,
-    SynchronizedTimeline1d, begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d,
-    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
+    begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d, gradients_at_hsml_1d,
+    inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
     select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d,
+    GradientEstimate, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d, SynchronizedTimeline1d,
+    LEGACY_TIMEBASE_TICKS,
 };
-use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
+use gizmo_io::{read_soundwave, write_soundwave, SnapshotHeader, SoundWaveWriteView};
 use gizmo_params::SoundwaveParameters;
 
 fn main() -> ExitCode {
@@ -50,14 +52,14 @@ fn run() -> Result<(), ApplicationError> {
         invocation.restart as u8
     );
 
-    validate_soundwave_config(&manifest)?;
-    let initialized = initialize_soundwave(&invocation.parameter_file)?;
+    let profile = validate_strict_config(&manifest)?;
+    let initialized = initialize_profile(&invocation.parameter_file, profile)?;
     initialized.validate_owned_state()?;
     if invocation.initialize_only {
-        initialized.summary.print(&manifest.sha256());
+        initialized.print_initialization(&manifest.sha256());
         Ok(())
     } else {
-        evolve_soundwave(initialized)
+        evolve_profile(initialized)
     }
 }
 
@@ -69,7 +71,29 @@ fn reject_unsupported_restart(restart: RestartFlag) -> Result<(), ApplicationErr
     }
 }
 
-fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), ApplicationError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrictProfile {
+    Soundwave,
+    EqualMassShocktube,
+}
+
+impl StrictProfile {
+    const fn gamma(self) -> f64 {
+        match self {
+            Self::Soundwave => 5.0 / 3.0,
+            Self::EqualMassShocktube => 1.4,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Soundwave => "soundwave",
+            Self::EqualMassShocktube => "equal-mass shocktube",
+        }
+    }
+}
+
+fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
     const REQUIRED_FLAGS: [&str; 7] = [
         "BOX_PERIODIC",
         "DEVELOPER_MODE",
@@ -79,8 +103,6 @@ fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), Applicatio
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
-    const REQUIRED_VALUES: [(&str, &str); 2] =
-        [("BOX_SPATIAL_DIMENSION", "1"), ("EOS_GAMMA", "(5.0/3.0)")];
     const ALLOWED: [&str; 9] = [
         "BOX_PERIODIC",
         "BOX_SPATIAL_DIMENSION",
@@ -95,7 +117,7 @@ fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), Applicatio
     for option in manifest.iter() {
         if !ALLOWED.contains(&option.name.as_str()) {
             return Err(ApplicationError::UnsupportedConfig(format!(
-                "option `{}` is outside the sound-wave initialization profile",
+                "option `{}` is outside the strict one-dimensional hydro profiles",
                 option.name
             )));
         }
@@ -103,10 +125,17 @@ fn validate_soundwave_config(manifest: &ConfigManifest) -> Result<(), Applicatio
     for required in REQUIRED_FLAGS {
         require_config_flag(manifest, required)?;
     }
-    for (name, expected) in REQUIRED_VALUES {
-        require_config_value(manifest, name, expected)?;
+    require_config_value(manifest, "BOX_SPATIAL_DIMENSION", "1")?;
+    match manifest
+        .get("EOS_GAMMA")
+        .and_then(|option| option.value.as_deref())
+    {
+        Some("(5.0/3.0)") => Ok(StrictProfile::Soundwave),
+        Some("(1.4)") => Ok(StrictProfile::EqualMassShocktube),
+        actual => Err(ApplicationError::UnsupportedConfig(format!(
+            "`EOS_GAMMA` must identify a ported profile (`(5.0/3.0)` or `(1.4)`), found {actual:?}"
+        ))),
     }
-    Ok(())
 }
 
 fn require_config_flag(manifest: &ConfigManifest, name: &str) -> Result<(), ApplicationError> {
@@ -139,9 +168,14 @@ fn require_config_value(
     }
 }
 
-fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, ApplicationError> {
-    let parameters =
-        SoundwaveParameters::from_path(parameter_file).map_err(ApplicationError::Parameters)?;
+fn initialize_profile(
+    parameter_file: &Path,
+    profile: StrictProfile,
+) -> Result<InitializedSoundwave, ApplicationError> {
+    let parameters = read_profile_parameters(parameter_file, profile)?;
+    if profile == StrictProfile::EqualMassShocktube {
+        return Err(ApplicationError::ShocktubeTreeInitializationUnavailable);
+    }
     let fixture_path = resolve_initial_conditions(&parameters.init_cond_file);
     let snapshot = read_soundwave(&fixture_path).map_err(ApplicationError::Input)?;
     if snapshot.header.box_size.to_bits() != parameters.box_size.to_bits() {
@@ -150,29 +184,12 @@ fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, A
             parameters.box_size, snapshot.header.box_size
         )));
     }
-    let expected_density = snapshot
-        .gas
-        .density
-        .as_deref()
-        .ok_or(ApplicationError::MissingDataset("Density"))?;
-    let legacy_hsml = snapshot
-        .gas
-        .smoothing_length
-        .as_deref()
-        .ok_or(ApplicationError::MissingDataset("SmoothingLength"))?;
     let positions: Vec<f64> = snapshot
         .gas
         .coordinates
         .iter()
         .map(|coordinate| coordinate[0])
         .collect();
-    let at_legacy_hsml = density_at_hsml_1d(
-        &positions,
-        &snapshot.gas.masses,
-        legacy_hsml,
-        snapshot.header.box_size,
-    )
-    .map_err(ApplicationError::Hydro)?;
     let particle_count = u32::try_from(snapshot.gas.len())
         .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u32".to_owned()))?;
     let solved = solve_public_c_initial_smoothing_lengths_1d(
@@ -184,16 +201,38 @@ fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, A
     )
     .map_err(ApplicationError::Hydro)?;
 
-    let summary = summarize_initialization(
-        &snapshot,
-        &positions,
-        expected_density,
-        legacy_hsml,
-        &at_legacy_hsml,
-        &solved,
-        (particle_count, parameters.desired_num_neighbors),
-    )?;
-    summary.validate(parameters.max_neighbor_deviation)?;
+    let summary = if profile == StrictProfile::Soundwave {
+        let expected_density = snapshot
+            .gas
+            .density
+            .as_deref()
+            .ok_or(ApplicationError::MissingDataset("Density"))?;
+        let legacy_hsml = snapshot
+            .gas
+            .smoothing_length
+            .as_deref()
+            .ok_or(ApplicationError::MissingDataset("SmoothingLength"))?;
+        let at_legacy_hsml = density_at_hsml_1d(
+            &positions,
+            &snapshot.gas.masses,
+            legacy_hsml,
+            snapshot.header.box_size,
+        )
+        .map_err(ApplicationError::Hydro)?;
+        let summary = summarize_initialization(
+            &snapshot,
+            &positions,
+            expected_density,
+            legacy_hsml,
+            &at_legacy_hsml,
+            &solved,
+            (particle_count, parameters.desired_num_neighbors),
+        )?;
+        summary.validate(parameters.max_neighbor_deviation)?;
+        Some(summary)
+    } else {
+        None
+    };
     let particle_ids = snapshot.gas.ids;
     let transverse_vectors = snapshot
         .gas
@@ -220,15 +259,73 @@ fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, A
             .map(|particle| particle.smoothing_length)
             .collect(),
         box_size: snapshot.header.box_size,
-        gamma: 5.0 / 3.0,
+        gamma: profile.gamma(),
     };
     Ok(InitializedSoundwave {
+        profile,
         parameters,
         particle_ids,
         transverse_vectors,
         state,
         summary,
     })
+}
+
+fn read_profile_parameters(
+    parameter_file: &Path,
+    profile: StrictProfile,
+) -> Result<SoundwaveParameters, ApplicationError> {
+    if profile == StrictProfile::Soundwave {
+        return SoundwaveParameters::from_path(parameter_file)
+            .map_err(ApplicationError::Parameters);
+    }
+    let input = fs::read_to_string(parameter_file).map_err(ApplicationError::ParameterFile)?;
+    let mut retained = Vec::new();
+    let mut profile_tags = BTreeSet::new();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let definition = raw_line
+            .split_once('%')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if definition.is_empty() {
+            retained.push(raw_line);
+            continue;
+        }
+        let mut tokens = definition.split_whitespace();
+        let tag = tokens.next().unwrap_or_default();
+        let expected = match tag {
+            "TimeBegin" => Some("0"),
+            "ICFormat" | "SnapFormat" => Some("3"),
+            "BufferSize" => Some("8"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            let value = tokens.next();
+            if value != Some(expected) || tokens.next().is_some() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: `{tag}` must equal `{expected}` for the equal-mass shocktube",
+                    line_index + 1
+                )));
+            }
+            if !profile_tags.insert(tag) {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "line {}: duplicate profile parameter `{tag}`",
+                    line_index + 1
+                )));
+            }
+        } else {
+            retained.push(raw_line);
+        }
+    }
+    for required in ["TimeBegin", "ICFormat", "SnapFormat", "BufferSize"] {
+        if !profile_tags.contains(required) {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "required equal-mass shocktube parameter `{required}` is missing"
+            )));
+        }
+    }
+    SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))
 }
 
 fn summarize_initialization(
@@ -288,17 +385,17 @@ struct TransverseVectorShell {
 
 #[derive(Clone, Debug, PartialEq)]
 struct InitializedSoundwave {
+    profile: StrictProfile,
     parameters: SoundwaveParameters,
     particle_ids: Vec<u64>,
     transverse_vectors: Vec<TransverseVectorShell>,
     state: MfmEvolvingState1d,
-    summary: InitializationSummary,
+    summary: Option<InitializationSummary>,
 }
 
 impl InitializedSoundwave {
     fn validate_owned_state(&self) -> Result<(), ApplicationError> {
-        let particle_count = usize::try_from(self.summary.particle_count)
-            .map_err(|_| ApplicationError::StateMismatch("invalid particle count".to_owned()))?;
+        let particle_count = self.state.positions.len();
         for (field, actual) in [
             ("ParticleIDs", self.particle_ids.len()),
             ("transverse vectors", self.transverse_vectors.len()),
@@ -323,13 +420,15 @@ impl InitializedSoundwave {
             ));
         }
         if self.parameters.box_size.to_bits() != self.state.box_size.to_bits()
-            || self.summary.box_size.to_bits() != self.state.box_size.to_bits()
+            || self
+                .summary
+                .is_some_and(|summary| summary.box_size.to_bits() != self.state.box_size.to_bits())
         {
             return Err(ApplicationError::StateMismatch(
                 "runtime bundle has inconsistent box sizes".to_owned(),
             ));
         }
-        if self.state.gamma.to_bits() != (5.0_f64 / 3.0).to_bits() {
+        if self.state.gamma.to_bits() != self.profile.gamma().to_bits() {
             return Err(ApplicationError::StateMismatch(
                 "runtime bundle has inconsistent EOS gamma".to_owned(),
             ));
@@ -346,10 +445,24 @@ impl InitializedSoundwave {
         }
         Ok(())
     }
+
+    fn print_initialization(&self, config_sha256: &str) {
+        if let Some(summary) = self.summary {
+            summary.print(config_sha256);
+            return;
+        }
+        println!("{{");
+        println!("  \"config_sha256\": \"{config_sha256}\",");
+        println!("  \"profile\": \"{}\",", self.profile.name());
+        println!("  \"particles\": {},", self.state.positions.len());
+        println!("  \"box_size\": {},", self.state.box_size);
+        println!("  \"gamma\": {}", self.state.gamma);
+        println!("}}");
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn evolve_soundwave(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
+fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
     let output_dir = PathBuf::from(&initialized.parameters.output_dir);
     fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
     let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
@@ -765,11 +878,14 @@ enum ApplicationError {
     Cli(CliError),
     Config(gizmo_config::ReadConfigError),
     Parameters(gizmo_params::ReadParameterError),
+    ParameterFile(std::io::Error),
     Input(gizmo_io::InputError),
     Output(gizmo_io::OutputError),
     OutputDirectory(std::io::Error),
     Hydro(gizmo_hydro::HydroError),
     UnsupportedConfig(String),
+    UnsupportedParameters(String),
+    ShocktubeTreeInitializationUnavailable,
     UnsupportedRestart(RestartFlag),
     MissingDataset(&'static str),
     StateMismatch(String),
@@ -781,6 +897,9 @@ impl std::fmt::Display for ApplicationError {
             Self::Cli(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
             Self::Parameters(error) => error.fmt(formatter),
+            Self::ParameterFile(error) => {
+                write!(formatter, "failed to read parameter file: {error}")
+            }
             Self::Input(error) => error.fmt(formatter),
             Self::Output(error) => error.fmt(formatter),
             Self::OutputDirectory(error) => {
@@ -793,6 +912,15 @@ impl std::fmt::Display for ApplicationError {
             Self::UnsupportedConfig(error) => {
                 write!(formatter, "unsupported initialization config: {error}")
             }
+            Self::UnsupportedParameters(error) => {
+                write!(formatter, "unsupported runtime parameters: {error}")
+            }
+            Self::ShocktubeTreeInitializationUnavailable => write!(
+                formatter,
+                "equal-mass shocktube restart-0 is not yet supported: the Rust dyadic tree \
+                 approximation does not reproduce public-C smoothing-length seeds for the \
+                 nonuniform particle layout"
+            ),
             Self::UnsupportedRestart(restart) => write!(
                 formatter,
                 "restart flag {} is not ported; only restart flag 0 can initialize a simulation",
@@ -821,6 +949,39 @@ EOS_GAMMA=(5.0/3.0)
 FORCE_EQUAL_TIMESTEPS
 DEVELOPER_MODE
 ";
+    const SHOCKTUBE_CONFIG: &str = "\
+HYDRO_MESHLESS_FINITE_MASS
+BOX_SPATIAL_DIMENSION=1
+BOX_PERIODIC
+SELFGRAVITY_OFF
+INPUT_IN_DOUBLEPRECISION
+OUTPUT_IN_DOUBLEPRECISION
+EOS_GAMMA=(1.4)
+FORCE_EQUAL_TIMESTEPS
+DEVELOPER_MODE
+";
+    const SHOCKTUBE_PARAMETERS: &str = "\
+InitCondFile shocktube_ics_emass
+OutputDir output/
+ICFormat 3
+SnapFormat 3
+TimeBegin 0
+TimeMax 5
+BoxSize 80
+TimeBetSnapshot 0.5
+MaxSizeTimestep 0.001
+DesNumNgb 4
+BufferSize 8
+ErrTolIntAccuracy 0.0025
+CourantFac 0.05
+MaxRMSDisplacementFac 0.125
+TimeBetStatistics 0.5
+ErrTolForceAcc 0.0025
+ErrTolTheta 0.5
+MaxNumNgbDeviation 0.05
+ResubmitOn 0
+ResubmitCommand none
+";
 
     #[test]
     fn hdf5_suffix_is_appended_to_legacy_basename_even_when_it_contains_dots() {
@@ -833,7 +994,10 @@ DEVELOPER_MODE
     #[test]
     fn exact_soundwave_config_profile_is_required() {
         let manifest = ConfigManifest::parse(STRICT_CONFIG).unwrap();
-        validate_soundwave_config(&manifest).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::Soundwave
+        );
 
         for required in [
             "FORCE_EQUAL_TIMESTEPS",
@@ -848,7 +1012,7 @@ DEVELOPER_MODE
             let manifest = ConfigManifest::parse(&incomplete).unwrap();
             assert!(
                 matches!(
-                    validate_soundwave_config(&manifest),
+                    validate_strict_config(&manifest),
                     Err(ApplicationError::UnsupportedConfig(message))
                         if message.contains(required) && message.contains("missing")
                 ),
@@ -863,11 +1027,54 @@ DEVELOPER_MODE
             STRICT_CONFIG.replace("INPUT_IN_DOUBLEPRECISION\n", "INPUT_IN_DOUBLEPRECISION=1\n");
         let manifest = ConfigManifest::parse(&config).unwrap();
         assert!(matches!(
-            validate_soundwave_config(&manifest),
+            validate_strict_config(&manifest),
             Err(ApplicationError::UnsupportedConfig(message))
                 if message.contains("INPUT_IN_DOUBLEPRECISION")
                     && message.contains("bare enabled flag")
         ));
+    }
+
+    #[test]
+    fn exact_equal_mass_shocktube_config_profile_is_accepted() {
+        let manifest = ConfigManifest::parse(SHOCKTUBE_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::EqualMassShocktube
+        );
+        for gamma in ["1.4000000001", "(7.0/5.0)", "1.4"] {
+            let config = SHOCKTUBE_CONFIG.replace("EOS_GAMMA=(1.4)", &format!("EOS_GAMMA={gamma}"));
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&config).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(message))
+                    if message.contains("EOS_GAMMA") && message.contains("ported profile")
+            ));
+        }
+    }
+
+    #[test]
+    fn shocktube_parameters_are_strict_and_initialization_reports_tree_blocker() {
+        let path =
+            std::env::temp_dir().join(format!("gizmo-shocktube-params-{}.txt", std::process::id()));
+        fs::write(&path, SHOCKTUBE_PARAMETERS).unwrap();
+        let parameters = read_profile_parameters(&path, StrictProfile::EqualMassShocktube).unwrap();
+        assert_eq!(parameters.box_size.to_bits(), 80.0_f64.to_bits());
+        assert_eq!(parameters.time_max.to_bits(), 5.0_f64.to_bits());
+        assert!(matches!(
+            initialize_profile(&path, StrictProfile::EqualMassShocktube),
+            Err(ApplicationError::ShocktubeTreeInitializationUnavailable)
+        ));
+
+        fs::write(
+            &path,
+            SHOCKTUBE_PARAMETERS.replace("BufferSize 8", "BufferSize 16"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_profile_parameters(&path, StrictProfile::EqualMassShocktube),
+            Err(ApplicationError::UnsupportedParameters(message))
+                if message.contains("BufferSize") && message.contains("must equal `8`")
+        ));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
