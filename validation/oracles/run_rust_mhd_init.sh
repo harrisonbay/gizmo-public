@@ -13,3 +13,12 @@ GIZMO_MHD_WAVE_IC="$fixture" \
   -- \
   --ignored \
   --nocapture
+
+GIZMO_MHD_WAVE_IC="$fixture" \
+  cargo test \
+  --manifest-path "$repo_root/rust/Cargo.toml" \
+  -p gizmo-hydro \
+  --test public_mhd_wave \
+  -- \
+  --ignored \
+  --nocapture
