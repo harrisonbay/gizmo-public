@@ -9,10 +9,11 @@ use std::process::ExitCode;
 use gizmo_cli::{CliError, Invocation, RestartFlag, USAGE};
 use gizmo_config::ConfigManifest;
 use gizmo_hydro::{
-    GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d,
-    SynchronizedTimeline1d, begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d,
-    gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
-    select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d,
+    BoundaryMode1d, GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d,
+    MfmEvolvingState1d, SynchronizedTimeline1d, begin_mfm_kdk_1d, begin_mfm_reflective_kdk_1d,
+    density_at_hsml_1d, density_at_hsml_1d_with_boundary, finish_mfm_kdk_1d, gradients_at_hsml_1d,
+    inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d_with_boundary,
+    select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d_with_boundary,
 };
 use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
 use gizmo_params::SoundwaveParameters;
@@ -74,13 +75,14 @@ fn reject_unsupported_restart(restart: RestartFlag) -> Result<(), ApplicationErr
 enum StrictProfile {
     Soundwave,
     EqualMassShocktube,
+    InteractingBlast,
 }
 
 impl StrictProfile {
     const fn gamma(self) -> f64 {
         match self {
             Self::Soundwave => 5.0 / 3.0,
-            Self::EqualMassShocktube => 1.4,
+            Self::EqualMassShocktube | Self::InteractingBlast => 1.4,
         }
     }
 
@@ -88,22 +90,30 @@ impl StrictProfile {
         match self {
             Self::Soundwave => "soundwave",
             Self::EqualMassShocktube => "equal-mass shocktube",
+            Self::InteractingBlast => "interacting blastwave",
+        }
+    }
+
+    const fn boundary(self) -> BoundaryMode1d {
+        match self {
+            Self::Soundwave | Self::EqualMassShocktube => BoundaryMode1d::Periodic,
+            Self::InteractingBlast => BoundaryMode1d::Reflective,
         }
     }
 }
 
 fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, ApplicationError> {
-    const REQUIRED_FLAGS: [&str; 7] = [
-        "BOX_PERIODIC",
+    const REQUIRED_FLAGS: [&str; 5] = [
         "DEVELOPER_MODE",
-        "FORCE_EQUAL_TIMESTEPS",
         "HYDRO_MESHLESS_FINITE_MASS",
         "INPUT_IN_DOUBLEPRECISION",
         "OUTPUT_IN_DOUBLEPRECISION",
         "SELFGRAVITY_OFF",
     ];
-    const ALLOWED: [&str; 9] = [
+    const ALLOWED: [&str; 11] = [
+        "BOX_BND_PARTICLES",
         "BOX_PERIODIC",
+        "BOX_REFLECT_X",
         "BOX_SPATIAL_DIMENSION",
         "DEVELOPER_MODE",
         "EOS_GAMMA",
@@ -124,15 +134,40 @@ fn validate_strict_config(manifest: &ConfigManifest) -> Result<StrictProfile, Ap
     for required in REQUIRED_FLAGS {
         require_config_flag(manifest, required)?;
     }
+    for topology_flag in [
+        "BOX_BND_PARTICLES",
+        "BOX_PERIODIC",
+        "BOX_REFLECT_X",
+        "FORCE_EQUAL_TIMESTEPS",
+    ] {
+        if manifest.get(topology_flag).is_some() {
+            require_config_flag(manifest, topology_flag)?;
+        }
+    }
     require_config_value(manifest, "BOX_SPATIAL_DIMENSION", "1")?;
-    match manifest
+    let gamma = manifest
         .get("EOS_GAMMA")
-        .and_then(|option| option.value.as_deref())
-    {
-        Some("(5.0/3.0)") => Ok(StrictProfile::Soundwave),
-        Some("(1.4)") => Ok(StrictProfile::EqualMassShocktube),
-        actual => Err(ApplicationError::UnsupportedConfig(format!(
-            "`EOS_GAMMA` must identify a ported profile (`(5.0/3.0)` or `(1.4)`), found {actual:?}"
+        .and_then(|option| option.value.as_deref());
+    let periodic = manifest.get("BOX_PERIODIC").is_some();
+    let equal_timesteps = manifest.get("FORCE_EQUAL_TIMESTEPS").is_some();
+    let reflective_x = manifest.get("BOX_REFLECT_X").is_some();
+    let boundary_particles = manifest.get("BOX_BND_PARTICLES").is_some();
+
+    match (
+        gamma,
+        periodic,
+        equal_timesteps,
+        reflective_x,
+        boundary_particles,
+    ) {
+        (Some("(5.0/3.0)"), true, true, false, false) => Ok(StrictProfile::Soundwave),
+        (Some("(1.4)"), true, true, false, false) => Ok(StrictProfile::EqualMassShocktube),
+        (Some("(1.4)"), false, false, true, true) => Ok(StrictProfile::InteractingBlast),
+        _ => Err(ApplicationError::UnsupportedConfig(format!(
+            "configuration does not exactly match a ported profile: \
+             EOS_GAMMA={gamma:?}, BOX_PERIODIC={periodic}, \
+             FORCE_EQUAL_TIMESTEPS={equal_timesteps}, BOX_REFLECT_X={reflective_x}, \
+             BOX_BND_PARTICLES={boundary_particles}"
         ))),
     }
 }
@@ -188,12 +223,13 @@ fn initialize_profile(
         .collect();
     let particle_count = u32::try_from(snapshot.gas.len())
         .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u32".to_owned()))?;
-    let solved = solve_public_c_initial_smoothing_lengths_1d(
+    let solved = solve_public_c_initial_smoothing_lengths_1d_with_boundary(
         &positions,
         &snapshot.gas.masses,
         snapshot.header.box_size,
         parameters.desired_num_neighbors,
         parameters.max_neighbor_deviation,
+        profile.boundary(),
     )
     .map_err(ApplicationError::Hydro)?;
 
@@ -299,8 +335,9 @@ fn read_profile_parameters(
             let value = tokens.next();
             if value != Some(expected) || tokens.next().is_some() {
                 return Err(ApplicationError::UnsupportedParameters(format!(
-                    "line {}: `{tag}` must equal `{expected}` for the equal-mass shocktube",
-                    line_index + 1
+                    "line {}: `{tag}` must equal `{expected}` for the {}",
+                    line_index + 1,
+                    profile.name()
                 )));
             }
             if !profile_tags.insert(tag) {
@@ -316,12 +353,58 @@ fn read_profile_parameters(
     for required in ["TimeBegin", "ICFormat", "SnapFormat", "BufferSize"] {
         if !profile_tags.contains(required) {
             return Err(ApplicationError::UnsupportedParameters(format!(
-                "required equal-mass shocktube parameter `{required}` is missing"
+                "required {} parameter `{required}` is missing",
+                profile.name()
             )));
         }
     }
-    SoundwaveParameters::parse(&retained.join("\n"))
-        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))
+    let parameters = SoundwaveParameters::parse(&retained.join("\n"))
+        .map_err(|error| ApplicationError::UnsupportedParameters(error.to_string()))?;
+    if profile == StrictProfile::InteractingBlast
+        && parameters.min_timestep != Some(parameters.max_timestep)
+    {
+        return Err(ApplicationError::UnsupportedParameters(
+            "interacting blastwave requires equal explicit MinSizeTimestep and \
+             MaxSizeTimestep values"
+                .to_owned(),
+        ));
+    }
+    if profile == StrictProfile::InteractingBlast {
+        let required_scalars: [(&str, f64, f64); 10] = [
+            ("TimeMax", parameters.time_max, 0.038),
+            ("BoxSize", parameters.box_size, 1.0),
+            ("TimeBetSnapshot", parameters.time_between_snapshots, 0.0038),
+            ("MaxSizeTimestep", parameters.max_timestep, 2.0e-7),
+            ("DesNumNgb", parameters.desired_num_neighbors, 4.0),
+            ("ErrTolIntAccuracy", parameters.integration_accuracy, 0.002),
+            ("CourantFac", parameters.courant_factor, 0.01),
+            (
+                "MaxRMSDisplacementFac",
+                parameters.max_rms_displacement_factor,
+                0.05,
+            ),
+            ("ErrTolForceAcc", parameters.force_accuracy, 0.001),
+            (
+                "MaxNumNgbDeviation",
+                parameters.max_neighbor_deviation,
+                0.05,
+            ),
+        ];
+        for (field, actual, expected) in required_scalars {
+            if actual.to_bits() != expected.to_bits() {
+                return Err(ApplicationError::UnsupportedParameters(format!(
+                    "interacting blastwave requires `{field} {expected}`, found `{actual}`"
+                )));
+            }
+        }
+        if parameters.init_cond_file != "interactblast_ics" {
+            return Err(ApplicationError::UnsupportedParameters(format!(
+                "interacting blastwave requires `InitCondFile interactblast_ics`, found `{}`",
+                parameters.init_cond_file
+            )));
+        }
+    }
+    Ok(parameters)
 }
 
 fn summarize_initialization(
@@ -415,6 +498,16 @@ impl InitializedSoundwave {
                 "ParticleIDs are not strictly sorted".to_owned(),
             ));
         }
+        if self.profile == StrictProfile::InteractingBlast
+            && (self.particle_ids.len() != 512
+                || self.particle_ids.iter().copied().ne(1_u64..=512_u64))
+        {
+            return Err(ApplicationError::StateMismatch(
+                "interacting-blast ParticleIDs must be exactly 1 through 512; \
+                 ID zero would activate unported BOX_BND_PARTICLES semantics"
+                    .to_owned(),
+            ));
+        }
         if self.parameters.box_size.to_bits() != self.state.box_size.to_bits()
             || self
                 .summary
@@ -457,15 +550,18 @@ impl InitializedSoundwave {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), ApplicationError> {
     let output_dir = PathBuf::from(&initialized.parameters.output_dir);
     fs::create_dir_all(&output_dir).map_err(ApplicationError::OutputDirectory)?;
     let mut timeline = SynchronizedTimeline1d::new(0.0, initialized.parameters.time_max)
         .map_err(ApplicationError::Hydro)?;
     let tick_duration = initialized.parameters.time_max / LEGACY_TIMEBASE_TICKS as f64;
-    let mut rates =
-        mfm_spatial_rates_1d(initialized.state.as_view()).map_err(ApplicationError::Hydro)?;
+    let mut rates = mfm_spatial_rates_1d_with_boundary(
+        initialized.state.as_view(),
+        initialized.profile.boundary(),
+    )
+    .map_err(ApplicationError::Hydro)?;
     let mut next_output_time = 0.0_f64;
     let mut next_output_tick = Some(0_u64);
     let mut snapshot_number = 0_u32;
@@ -473,21 +569,38 @@ fn evolve_profile(mut initialized: InitializedSoundwave) -> Result<(), Applicati
     let mut step_count = 0_u64;
 
     while !timeline.is_finished() {
-        let selection = select_public_soundwave_timestep_1d(
-            initialized.state.as_view(),
-            &rates,
-            initialized.parameters.max_timestep,
-            initialized.parameters.courant_factor,
-            initialized.parameters.integration_accuracy,
-        )
-        .map_err(ApplicationError::Hydro)?;
+        let desired_timestep = if initialized.profile == StrictProfile::InteractingBlast {
+            // Public C computes the physical criteria, then clamps them between
+            // equal explicit MinSizeTimestep and MaxSizeTimestep values.
+            initialized.parameters.max_timestep
+        } else {
+            select_public_soundwave_timestep_1d(
+                initialized.state.as_view(),
+                &rates,
+                initialized.parameters.max_timestep,
+                initialized.parameters.courant_factor,
+                initialized.parameters.integration_accuracy,
+            )
+            .map_err(ApplicationError::Hydro)?
+            .duration
+        };
         let synchronized = timeline
-            .select_step(selection.duration, initialized.parameters.max_timestep)
+            .select_step(desired_timestep, initialized.parameters.max_timestep)
             .map_err(ApplicationError::Hydro)?;
         let start_tick = timeline.current_tick();
         let end_tick = start_tick + synchronized.ticks;
-        let mut prepared = begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
-            .map_err(ApplicationError::Hydro)?;
+        let mut prepared = if initialized.profile == StrictProfile::InteractingBlast {
+            begin_mfm_reflective_kdk_1d(
+                &initialized.state,
+                &rates,
+                synchronized.duration,
+                0.0,
+                &initialized.particle_ids,
+            )
+        } else {
+            begin_mfm_kdk_1d(&initialized.state, &rates, synchronized.duration, 0.0)
+        }
+        .map_err(ApplicationError::Hydro)?;
 
         while next_output_tick.is_some_and(|tick| tick <= end_tick) {
             let output_tick = next_output_tick.expect("checked above");
@@ -586,11 +699,12 @@ fn write_completed_snapshot(
     path: PathBuf,
     time: f64,
 ) -> Result<(), ApplicationError> {
-    let density: Vec<f64> = density_at_hsml_1d(
+    let density: Vec<f64> = density_at_hsml_1d_with_boundary(
         &initialized.state.positions,
         &initialized.state.masses,
         &initialized.state.smoothing_lengths,
         initialized.state.box_size,
+        initialized.profile.boundary(),
     )
     .map_err(ApplicationError::Hydro)?
     .into_iter()
@@ -950,6 +1064,8 @@ EOS_GAMMA=(1.4)
 FORCE_EQUAL_TIMESTEPS
 DEVELOPER_MODE
 ";
+    const INTERACTBLAST_CONFIG: &str =
+        include_str!("../../../../validation/oracles/interactblast/legacy-config.sh");
     const SHOCKTUBE_PARAMETERS: &str = "\
 InitCondFile shocktube_ics_emass
 OutputDir output/
@@ -989,11 +1105,7 @@ ResubmitCommand none
             StrictProfile::Soundwave
         );
 
-        for required in [
-            "FORCE_EQUAL_TIMESTEPS",
-            "INPUT_IN_DOUBLEPRECISION",
-            "OUTPUT_IN_DOUBLEPRECISION",
-        ] {
+        for required in ["INPUT_IN_DOUBLEPRECISION", "OUTPUT_IN_DOUBLEPRECISION"] {
             let incomplete = STRICT_CONFIG
                 .lines()
                 .filter(|line| *line != required)
@@ -1009,6 +1121,12 @@ ResubmitCommand none
                 "unexpectedly accepted config without {required}"
             );
         }
+        let no_equal_steps = STRICT_CONFIG.replace("FORCE_EQUAL_TIMESTEPS\n", "");
+        assert!(matches!(
+            validate_strict_config(&ConfigManifest::parse(&no_equal_steps).unwrap()),
+            Err(ApplicationError::UnsupportedConfig(message))
+                if message.contains("FORCE_EQUAL_TIMESTEPS=false")
+        ));
     }
 
     #[test]
@@ -1036,9 +1154,49 @@ ResubmitCommand none
             assert!(matches!(
                 validate_strict_config(&ConfigManifest::parse(&config).unwrap()),
                 Err(ApplicationError::UnsupportedConfig(message))
-                    if message.contains("EOS_GAMMA") && message.contains("ported profile")
+                    if message.contains("EOS_GAMMA")
             ));
         }
+    }
+
+    #[test]
+    fn exact_interacting_blast_config_profile_is_accepted() {
+        let manifest = ConfigManifest::parse(INTERACTBLAST_CONFIG).unwrap();
+        assert_eq!(
+            validate_strict_config(&manifest).unwrap(),
+            StrictProfile::InteractingBlast
+        );
+        for forbidden in ["BOX_PERIODIC", "FORCE_EQUAL_TIMESTEPS"] {
+            let config = format!("{INTERACTBLAST_CONFIG}{forbidden}\n");
+            assert!(matches!(
+                validate_strict_config(&ConfigManifest::parse(&config).unwrap()),
+                Err(ApplicationError::UnsupportedConfig(message))
+                    if message.contains(forbidden)
+            ));
+        }
+    }
+
+    #[test]
+    fn interacting_blast_requires_the_public_fixed_timestep() {
+        let path = std::env::temp_dir().join(format!(
+            "gizmo-interactblast-params-{}.txt",
+            std::process::id()
+        ));
+        let parameters = include_str!("../../../../validation/oracles/interactblast/legacy.params");
+        fs::write(&path, parameters).unwrap();
+        let parsed = read_profile_parameters(&path, StrictProfile::InteractingBlast).unwrap();
+        assert_eq!(parsed.min_timestep, Some(2.0e-7));
+        fs::write(
+            &path,
+            parameters.replace("MinSizeTimestep                    2e-07\n", ""),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_profile_parameters(&path, StrictProfile::InteractingBlast),
+            Err(ApplicationError::UnsupportedParameters(message))
+                if message.contains("equal explicit")
+        ));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

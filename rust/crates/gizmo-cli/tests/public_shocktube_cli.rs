@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gizmo_io::read_soundwave;
 
-const C_PARITY_TOLERANCE: f64 = 1.0e-10;
 const HEADER_ATTRIBUTES: [&str; 28] = [
     "BoxSize",
     "ComovingIntegrationOn",
@@ -43,9 +42,15 @@ fn strict_equal_mass_shocktube_cli_matches_corrected_c() {
         fixture_variable: "GIZMO_SHOCKTUBE_IC",
         parameter_variable: "GIZMO_SHOCKTUBE_PARAMS",
         t0_variable: "GIZMO_SHOCKTUBE_C_T0",
+        tmid_variable: None,
         t5_variable: "GIZMO_SHOCKTUBE_C_T5",
         fixture_name: "shocktube_ics_emass.hdf5",
         particle_count: 320,
+        box_size: 80.0,
+        snapshot_cadence: 0.5,
+        synchronized_steps: 8_192,
+        c_parity_tolerances: [1.0e-10; 6],
+        public_reference_variable: None,
     });
 }
 
@@ -56,9 +61,38 @@ fn strict_differential_mass_shocktube_cli_matches_corrected_c() {
         fixture_variable: "GIZMO_SHOCKTUBE_DIFFMASS_IC",
         parameter_variable: "GIZMO_SHOCKTUBE_DIFFMASS_PARAMS",
         t0_variable: "GIZMO_SHOCKTUBE_C_DIFFMASS_T0",
+        tmid_variable: None,
         t5_variable: "GIZMO_SHOCKTUBE_C_DIFFMASS_T5",
         fixture_name: "shocktube_ics_diffmass.hdf5",
         particle_count: 512,
+        box_size: 80.0,
+        snapshot_cadence: 0.5,
+        synchronized_steps: 8_192,
+        c_parity_tolerances: [1.0e-10; 6],
+        public_reference_variable: None,
+    });
+}
+
+#[test]
+#[ignore = "requires pinned interacting-blast assets; run via validation oracle script"]
+fn strict_interacting_blast_cli_matches_corrected_c() {
+    run_shocktube_cli_case(&ShocktubeCase {
+        fixture_variable: "GIZMO_INTERACTBLAST_IC",
+        parameter_variable: "GIZMO_INTERACTBLAST_PARAMS",
+        t0_variable: "GIZMO_INTERACTBLAST_C_T0",
+        tmid_variable: Some("GIZMO_INTERACTBLAST_C_TMID"),
+        t5_variable: "GIZMO_INTERACTBLAST_C_TFINAL",
+        fixture_name: "interactblast_ics.hdf5",
+        particle_count: 512,
+        box_size: 1.0,
+        snapshot_cadence: 0.0038,
+        synchronized_steps: 262_144,
+        // Strong interacting shocks amplify roundoff and solver-branch timing;
+        // the independent public reference remains the macroscopic quality gate.
+        // Normalized limits for x, vx, rho, u, H, and mass. These retain at
+        // least ~40% margin over the pinned macOS corrected-C differential.
+        c_parity_tolerances: [5.0e-6, 5.0e-4, 1.5e-3, 1.5e-3, 1.0e-4, 0.0],
+        public_reference_variable: Some("GIZMO_INTERACTBLAST_EXACT"),
     });
 }
 
@@ -66,17 +100,30 @@ struct ShocktubeCase {
     fixture_variable: &'static str,
     parameter_variable: &'static str,
     t0_variable: &'static str,
+    tmid_variable: Option<&'static str>,
     t5_variable: &'static str,
     fixture_name: &'static str,
     particle_count: u64,
+    box_size: f64,
+    snapshot_cadence: f64,
+    synchronized_steps: u64,
+    c_parity_tolerances: [f64; 6],
+    public_reference_variable: Option<&'static str>,
 }
 
 #[allow(clippy::too_many_lines)]
 fn run_shocktube_cli_case(case: &ShocktubeCase) {
     let fixture = required_path(case.fixture_variable);
-    let config = required_path("GIZMO_SHOCKTUBE_CONFIG");
+    let config = required_path(if case.fixture_name.starts_with("interactblast") {
+        "GIZMO_INTERACTBLAST_CONFIG"
+    } else {
+        "GIZMO_SHOCKTUBE_CONFIG"
+    });
     let parameters = required_path(case.parameter_variable);
     let expected_t0 = read_evolution_table(&required_path(case.t0_variable));
+    let expected_tmid = case
+        .tmid_variable
+        .map(|variable| read_evolution_table(&required_path(variable)));
     let expected_t5 = read_evolution_table(&required_path(case.t5_variable));
     let temporary = TemporaryDirectory::new();
     std::fs::copy(&fixture, temporary.path.join(case.fixture_name))
@@ -96,7 +143,10 @@ fn run_shocktube_cli_case(case: &ShocktubeCase) {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(String::from_utf8_lossy(&result.stderr).contains("completed 8192 synchronized steps"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains(&format!(
+        "completed {} synchronized steps",
+        case.synchronized_steps
+    )));
 
     let output = temporary.path.join("output");
     let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&output)
@@ -115,10 +165,16 @@ fn run_shocktube_cli_case(case: &ShocktubeCase) {
             path.file_name().and_then(|name| name.to_str()),
             Some(expected_name.as_str())
         );
-        assert_snapshot_schema(path, index, case.particle_count);
+        assert_snapshot_schema(path, index, case);
     }
-    assert_snapshot_state(&snapshots[0], &expected_t0);
-    assert_snapshot_state(&snapshots[10], &expected_t5);
+    assert_snapshot_state(&snapshots[0], &expected_t0, case.c_parity_tolerances);
+    if let Some(expected) = &expected_tmid {
+        assert_snapshot_state(&snapshots[5], expected, case.c_parity_tolerances);
+    }
+    assert_snapshot_state(&snapshots[10], &expected_t5, case.c_parity_tolerances);
+    if let Some(variable) = case.public_reference_variable {
+        assert_interactblast_reference(&snapshots[10], &required_path(variable));
+    }
 }
 
 fn required_path(variable: &str) -> PathBuf {
@@ -129,14 +185,14 @@ fn required_path(variable: &str) -> PathBuf {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn assert_snapshot_schema(path: &Path, index: usize, particle_count: u64) {
+fn assert_snapshot_schema(path: &Path, index: usize, case: &ShocktubeCase) {
     let snapshot = read_soundwave(path).expect("CLI snapshot must be readable");
-    let expected_time = index as f64 * 0.5;
+    let expected_time = index as f64 * case.snapshot_cadence;
     assert!((snapshot.header.time - expected_time).abs() < f64::EPSILON * 8.0);
-    assert_eq!(snapshot.header.box_size.to_bits(), 80.0_f64.to_bits());
+    assert_eq!(snapshot.header.box_size.to_bits(), case.box_size.to_bits());
     assert_eq!(
         snapshot.header.num_part_total,
-        [particle_count, 0, 0, 0, 0, 0]
+        [case.particle_count, 0, 0, 0, 0, 0]
     );
     assert!(snapshot.header.double_precision);
     assert_eq!(
@@ -169,7 +225,8 @@ fn assert_snapshot_schema(path: &Path, index: usize, particle_count: u64) {
             "Velocities",
         ]
     );
-    let particle_count = usize::try_from(particle_count).expect("particle count must fit usize");
+    let particle_count =
+        usize::try_from(case.particle_count).expect("particle count must fit usize");
     for dataset_name in ["Density", "InternalEnergy", "Masses", "SmoothingLength"] {
         let dataset = gas
             .dataset(dataset_name)
@@ -205,7 +262,7 @@ fn assert_snapshot_schema(path: &Path, index: usize, particle_count: u64) {
     );
 }
 
-fn assert_snapshot_state(path: &Path, expected: &EvolutionTable) {
+fn assert_snapshot_state(path: &Path, expected: &EvolutionTable, tolerances: [f64; 6]) {
     let actual = read_soundwave(path).expect("CLI snapshot must be readable");
     let density = actual
         .gas
@@ -229,7 +286,7 @@ fn assert_snapshot_state(path: &Path, expected: &EvolutionTable) {
     );
     assert_eq!(actual_ids, expected.ids);
     for (expected_index, &actual_index) in actual_indices.iter().enumerate() {
-        for (field, actual, expected_value) in [
+        for ((field, actual, expected_value), tolerance) in [
             (
                 "x",
                 actual.gas.coordinates[actual_index][0],
@@ -260,14 +317,100 @@ fn assert_snapshot_state(path: &Path, expected: &EvolutionTable) {
                 actual.gas.masses[actual_index],
                 expected.masses[expected_index],
             ),
-        ] {
+        ]
+        .into_iter()
+        .zip(tolerances)
+        {
             let scale = expected_value.abs().max(1.0);
             assert!(
-                (actual - expected_value).abs() <= C_PARITY_TOLERANCE * scale,
+                (actual - expected_value).abs() <= tolerance * scale,
                 "particle {} {field}: {actual} != {expected_value}",
                 expected.ids[expected_index]
             );
         }
+    }
+}
+
+fn assert_interactblast_reference(path: &Path, reference_path: &Path) {
+    let snapshot = read_soundwave(path).expect("CLI snapshot must be readable");
+    let density = snapshot
+        .gas
+        .density
+        .as_deref()
+        .expect("CLI density must be present");
+    let rows: Vec<[f64; 4]> = std::fs::read_to_string(reference_path)
+        .expect("public reference must be readable")
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let values: Vec<f64> = line
+                .split_whitespace()
+                .map(|value| value.parse().expect("reference value must be numeric"))
+                .collect();
+            assert_eq!(values.len(), 7);
+            [values[1], values[2], values[3], values[6]]
+        })
+        .collect();
+    assert_eq!(rows.len(), 20_000);
+
+    let mut weighted_error = [0.0_f64; 4];
+    let mut total_volume = 0.0;
+    for (index, &actual_density) in density.iter().enumerate() {
+        let position = snapshot.gas.coordinates[index][0];
+        let right = rows.partition_point(|row| row[0] < position);
+        let (left, right) = if right == 0 {
+            (0, 1)
+        } else if right == rows.len() {
+            (rows.len() - 2, rows.len() - 1)
+        } else {
+            (right - 1, right)
+        };
+        let fraction = (position - rows[left][0]) / (rows[right][0] - rows[left][0]);
+        let interpolate = |column: usize| {
+            rows[left][column] + fraction * (rows[right][column] - rows[left][column])
+        };
+        let expected_density = interpolate(1);
+        let expected_velocity = interpolate(2);
+        let expected_pressure = interpolate(3);
+        let actual_pressure = 0.4 * actual_density * snapshot.gas.internal_energy[index];
+        let actual_entropy = actual_pressure / actual_density.powf(1.4);
+        let expected_entropy = expected_pressure / expected_density.powf(1.4);
+        let actual = [
+            actual_density,
+            actual_pressure,
+            actual_entropy,
+            snapshot.gas.velocities[index][0],
+        ];
+        let expected = [
+            expected_density,
+            expected_pressure,
+            expected_entropy,
+            expected_velocity,
+        ];
+        let volume = snapshot.gas.masses[index] / actual_density;
+        for field in 0..4 {
+            weighted_error[field] += volume * (actual[field] - expected[field]).abs();
+        }
+        total_volume += volume;
+    }
+    for error in &mut weighted_error {
+        *error /= total_volume;
+    }
+    let corrected_c_baseline = [
+        0.046_259_608_024_094_4,
+        3.720_250_090_920_468,
+        15.666_363_547_865_624,
+        0.191_381_933_286_983_2,
+    ];
+    for (field, (actual, baseline)) in ["density", "pressure", "entropy", "velocity_x"]
+        .into_iter()
+        .zip(weighted_error.into_iter().zip(corrected_c_baseline))
+    {
+        assert!(
+            (actual - baseline).abs() <= baseline * 1.0e-3,
+            "{field} public-reference L1 moved outside the 0.1% corrected-C band: \
+             actual={actual}, baseline={baseline}"
+        );
     }
 }
 

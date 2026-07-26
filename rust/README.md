@@ -1,8 +1,9 @@
 # GIZMO Rust port
 
 This workspace is the correctness-oriented Rust replacement for GIZMO. It
-currently ports the public one-dimensional MFM sound-wave and both equal- and
-differential-mass Sod shock-tube paths: strict
+currently ports the public one-dimensional MFM sound-wave, both equal- and
+differential-mass Sod shock-tube paths, and the Woodward-Colella interacting
+blastwave: strict
 configuration and parameter parsing, validated HDF5 gas input, the exact default
 one-dimensional cubic kernel, density summation, adaptive smoothing-length
 constraints, slope-limited moving-least-squares gradients, default MFM face
@@ -16,6 +17,7 @@ snapshots. Other physics/configuration profiles fail closed.
 ```console
 validation/oracles/run_rust_soundwave_init.sh
 validation/oracles/run_rust_shocktube.sh
+validation/oracles/run_rust_interactblast.sh
 ```
 
 The complete 65,536-step corrected-C differential is intentionally separate
@@ -38,6 +40,14 @@ position/velocity errors are `3.56e-14`/`4.16e-13`, with density,
 internal-energy, and smoothing-length absolute errors below `5.04e-13`.
 Both terminal states are also gated against the independent public PPM table
 with volume-weighted L1 norms.
+
+The interacting-blast slice adds non-periodic neighbor geometry and exact
+public-C reflective-wall drift semantics, including the legacy ID-dependent
+inward nudge and predictor reset. Its corrected-C oracle runs 262,144 shared
+steps through `t=0.038` and is additionally gated against the supplied
+20,000-zone reference solution. The hosted IC has 512 particles, contrary to
+the public documentation's statement that it has 400; this discrepancy is
+pinned as oracle metadata rather than silently normalized.
 
 Initialization-only mode validates either supported profile, parses the runtime
 parameters, loads and ID-aligns the HDF5 state, recomputes density and adaptive

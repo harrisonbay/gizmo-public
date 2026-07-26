@@ -11,6 +11,7 @@ const SUPPORTED_TAGS: &[&str] = &[
     "OutputDir",
     "TimeMax",
     "MaxSizeTimestep",
+    "MinSizeTimestep",
     "BoxSize",
     "TimeBetSnapshot",
     "DesNumNgb",
@@ -37,6 +38,7 @@ pub struct SoundwaveParameters {
     pub output_dir: String,
     pub time_max: f64,
     pub max_timestep: f64,
+    pub min_timestep: Option<f64>,
     pub box_size: f64,
     pub time_between_snapshots: f64,
     pub desired_num_neighbors: f64,
@@ -136,6 +138,10 @@ impl SoundwaveParameters {
                 "MaxSizeTimestep",
                 (1.0e-3 * time_max).min(1.0e-2 * time_between_snapshots),
             )?,
+            min_timestep: entries
+                .get("MinSizeTimestep")
+                .map(|entry| parse_f64(entry, "MinSizeTimestep"))
+                .transpose()?,
             box_size,
             time_between_snapshots,
             desired_num_neighbors,
@@ -178,6 +184,16 @@ impl SoundwaveParameters {
     fn validate(&self, entries: &BTreeMap<String, Entry>) -> Result<(), ParameterError> {
         positive(entries, "TimeMax", self.time_max)?;
         positive(entries, "MaxSizeTimestep", self.max_timestep)?;
+        if let Some(min_timestep) = self.min_timestep {
+            positive(entries, "MinSizeTimestep", min_timestep)?;
+            if min_timestep > self.max_timestep {
+                return Err(invalid_value(
+                    entries,
+                    "MinSizeTimestep",
+                    "must not exceed MaxSizeTimestep",
+                ));
+            }
+        }
         positive(entries, "BoxSize", self.box_size)?;
         positive(entries, "TimeBetSnapshot", self.time_between_snapshots)?;
         positive(entries, "DesNumNgb", self.desired_num_neighbors)?;
@@ -511,6 +527,8 @@ DesNumNgb 4
 ";
 
     const PINNED: &str = include_str!("../../../../validation/oracles/soundwave/legacy.params");
+    const INTERACTBLAST: &str =
+        include_str!("../../../../validation/oracles/interactblast/legacy.params");
     const UPSTREAM_PUBLIC: &str =
         include_str!("../../../../scripts/test_problems/soundwave.params");
 
@@ -521,6 +539,7 @@ DesNumNgb 4
         assert_eq!(parameters.output_dir, "output");
         assert_float_eq(parameters.time_max, 1.5);
         assert_float_eq(parameters.max_timestep, 0.001);
+        assert_eq!(parameters.min_timestep, None);
         assert_float_eq(parameters.box_size, 1.0);
         assert_float_eq(parameters.time_between_snapshots, 0.1);
         assert_float_eq(parameters.desired_num_neighbors, 4.0);
@@ -529,6 +548,26 @@ DesNumNgb 4
         assert_eq!(parameters.max_memory_mb, Some(1024));
         assert!(!parameters.resubmit);
         assert_eq!(parameters.resubmit_command, "none");
+    }
+
+    #[test]
+    fn parses_the_fixed_timestep_interacting_blast_parameters() {
+        let retained = INTERACTBLAST
+            .lines()
+            .filter(|line| {
+                !matches!(
+                    line.split_whitespace().next(),
+                    Some("TimeBegin" | "ICFormat" | "SnapFormat" | "BufferSize")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parameters = SoundwaveParameters::parse(&retained).unwrap();
+        assert_float_eq(parameters.time_max, 0.038);
+        assert_float_eq(parameters.max_timestep, 2.0e-7);
+        assert_eq!(parameters.min_timestep, Some(2.0e-7));
+        assert_float_eq(parameters.box_size, 1.0);
+        assert_float_eq(parameters.courant_factor, 0.01);
     }
 
     #[test]

@@ -27,10 +27,18 @@ hosted `soundwave_ics.hdf5` has mean pressure `4/15`, sound speed `2/3`, and a
 For `shocktube`, please include the actual `Config.sh` and resolved parameters
 used to produce the published comparison. The checked-in parameter file omits
 tags required by a strict developer-mode run. Please also provide a known-good
-reference run for `shocktube_ics_diffmass.hdf5`: the current public source and
-hosted IC deterministically exhaust the force-tree top-node allocation during
-restart-0 under the otherwise equivalent one-rank profile, while the equal-mass
-IC completes.
+reference run for `shocktube_ics_diffmass.hdf5`. The public source required a
+correction to the force-tree node-capacity guard before that hosted IC could
+complete under the otherwise equivalent one-rank profile.
+
+For `interactblast`, please clarify the particle count and acceptance
+criterion. The prose says 400 evenly spaced, equal-mass particles; the hosted
+`interactblast_ics.hdf5` contains 512 particles and has adjusted edge masses
+and smoothing lengths. Please provide the exact configuration and compiler
+profile used for the published result, plus the quantitative norm and
+tolerance applied to `interactblast_exact.txt`. A known-good reduced snapshot
+at `t=0.038` would also disambiguate reflective-wall and output-phase
+semantics.
 
 The most useful delivery is a versioned archive or repository containing the
 generators, configs, analyzers, thresholds, and a checksum manifest. Large raw

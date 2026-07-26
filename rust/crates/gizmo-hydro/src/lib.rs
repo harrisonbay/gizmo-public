@@ -51,6 +51,52 @@ pub fn cubic_kernel_1d(radius: f64, hsml: f64) -> Result<KernelValue, HydroError
     Ok(result)
 }
 
+/// Boundary topology used by the one-dimensional hydro operators.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BoundaryMode1d {
+    #[default]
+    Periodic,
+    Reflective,
+}
+
+/// Signed displacement `a - b` for the selected boundary topology.
+///
+/// # Errors
+///
+/// Returns an error for non-finite, out-of-domain, or invalid-box inputs.
+pub fn displacement_1d(
+    a: f64,
+    b: f64,
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<f64, HydroError> {
+    let upper_inclusive = boundary == BoundaryMode1d::Reflective;
+    if !a.is_finite()
+        || !b.is_finite()
+        || !box_size.is_finite()
+        || box_size <= 0.0
+        || a < 0.0
+        || b < 0.0
+        || if upper_inclusive {
+            a > box_size || b > box_size
+        } else {
+            a >= box_size || b >= box_size
+        }
+    {
+        return Err(HydroError::InvalidPeriodicInput { a, b, box_size });
+    }
+    let mut displacement = a - b;
+    if boundary == BoundaryMode1d::Periodic {
+        if displacement > 0.5 * box_size {
+            displacement -= box_size;
+        }
+        if displacement < -0.5 * box_size {
+            displacement += box_size;
+        }
+    }
+    Ok(displacement)
+}
+
 /// Signed legacy periodic displacement `a - b` in a one-dimensional box.
 ///
 /// Positions must already be wrapped into `[0, box_size)`. Exactly half-box
@@ -61,25 +107,7 @@ pub fn cubic_kernel_1d(radius: f64, hsml: f64) -> Result<KernelValue, HydroError
 /// Returns an error unless both positions are wrapped and finite and
 /// `box_size` is finite and positive.
 pub fn periodic_displacement_1d(a: f64, b: f64, box_size: f64) -> Result<f64, HydroError> {
-    if !a.is_finite()
-        || !b.is_finite()
-        || !box_size.is_finite()
-        || box_size <= 0.0
-        || a < 0.0
-        || a >= box_size
-        || b < 0.0
-        || b >= box_size
-    {
-        return Err(HydroError::InvalidPeriodicInput { a, b, box_size });
-    }
-    let mut displacement = a - b;
-    if displacement > 0.5 * box_size {
-        displacement -= box_size;
-    }
-    if displacement < -0.5 * box_size {
-        displacement += box_size;
-    }
-    Ok(displacement)
+    displacement_1d(a, b, box_size, BoundaryMode1d::Periodic)
 }
 
 /// Reusable exact spatial index for periodic target-kernel queries.
@@ -87,13 +115,14 @@ pub fn periodic_displacement_1d(a: f64, b: f64, box_size: f64) -> Result<f64, Hy
 /// Query results are sorted by original particle index, not position. Every
 /// kernel accumulator therefore retains the arithmetic order of the legacy
 /// all-particles scan while omitting compact-support zeroes.
-struct PeriodicNeighborIndex1d {
+struct NeighborIndex1d {
     sorted: Vec<(f64, usize)>,
     box_size: f64,
+    boundary: BoundaryMode1d,
 }
 
-impl PeriodicNeighborIndex1d {
-    fn new(positions: &[f64], box_size: f64) -> Self {
+impl NeighborIndex1d {
+    fn new(positions: &[f64], box_size: f64, boundary: BoundaryMode1d) -> Self {
         let mut sorted: Vec<(f64, usize)> = positions
             .iter()
             .copied()
@@ -105,12 +134,23 @@ impl PeriodicNeighborIndex1d {
                 .total_cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
         });
-        Self { sorted, box_size }
+        Self {
+            sorted,
+            box_size,
+            boundary,
+        }
     }
 
     fn query(&self, position: f64, support: f64, output: &mut Vec<usize>) {
         output.clear();
-        if support >= 0.5 * self.box_size {
+        if self.boundary == BoundaryMode1d::Reflective {
+            append_sorted_position_range(
+                &self.sorted,
+                (position - support).max(0.0),
+                (position + support).min(self.box_size),
+                output,
+            );
+        } else if support >= 0.5 * self.box_size {
             output.extend(0..self.sorted.len());
         } else {
             let lower = position - support;
@@ -146,12 +186,13 @@ impl PeriodicNeighborIndex1d {
 /// This costs `O(N log N + sum(k_i log k_i) + P log P)`, where `k_i` is the
 /// number of particles inside `H_i` and `P` is the interacting-pair count,
 /// instead of `O(N²)` for locally bounded support.
-fn interacting_pairs_periodic_1d(
+fn interacting_pairs_1d(
     positions: &[f64],
     smoothing_lengths: &[f64],
     box_size: f64,
+    boundary: BoundaryMode1d,
 ) -> Result<Vec<(usize, usize, f64)>, HydroError> {
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut pair_indices = Vec::new();
     let mut candidates = Vec::new();
     for (source, (&position, &support)) in positions.iter().zip(smoothing_lengths).enumerate() {
@@ -160,7 +201,8 @@ fn interacting_pairs_periodic_1d(
             if neighbor == source {
                 continue;
             }
-            let distance = periodic_displacement_1d(position, positions[neighbor], box_size)?.abs();
+            let distance =
+                displacement_1d(position, positions[neighbor], box_size, boundary)?.abs();
             if distance > 0.0 && distance < support {
                 pair_indices.push(if source < neighbor {
                     (source, neighbor)
@@ -175,10 +217,24 @@ fn interacting_pairs_periodic_1d(
     pair_indices
         .into_iter()
         .map(|(i, j)| {
-            periodic_displacement_1d(positions[i], positions[j], box_size)
+            displacement_1d(positions[i], positions[j], box_size, boundary)
                 .map(|displacement| (i, j, displacement))
         })
         .collect()
+}
+
+#[cfg(test)]
+fn interacting_pairs_periodic_1d(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<Vec<(usize, usize, f64)>, HydroError> {
+    interacting_pairs_1d(
+        positions,
+        smoothing_lengths,
+        box_size,
+        BoundaryMode1d::Periodic,
+    )
 }
 
 fn append_sorted_position_range(
@@ -209,8 +265,35 @@ pub fn density_at_hsml_1d(
     smoothing_lengths: &[f64],
     box_size: f64,
 ) -> Result<Vec<DensityEstimate>, HydroError> {
-    validate_particle_columns(positions, masses, smoothing_lengths, box_size)?;
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    density_at_hsml_1d_with_boundary(
+        positions,
+        masses,
+        smoothing_lengths,
+        box_size,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware density evaluation.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`density_at_hsml_1d`].
+pub fn density_at_hsml_1d_with_boundary(
+    positions: &[f64],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<DensityEstimate>, HydroError> {
+    validate_particle_columns_with_boundary(
+        positions,
+        masses,
+        smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut output = Vec::with_capacity(positions.len());
     for (index, &hsml) in smoothing_lengths.iter().enumerate() {
         output.push(estimate_particle(
@@ -243,7 +326,36 @@ pub fn particle_divergence_at_hsml_1d(
     smoothing_lengths: &[f64],
     box_size: f64,
 ) -> Result<Vec<f64>, HydroError> {
-    validate_particle_columns(positions, masses, smoothing_lengths, box_size)?;
+    particle_divergence_at_hsml_1d_with_boundary(
+        positions,
+        velocities,
+        masses,
+        smoothing_lengths,
+        box_size,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware particle-divergence evaluation.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`particle_divergence_at_hsml_1d`].
+pub fn particle_divergence_at_hsml_1d_with_boundary(
+    positions: &[f64],
+    velocities: &[f64],
+    masses: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<f64>, HydroError> {
+    validate_particle_columns_with_boundary(
+        positions,
+        masses,
+        smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
     if velocities.len() != positions.len() {
         return Err(HydroError::MismatchedLength {
             field: "velocities",
@@ -261,8 +373,9 @@ pub fn particle_divergence_at_hsml_1d(
         }
     }
 
-    let density = density_at_hsml_1d(positions, masses, smoothing_lengths, box_size)?;
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let density =
+        density_at_hsml_1d_with_boundary(positions, masses, smoothing_lengths, box_size, boundary)?;
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, ((&position, &velocity), &hsml)) in positions
@@ -277,7 +390,7 @@ pub fn particle_divergence_at_hsml_1d(
         for &neighbor in &neighbors {
             let neighbor_position = positions[neighbor];
             let neighbor_velocity = velocities[neighbor];
-            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let displacement = displacement_1d(position, neighbor_position, box_size, boundary)?;
             let distance = displacement.abs();
             let kernel = cubic_kernel_1d(distance, hsml)?;
             kernel_sum += kernel.weight;
@@ -323,7 +436,39 @@ pub fn solve_smoothing_lengths_1d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
-    validate_particle_columns(positions, masses, initial_smoothing_lengths, box_size)?;
+    solve_smoothing_lengths_1d_with_boundary(
+        positions,
+        masses,
+        initial_smoothing_lengths,
+        box_size,
+        desired_neighbors,
+        tolerance,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Boundary-aware adaptive smoothing-length solve.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`solve_smoothing_lengths_1d`].
+pub fn solve_smoothing_lengths_1d_with_boundary(
+    positions: &[f64],
+    masses: &[f64],
+    initial_smoothing_lengths: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
+    validate_particle_columns_with_boundary(
+        positions,
+        masses,
+        initial_smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
     if !desired_neighbors.is_finite()
         || desired_neighbors <= 0.0
         || !tolerance.is_finite()
@@ -336,7 +481,7 @@ pub fn solve_smoothing_lengths_1d(
         });
     }
 
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut output = Vec::with_capacity(positions.len());
     for (index, &initial_hsml) in initial_smoothing_lengths.iter().enumerate() {
         let mut hsml = initial_hsml;
@@ -410,6 +555,27 @@ pub fn public_c_tree_smoothing_length_seeds_1d(
     box_size: f64,
     desired_neighbors: f64,
 ) -> Result<Vec<f64>, HydroError> {
+    public_c_tree_smoothing_length_seeds_1d_with_boundary(
+        positions,
+        masses,
+        box_size,
+        desired_neighbors,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware public-C tree seed construction.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`public_c_tree_smoothing_length_seeds_1d`].
+pub fn public_c_tree_smoothing_length_seeds_1d_with_boundary(
+    positions: &[f64],
+    masses: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<f64>, HydroError> {
     const TREE_BITS: u32 = 42;
 
     if positions.len() != masses.len() {
@@ -432,7 +598,13 @@ pub fn public_c_tree_smoothing_length_seeds_1d(
         for (field, value, positive) in [("position", position, false), ("mass", mass, true)] {
             if !value.is_finite()
                 || (positive && value <= 0.0)
-                || (field == "position" && (value < 0.0 || value >= box_size))
+                || (field == "position"
+                    && (value < 0.0
+                        || if boundary == BoundaryMode1d::Reflective {
+                            value > box_size
+                        } else {
+                            value >= box_size
+                        }))
             {
                 return Err(HydroError::InvalidParticle {
                     index,
@@ -522,21 +694,51 @@ pub fn solve_public_c_initial_smoothing_lengths_1d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
-    let mut seeds =
-        public_c_tree_smoothing_length_seeds_1d(positions, masses, box_size, desired_neighbors)?;
+    solve_public_c_initial_smoothing_lengths_1d_with_boundary(
+        positions,
+        masses,
+        box_size,
+        desired_neighbors,
+        tolerance,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware public-C initial smoothing-length solve.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as
+/// [`solve_public_c_initial_smoothing_lengths_1d`].
+pub fn solve_public_c_initial_smoothing_lengths_1d_with_boundary(
+    positions: &[f64],
+    masses: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
+    let mut seeds = public_c_tree_smoothing_length_seeds_1d_with_boundary(
+        positions,
+        masses,
+        box_size,
+        desired_neighbors,
+        boundary,
+    )?;
     let mut solved = Vec::new();
     // Restart-0 evaluates density once inside `setup_smoothinglengths()`, once
     // again while completing `init()`, and once in the initial force
     // evaluation before the visible t=0 drift snapshot. Each call resets its
     // brackets but retains the previously accepted Hsml.
     for _ in 0..3 {
-        solved = solve_public_c_smoothing_lengths_from_seeds_1d(
+        solved = solve_public_c_smoothing_lengths_from_seeds_1d_with_boundary(
             positions,
             masses,
             &seeds,
             box_size,
             desired_neighbors,
             tolerance,
+            boundary,
         )?;
         seeds = solved
             .iter()
@@ -564,14 +766,41 @@ pub fn solve_public_c_smoothing_lengths_from_seeds_1d(
     desired_neighbors: f64,
     tolerance: f64,
 ) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
-    validate_particle_columns(positions, masses, seeds, box_size)?;
+    solve_public_c_smoothing_lengths_from_seeds_1d_with_boundary(
+        positions,
+        masses,
+        seeds,
+        box_size,
+        desired_neighbors,
+        tolerance,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Boundary-aware public-C smoothing-length pass.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as
+/// [`solve_public_c_smoothing_lengths_from_seeds_1d`].
+pub fn solve_public_c_smoothing_lengths_from_seeds_1d_with_boundary(
+    positions: &[f64],
+    masses: &[f64],
+    seeds: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
+    validate_particle_columns_with_boundary(positions, masses, seeds, box_size, boundary)?;
     if !tolerance.is_finite() || tolerance <= 0.0 || tolerance >= desired_neighbors {
         return Err(HydroError::InvalidNeighborConstraint {
             desired: desired_neighbors,
             tolerance,
         });
     }
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     seeds
         .iter()
         .copied()
@@ -600,7 +829,7 @@ fn solve_public_c_particle_from_seed(
     desired_neighbors: f64,
     base_tolerance: f64,
     seed: f64,
-    neighbor_index: &PeriodicNeighborIndex1d,
+    neighbor_index: &NeighborIndex1d,
 ) -> Result<AdaptiveDensityEstimate, HydroError> {
     let mut hsml = seed;
     let mut lower = 0.0_f64;
@@ -687,7 +916,7 @@ fn estimate_public_c_density_geometry(
     masses: &[f64],
     hsml: f64,
     box_size: f64,
-    neighbor_index: &PeriodicNeighborIndex1d,
+    neighbor_index: &NeighborIndex1d,
 ) -> Result<PublicCDensityGeometry, HydroError> {
     let position = positions[index];
     let mut kernel_sum = 0.0;
@@ -697,7 +926,12 @@ fn estimate_public_c_density_geometry(
     let mut neighbors = Vec::new();
     neighbor_index.query(position, hsml, &mut neighbors);
     for neighbor in neighbors {
-        let displacement = periodic_displacement_1d(position, positions[neighbor], box_size)?;
+        let displacement = displacement_1d(
+            position,
+            positions[neighbor],
+            box_size,
+            neighbor_index.boundary,
+        )?;
         let radius = displacement.abs();
         let kernel = cubic_kernel_1d(radius, hsml)?;
         kernel_sum += kernel.weight;
@@ -846,9 +1080,34 @@ pub fn inverse_moments_1d(
     smoothing_lengths: &[f64],
     box_size: f64,
 ) -> Result<Vec<f64>, HydroError> {
+    inverse_moments_1d_with_boundary(
+        positions,
+        smoothing_lengths,
+        box_size,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware inverse-moment construction.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`inverse_moments_1d`].
+pub fn inverse_moments_1d_with_boundary(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<f64>, HydroError> {
     let unit_masses = vec![1.0; positions.len()];
-    validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    validate_particle_columns_with_boundary(
+        positions,
+        &unit_masses,
+        smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
@@ -856,7 +1115,7 @@ pub fn inverse_moments_1d(
         neighbor_index.query(position, hsml, &mut neighbors);
         for &neighbor in &neighbors {
             let neighbor_position = positions[neighbor];
-            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let displacement = displacement_1d(position, neighbor_position, box_size, boundary)?;
             let distance = displacement.abs();
             if distance <= 0.0 || distance >= hsml {
                 continue;
@@ -893,10 +1152,36 @@ pub fn face_closure_errors_1d(
     smoothing_lengths: &[f64],
     box_size: f64,
 ) -> Result<Vec<f64>, HydroError> {
+    face_closure_errors_1d_with_boundary(
+        positions,
+        smoothing_lengths,
+        box_size,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+/// Boundary-aware face-closure diagnostics.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`face_closure_errors_1d`].
+pub fn face_closure_errors_1d_with_boundary(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<f64>, HydroError> {
     let unit_masses = vec![1.0; positions.len()];
-    validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
-    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
-    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    validate_particle_columns_with_boundary(
+        positions,
+        &unit_masses,
+        smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
+    let inverse_moments =
+        inverse_moments_1d_with_boundary(positions, smoothing_lengths, box_size, boundary)?;
+    let neighbor_index = NeighborIndex1d::new(positions, box_size, boundary);
     let mut neighbors = Vec::new();
     let mut output = Vec::with_capacity(positions.len());
     for (index, (&position, &hsml)) in positions.iter().zip(smoothing_lengths).enumerate() {
@@ -905,7 +1190,7 @@ pub fn face_closure_errors_1d(
         neighbor_index.query(position, hsml, &mut neighbors);
         for &neighbor in &neighbors {
             let neighbor_position = positions[neighbor];
-            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let displacement = displacement_1d(position, neighbor_position, box_size, boundary)?;
             let kernel = cubic_kernel_1d(displacement.abs(), hsml)?;
             kernel_sum += kernel.weight;
             if !legacy_float_equal(displacement, 0.0) {
@@ -947,8 +1232,40 @@ pub fn gradients_at_hsml_1d(
     shoot_tolerance: f64,
     positivity_preserving: bool,
 ) -> Result<Vec<GradientEstimate>, HydroError> {
+    gradients_at_hsml_1d_with_boundary(
+        positions,
+        values,
+        smoothing_lengths,
+        box_size,
+        shoot_tolerance,
+        positivity_preserving,
+        BoundaryMode1d::Periodic,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Boundary-aware MLS gradient construction.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`gradients_at_hsml_1d`].
+pub fn gradients_at_hsml_1d_with_boundary(
+    positions: &[f64],
+    values: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+    shoot_tolerance: f64,
+    positivity_preserving: bool,
+    boundary: BoundaryMode1d,
+) -> Result<Vec<GradientEstimate>, HydroError> {
     let unit_masses = vec![1.0; positions.len()];
-    validate_particle_columns(positions, &unit_masses, smoothing_lengths, box_size)?;
+    validate_particle_columns_with_boundary(
+        positions,
+        &unit_masses,
+        smoothing_lengths,
+        box_size,
+        boundary,
+    )?;
     if values.len() != positions.len() {
         return Err(HydroError::MismatchedLength {
             field: "gradient_values",
@@ -968,9 +1285,10 @@ pub fn gradients_at_hsml_1d(
     if !shoot_tolerance.is_finite() || shoot_tolerance < 0.0 {
         return Err(HydroError::InvalidGradientTolerance(shoot_tolerance));
     }
-    let inverse_moments = inverse_moments_1d(positions, smoothing_lengths, box_size)?;
+    let inverse_moments =
+        inverse_moments_1d_with_boundary(positions, smoothing_lengths, box_size, boundary)?;
     let mut neighbor_lists = vec![Vec::new(); positions.len()];
-    for (i, j, _) in interacting_pairs_periodic_1d(positions, smoothing_lengths, box_size)? {
+    for (i, j, _) in interacting_pairs_1d(positions, smoothing_lengths, box_size, boundary)? {
         neighbor_lists[i].push(j);
         neighbor_lists[j].push(i);
     }
@@ -992,7 +1310,7 @@ pub fn gradients_at_hsml_1d(
         for &neighbor in &neighbor_lists[index] {
             let neighbor_position = positions[neighbor];
             let neighbor_value = values[neighbor];
-            let displacement = periodic_displacement_1d(position, neighbor_position, box_size)?;
+            let displacement = displacement_1d(position, neighbor_position, box_size, boundary)?;
             let distance = displacement.abs();
             let delta = neighbor_value - center;
             minimum_delta = minimum_delta.min(delta);
@@ -1063,9 +1381,23 @@ pub fn meshless_face_geometry_1d(
     j: MeshlessPoint1d,
     box_size: f64,
 ) -> Result<MeshlessFace1d, HydroError> {
-    validate_meshless_point("i", i, box_size)?;
-    validate_meshless_point("j", j, box_size)?;
-    let displacement = periodic_displacement_1d(i.position, j.position, box_size)?;
+    meshless_face_geometry_1d_with_boundary(i, j, box_size, BoundaryMode1d::Periodic)
+}
+
+/// Boundary-aware meshless face construction.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`meshless_face_geometry_1d`].
+pub fn meshless_face_geometry_1d_with_boundary(
+    i: MeshlessPoint1d,
+    j: MeshlessPoint1d,
+    box_size: f64,
+    boundary: BoundaryMode1d,
+) -> Result<MeshlessFace1d, HydroError> {
+    validate_meshless_point("i", i, box_size, boundary)?;
+    validate_meshless_point("j", j, box_size, boundary)?;
+    let displacement = displacement_1d(i.position, j.position, box_size, boundary)?;
     let distance = displacement.abs();
     if distance <= 0.0 || (distance >= i.smoothing_length && distance >= j.smoothing_length) {
         return Err(HydroError::InvalidFacePair {
@@ -1678,6 +2010,19 @@ pub fn apply_entropic_pdv_1d(
 /// geometry, reconstruction failure, or a non-finite rate.
 #[allow(clippy::too_many_lines)]
 pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroError> {
+    mfm_spatial_rates_1d_with_boundary(state, BoundaryMode1d::Periodic)
+}
+
+#[allow(clippy::too_many_lines)]
+/// Boundary-aware semidiscrete MFM hydro operator.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`mfm_spatial_rates_1d`].
+pub fn mfm_spatial_rates_1d_with_boundary(
+    state: MfmState1d<'_>,
+    boundary: BoundaryMode1d,
+) -> Result<MfmRates1d, HydroError> {
     let particle_count = state.positions.len();
     for (field, actual) in [
         ("masses", state.masses.len()),
@@ -1696,11 +2041,12 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
             });
         }
     }
-    validate_particle_columns(
+    validate_particle_columns_with_boundary(
         state.positions,
         state.masses,
         state.smoothing_lengths,
         state.box_size,
+        boundary,
     )?;
     if !state.gamma.is_finite() || state.gamma <= 1.0 {
         return Err(HydroError::InvalidRiemannParameter {
@@ -1730,11 +2076,12 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         }
     }
 
-    let density = density_at_hsml_1d(
+    let density = density_at_hsml_1d_with_boundary(
         state.positions,
         state.masses,
         state.smoothing_lengths,
         state.box_size,
+        boundary,
     )?;
     let density_values: Vec<f64> = density.iter().map(|value| value.density).collect();
     let pressure: Vec<f64> = density_values
@@ -1742,40 +2089,52 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         .zip(state.specific_internal_energy)
         .map(|(&rho, &internal_energy)| (state.gamma - 1.0) * rho * internal_energy)
         .collect();
-    let density_gradients = gradients_at_hsml_1d(
+    let density_gradients = gradients_at_hsml_1d_with_boundary(
         state.positions,
         &density_values,
         state.smoothing_lengths,
         state.box_size,
         0.0,
         true,
+        boundary,
     )?;
-    let velocity_gradients = gradients_at_hsml_1d(
+    let velocity_gradients = gradients_at_hsml_1d_with_boundary(
         state.positions,
         state.velocities,
         state.smoothing_lengths,
         state.box_size,
         0.1,
         false,
+        boundary,
     )?;
-    let pressure_gradients = gradients_at_hsml_1d(
+    let pressure_gradients = gradients_at_hsml_1d_with_boundary(
         state.positions,
         &pressure,
         state.smoothing_lengths,
         state.box_size,
         0.1,
         true,
+        boundary,
     )?;
-    let inverse_moments =
-        inverse_moments_1d(state.positions, state.smoothing_lengths, state.box_size)?;
-    let closure_errors =
-        face_closure_errors_1d(state.positions, state.smoothing_lengths, state.box_size)?;
-    let particle_divergence = particle_divergence_at_hsml_1d(
+    let inverse_moments = inverse_moments_1d_with_boundary(
+        state.positions,
+        state.smoothing_lengths,
+        state.box_size,
+        boundary,
+    )?;
+    let closure_errors = face_closure_errors_1d_with_boundary(
+        state.positions,
+        state.smoothing_lengths,
+        state.box_size,
+        boundary,
+    )?;
+    let particle_divergence = particle_divergence_at_hsml_1d_with_boundary(
         state.positions,
         state.velocities,
         state.masses,
         state.smoothing_lengths,
         state.box_size,
+        boundary,
     )?;
 
     let mut momentum = vec![0.0; particle_count];
@@ -1787,9 +2146,12 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         .zip(&density_values)
         .map(|(&particle_pressure, &rho)| (state.gamma * particle_pressure / rho).sqrt())
         .collect();
-    for (i, j, displacement) in
-        interacting_pairs_periodic_1d(state.positions, state.smoothing_lengths, state.box_size)?
-    {
+    for (i, j, displacement) in interacting_pairs_1d(
+        state.positions,
+        state.smoothing_lengths,
+        state.box_size,
+        boundary,
+    )? {
         let distance = displacement.abs();
         let point_geometry = |index: usize| MeshlessPoint1d {
             position: state.positions[index],
@@ -1798,7 +2160,12 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
             smoothing_length: state.smoothing_lengths[index],
             inverse_moment: inverse_moments[index],
         };
-        let face = meshless_face_geometry_1d(point_geometry(i), point_geometry(j), state.box_size)?;
+        let face = meshless_face_geometry_1d_with_boundary(
+            point_geometry(i),
+            point_geometry(j),
+            state.box_size,
+            boundary,
+        )?;
         let reconstructed = |index: usize| ReconstructedPoint1d {
             primitive: PrimitiveState1d {
                 density: density_values[index],
@@ -2338,6 +2705,8 @@ pub struct MfmKdkStep1d {
     elapsed: f64,
     timestep: f64,
     minimum_specific_internal_energy: f64,
+    boundary: BoundaryMode1d,
+    reflective_wall_offsets: Option<Vec<f64>>,
 }
 
 impl MfmKdkStep1d {
@@ -2368,11 +2737,45 @@ impl MfmKdkStep1d {
         let mut predicted_specific_internal_energy = Vec::with_capacity(particle_count);
         let mut predicted_density = Vec::with_capacity(particle_count);
         let mut predicted_smoothing_lengths = Vec::with_capacity(particle_count);
+        let mut half_velocity = self.half_velocity.clone();
+        let mut acceleration = self.acceleration.clone();
         for index in 0..particle_count {
-            let position = (self.drift.positions[index] + segment * self.half_velocity[index])
-                .rem_euclid(self.start.box_size);
-            let predicted_velocity =
-                self.drift.predicted_velocities[index] + segment * self.acceleration[index];
+            let crossed_position = self.drift.positions[index] + segment * half_velocity[index];
+            let mut position = match self.boundary {
+                BoundaryMode1d::Periodic => crossed_position.rem_euclid(self.start.box_size),
+                BoundaryMode1d::Reflective => crossed_position.clamp(0.0, self.start.box_size),
+            };
+            let mut predicted_velocity =
+                self.drift.predicted_velocities[index] + segment * acceleration[index];
+            if self.boundary == BoundaryMode1d::Reflective {
+                let Some(offset) = self
+                    .reflective_wall_offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.get(index))
+                    .copied()
+                else {
+                    return Err(HydroError::InvalidParticle {
+                        index,
+                        field: "reflective_wall_offset",
+                        value: f64::NAN,
+                    });
+                };
+                if crossed_position <= 0.0 {
+                    if half_velocity[index] < 0.0 {
+                        half_velocity[index] = -half_velocity[index];
+                        predicted_velocity = half_velocity[index];
+                        acceleration[index] = 0.0;
+                    }
+                    position = (0.1 * crossed_position).max(offset * self.start.box_size);
+                } else if crossed_position >= self.start.box_size {
+                    if half_velocity[index] > 0.0 {
+                        half_velocity[index] = -half_velocity[index];
+                        predicted_velocity = half_velocity[index];
+                        acceleration[index] = 0.0;
+                    }
+                    position = self.start.box_size * (1.0 - offset);
+                }
+            }
             let predicted_internal_energy = limited_internal_energy_update(
                 self.drift.predicted_specific_internal_energy[index],
                 self.specific_internal_energy_rate[index],
@@ -2403,12 +2806,14 @@ impl MfmKdkStep1d {
         }
         let drift = MfmDriftState1d {
             positions,
-            conserved_velocities: self.half_velocity.clone(),
+            conserved_velocities: half_velocity.clone(),
             predicted_velocities,
             predicted_specific_internal_energy,
             predicted_density,
             predicted_smoothing_lengths,
         };
+        self.half_velocity = half_velocity;
+        self.acceleration = acceleration;
         self.drift = drift.clone();
         self.elapsed = elapsed;
         Ok(drift)
@@ -2437,9 +2842,73 @@ pub fn begin_mfm_kdk_1d(
     timestep: f64,
     minimum_specific_internal_energy: f64,
 ) -> Result<MfmKdkStep1d, HydroError> {
+    begin_mfm_kdk_1d_with_boundary_data(
+        state,
+        old_rates,
+        timestep,
+        minimum_specific_internal_energy,
+        BoundaryMode1d::Periodic,
+        None,
+    )
+}
+
+/// Prepare a reflective public-C KDK step using explicit particle IDs.
+///
+/// The IDs are required because the legacy wall nudge is `ID * 2e-8` of the
+/// box length. This API fails closed instead of inferring IDs from row order.
+///
+/// # Errors
+///
+/// Returns an error for invalid state/rates, mismatched or invalid IDs, or
+/// invalid timestep and energy-floor inputs.
+pub fn begin_mfm_reflective_kdk_1d(
+    state: &MfmEvolvingState1d,
+    old_rates: &MfmRates1d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    particle_ids: &[u64],
+) -> Result<MfmKdkStep1d, HydroError> {
+    if particle_ids.len() != state.positions.len() {
+        return Err(HydroError::MismatchedLength {
+            field: "particle_ids",
+            expected: state.positions.len(),
+            actual: particle_ids.len(),
+        });
+    }
+    let mut offsets = Vec::with_capacity(particle_ids.len());
+    for (index, &id) in particle_ids.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let offset = id as f64 * 2.0e-8;
+        if id == 0 || !offset.is_finite() || offset >= 1.0 {
+            return Err(HydroError::InvalidParticle {
+                index,
+                field: "reflective_particle_id",
+                value: offset,
+            });
+        }
+        offsets.push(offset);
+    }
+    begin_mfm_kdk_1d_with_boundary_data(
+        state,
+        old_rates,
+        timestep,
+        minimum_specific_internal_energy,
+        BoundaryMode1d::Reflective,
+        Some(offsets),
+    )
+}
+
+fn begin_mfm_kdk_1d_with_boundary_data(
+    state: &MfmEvolvingState1d,
+    old_rates: &MfmRates1d,
+    timestep: f64,
+    minimum_specific_internal_energy: f64,
+    boundary: BoundaryMode1d,
+    reflective_wall_offsets: Option<Vec<f64>>,
+) -> Result<MfmKdkStep1d, HydroError> {
     let particle_count = state.positions.len();
     validate_rate_columns(old_rates, particle_count)?;
-    validate_evolving_state(state)?;
+    validate_evolving_state(state, boundary)?;
     if !timestep.is_finite() || timestep <= 0.0 {
         return Err(HydroError::InvalidRiemannParameter {
             field: "timestep",
@@ -2473,11 +2942,12 @@ pub fn begin_mfm_kdk_1d(
         half_velocity.push(velocity);
         half_internal_energy.push(internal_energy);
     }
-    let start_density = density_at_hsml_1d(
+    let start_density = density_at_hsml_1d_with_boundary(
         &state.positions,
         &state.masses,
         &state.smoothing_lengths,
         state.box_size,
+        boundary,
     )?
     .into_iter()
     .map(|estimate| estimate.density)
@@ -2501,6 +2971,8 @@ pub fn begin_mfm_kdk_1d(
         elapsed: 0.0,
         timestep,
         minimum_specific_internal_energy,
+        boundary,
+        reflective_wall_offsets,
     })
 }
 
@@ -2519,27 +2991,31 @@ pub fn finish_mfm_kdk_1d(
     neighbor_tolerance: f64,
 ) -> Result<(MfmEvolvingState1d, MfmRates1d), HydroError> {
     let endpoint = step.drift_state(step.timestep)?;
-    let solved = solve_public_c_smoothing_lengths_from_seeds_1d(
+    let solved = solve_public_c_smoothing_lengths_from_seeds_1d_with_boundary(
         &endpoint.positions,
         &step.start.masses,
         &endpoint.predicted_smoothing_lengths,
         step.start.box_size,
         desired_neighbors,
         neighbor_tolerance,
+        step.boundary,
     )?;
     let endpoint_smoothing_lengths: Vec<f64> = solved
         .iter()
         .map(|particle| particle.smoothing_length)
         .collect();
-    let new_rates = mfm_spatial_rates_1d(MfmState1d {
-        positions: &endpoint.positions,
-        masses: &step.start.masses,
-        velocities: &endpoint.predicted_velocities,
-        specific_internal_energy: &endpoint.predicted_specific_internal_energy,
-        smoothing_lengths: &endpoint_smoothing_lengths,
-        box_size: step.start.box_size,
-        gamma: step.start.gamma,
-    })?;
+    let new_rates = mfm_spatial_rates_1d_with_boundary(
+        MfmState1d {
+            positions: &endpoint.positions,
+            masses: &step.start.masses,
+            velocities: &endpoint.predicted_velocities,
+            specific_internal_energy: &endpoint.predicted_specific_internal_energy,
+            smoothing_lengths: &endpoint_smoothing_lengths,
+            box_size: step.start.box_size,
+            gamma: step.start.gamma,
+        },
+        step.boundary,
+    )?;
 
     let half_timestep = 0.5 * step.timestep;
     let mut endpoint_velocity = Vec::with_capacity(step.start.positions.len());
@@ -2602,6 +3078,34 @@ pub fn advance_mfm_kdk_1d(
     Ok(new_rates)
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Advance one synchronized reflective public-C KDK step.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as
+/// [`begin_mfm_reflective_kdk_1d`] or [`finish_mfm_kdk_1d`].
+pub fn advance_mfm_reflective_kdk_1d(
+    state: &mut MfmEvolvingState1d,
+    old_rates: &MfmRates1d,
+    timestep: f64,
+    desired_neighbors: f64,
+    neighbor_tolerance: f64,
+    minimum_specific_internal_energy: f64,
+    particle_ids: &[u64],
+) -> Result<MfmRates1d, HydroError> {
+    let step = begin_mfm_reflective_kdk_1d(
+        state,
+        old_rates,
+        timestep,
+        minimum_specific_internal_energy,
+        particle_ids,
+    )?;
+    let (endpoint, new_rates) = finish_mfm_kdk_1d(step, desired_neighbors, neighbor_tolerance)?;
+    *state = endpoint;
+    Ok(new_rates)
+}
+
 fn validate_rate_columns(rates: &MfmRates1d, expected: usize) -> Result<(), HydroError> {
     for (field, actual) in [
         ("momentum_rate", rates.momentum.len()),
@@ -2641,7 +3145,10 @@ fn validate_rate_columns(rates: &MfmRates1d, expected: usize) -> Result<(), Hydr
     Ok(())
 }
 
-fn validate_evolving_state(state: &MfmEvolvingState1d) -> Result<(), HydroError> {
+fn validate_evolving_state(
+    state: &MfmEvolvingState1d,
+    boundary: BoundaryMode1d,
+) -> Result<(), HydroError> {
     let view = state.as_view();
     let expected = view.positions.len();
     for (field, actual) in [
@@ -2661,11 +3168,12 @@ fn validate_evolving_state(state: &MfmEvolvingState1d) -> Result<(), HydroError>
             });
         }
     }
-    validate_particle_columns(
+    validate_particle_columns_with_boundary(
         view.positions,
         view.masses,
         view.smoothing_lengths,
         view.box_size,
+        boundary,
     )?;
     for (index, (&velocity, &internal_energy)) in view
         .velocities
@@ -3220,6 +3728,7 @@ fn validate_meshless_point(
     side: &'static str,
     point: MeshlessPoint1d,
     box_size: f64,
+    boundary: BoundaryMode1d,
 ) -> Result<(), HydroError> {
     for (field, value, positive) in [
         ("position", point.position, false),
@@ -3230,7 +3739,13 @@ fn validate_meshless_point(
     ] {
         if !value.is_finite()
             || (positive && value <= 0.0)
-            || (field == "position" && (value < 0.0 || value >= box_size))
+            || (field == "position"
+                && (value < 0.0
+                    || if boundary == BoundaryMode1d::Reflective {
+                        value > box_size
+                    } else {
+                        value >= box_size
+                    }))
         {
             return Err(HydroError::InvalidFaceInput { side, field, value });
         }
@@ -3238,11 +3753,12 @@ fn validate_meshless_point(
     Ok(())
 }
 
-fn validate_particle_columns(
+fn validate_particle_columns_with_boundary(
     positions: &[f64],
     masses: &[f64],
     smoothing_lengths: &[f64],
     box_size: f64,
+    boundary: BoundaryMode1d,
 ) -> Result<(), HydroError> {
     let count = positions.len();
     if masses.len() != count {
@@ -3275,7 +3791,13 @@ fn validate_particle_columns(
         ] {
             if !value.is_finite()
                 || (positive && value <= 0.0)
-                || (field == "position" && (value < 0.0 || value >= box_size))
+                || (field == "position"
+                    && (value < 0.0
+                        || if boundary == BoundaryMode1d::Reflective {
+                            value > box_size
+                        } else {
+                            value >= box_size
+                        }))
             {
                 return Err(HydroError::InvalidParticle {
                     index,
@@ -3294,7 +3816,7 @@ fn estimate_particle(
     masses: &[f64],
     hsml: f64,
     box_size: f64,
-    neighbor_index: &PeriodicNeighborIndex1d,
+    neighbor_index: &NeighborIndex1d,
 ) -> Result<DensityEstimate, HydroError> {
     let position = positions[index];
     let mut kernel_sum = 0.0;
@@ -3303,7 +3825,13 @@ fn estimate_particle(
     neighbor_index.query(position, hsml, &mut neighbors);
     for neighbor in neighbors {
         let neighbor_position = positions[neighbor];
-        let radius = periodic_displacement_1d(position, neighbor_position, box_size)?.abs();
+        let radius = displacement_1d(
+            position,
+            neighbor_position,
+            box_size,
+            neighbor_index.boundary,
+        )?
+        .abs();
         let kernel = cubic_kernel_1d(radius, hsml)?;
         kernel_sum += kernel.weight;
         if radius < hsml {
@@ -3784,6 +4312,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reflective_topology_does_not_interact_across_periodic_seam() {
+        let positions = [0.01, 0.99];
+        let masses = [1.0, 1.0];
+        let smoothing_lengths = [0.05, 0.05];
+        let periodic = density_at_hsml_1d(&positions, &masses, &smoothing_lengths, 1.0).unwrap();
+        let reflective = density_at_hsml_1d_with_boundary(
+            &positions,
+            &masses,
+            &smoothing_lengths,
+            1.0,
+            BoundaryMode1d::Reflective,
+        )
+        .unwrap();
+
+        assert!(periodic[0].density > reflective[0].density);
+        assert!(periodic[1].density > reflective[1].density);
+        assert_eq!(
+            interacting_pairs_1d(
+                &positions,
+                &smoothing_lengths,
+                1.0,
+                BoundaryMode1d::Reflective
+            )
+            .unwrap(),
+            Vec::new()
+        );
+        assert_close(
+            displacement_1d(0.99, 0.01, 1.0, BoundaryMode1d::Reflective).unwrap(),
+            0.98,
+        );
+    }
+
+    #[test]
+    fn reflective_kdk_applies_public_c_id_nudge_and_resets_predictor_acceleration() {
+        let state = MfmEvolvingState1d {
+            positions: vec![0.99],
+            masses: vec![1.0],
+            velocities: vec![1.0],
+            specific_internal_energy: vec![1.0],
+            smoothing_lengths: vec![0.2],
+            box_size: 1.0,
+            gamma: 5.0 / 3.0,
+        };
+        let rates = single_particle_rates(1.0, 0.4, 0.0);
+        let mut step = begin_mfm_reflective_kdk_1d(&state, &rates, 0.04, 0.0, &[7]).unwrap();
+
+        let reflected = step.drift_state(0.02).unwrap();
+        assert_close(reflected.positions[0], 1.0 - 7.0 * 2.0e-8);
+        assert_close(reflected.conserved_velocities[0], -1.008);
+        assert_close(reflected.predicted_velocities[0], -1.008);
+
+        let continued = step.drift_state(0.04).unwrap();
+        assert_close(continued.positions[0], 1.0 - 7.0 * 2.0e-8 - 0.02 * 1.008);
+        assert_close(continued.predicted_velocities[0], -1.008);
+        assert!(begin_mfm_reflective_kdk_1d(&state, &rates, 0.04, 0.0, &[0]).is_err());
+
+        let lower_state = MfmEvolvingState1d {
+            positions: vec![0.01],
+            velocities: vec![-1.0],
+            ..state
+        };
+        let zero_acceleration = single_particle_rates(1.0, 0.0, 0.0);
+        let mut lower =
+            begin_mfm_reflective_kdk_1d(&lower_state, &zero_acceleration, 0.02, 0.0, &[3]).unwrap();
+        let lower_reflected = lower.drift_state(0.02).unwrap();
+        assert_close(lower_reflected.positions[0], 3.0 * 2.0e-8);
+        assert_close(lower_reflected.conserved_velocities[0], 1.0);
+        assert_close(lower_reflected.predicted_velocities[0], 1.0);
+
+        let boundary_state = MfmEvolvingState1d {
+            positions: vec![0.0],
+            velocities: vec![1.0],
+            ..lower_state
+        };
+        let mut inward =
+            begin_mfm_reflective_kdk_1d(&boundary_state, &zero_acceleration, 0.02, 0.0, &[5])
+                .unwrap();
+        let nudged = inward.drift_state(0.0).unwrap();
+        assert_close(nudged.positions[0], 5.0 * 2.0e-8);
+        assert_close(nudged.conserved_velocities[0], 1.0);
+        assert_close(nudged.predicted_velocities[0], 1.0);
+    }
+
     fn brute_force_interacting_pairs(
         positions: &[f64],
         smoothing_lengths: &[f64],
@@ -3889,7 +4501,7 @@ mod tests {
         for _ in positions.len()..128 {
             positions.push(random_unit());
         }
-        let index = PeriodicNeighborIndex1d::new(&positions, box_size);
+        let index = NeighborIndex1d::new(&positions, box_size, BoundaryMode1d::Periodic);
         let mut actual = Vec::new();
         for source in 0..positions.len() {
             for support in [0.001, 0.017 + 0.08 * random_unit(), 0.5, 0.73] {
