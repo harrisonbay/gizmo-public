@@ -192,6 +192,8 @@ pub struct PublicMhdInitialHierarchy2d {
     half_cleaning: Vec<f64>,
     drift: PublicMhdDriftState2d,
     predictor_ticks: Vec<u64>,
+    primitive_cache: MhdPrimitiveColumns2d,
+    gradient_cache: MhdPrimitiveGradients2d,
     minimum_specific_internal_energy: f64,
 }
 
@@ -466,13 +468,13 @@ impl MhdMfmState2d {
     }
 }
 
-#[derive(Clone)]
-struct Gradients2d {
-    density: Vec<Vector2>,
-    pressure: Vec<Vector2>,
-    velocity: [Vec<Vector2>; 3],
-    magnetic: [Vec<Vector2>; 3],
-    cleaning: Vec<Vector2>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct MhdPrimitiveGradients2d {
+    pub density: Vec<Vector2>,
+    pub pressure: Vec<Vector2>,
+    pub velocity: [Vec<Vector2>; 3],
+    pub magnetic: [Vec<Vector2>; 3],
+    pub cleaning: Vec<Vector2>,
 }
 
 struct GradientLimiterGeometry2d {
@@ -1420,6 +1422,8 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
     }
 
     let primitive = state.primitive_columns()?;
+    let gradient_cache = primitive_gradients(state, &primitive, None)?;
+    let mut primitive_cache = primitive.clone();
     let count = state.positions.len();
     let mut effective_old_rates = old_rates.clone();
     let mut half_velocity = Vec::with_capacity(count);
@@ -1457,6 +1461,9 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
             predicted_cleaning[i] = 0.0;
         }
     }
+    for (i, &predicted) in predicted_cleaning.iter().enumerate() {
+        primitive_cache.cleaning_scalar[i] = predicted / state.masses[i];
+    }
     let drift = PublicMhdDriftState2d {
         positions: state.positions.clone(),
         actual_velocities: half_velocity,
@@ -1476,6 +1483,8 @@ pub fn begin_public_mhd_initial_hierarchy_2d(
         half_cleaning,
         drift,
         predictor_ticks: vec![0; count],
+        primitive_cache,
+        gradient_cache,
         minimum_specific_internal_energy,
     })
 }
@@ -1526,6 +1535,16 @@ impl PublicMhdInitialHierarchy2d {
     #[must_use]
     pub fn predictor_ticks(&self) -> &[u64] {
         &self.predictor_ticks
+    }
+
+    #[must_use]
+    pub fn predicted_primitive_cache(&self) -> &MhdPrimitiveColumns2d {
+        &self.primitive_cache
+    }
+
+    #[must_use]
+    pub fn retained_gradient_cache(&self) -> &MhdPrimitiveGradients2d {
+        &self.gradient_cache
     }
 
     #[must_use]
@@ -1585,6 +1604,14 @@ impl PublicMhdInitialHierarchy2d {
             self.old_rates.cleaning_damping_rate[i],
             segment,
         );
+        self.primitive_cache.density[i] = self.drift.predicted_density[i];
+        self.primitive_cache.pressure[i] = (self.start.gamma - 1.0)
+            * self.drift.predicted_density[i]
+            * self.drift.predicted_specific_internal_energy[i];
+        let volume = self.start.masses[i] / self.drift.predicted_density[i];
+        self.primitive_cache.magnetic[i] = self.drift.predicted_magnetic_volume[i] / volume;
+        self.primitive_cache.cleaning_scalar[i] =
+            self.drift.predicted_cleaning_mass[i] / self.start.masses[i];
         self.predictor_ticks[i] = target_tick;
         Ok(())
     }
@@ -2308,7 +2335,7 @@ fn primitive_gradients(
     state: &MhdMfmState2d,
     primitive: &MhdPrimitiveColumns2d,
     previous_stored_magnetic_divergence: Option<&[f64]>,
-) -> Result<Gradients2d, MhdEvolution2dError> {
+) -> Result<MhdPrimitiveGradients2d, MhdEvolution2dError> {
     let velocity = vector_columns(&state.velocities);
     let magnetic = vector_columns(&primitive.magnetic);
     let limiter = gradient_limiter_geometry(state)?;
@@ -2353,7 +2380,7 @@ fn primitive_gradients(
     let velocity_x = raw.pop().expect("nine gradient fields");
     let pressure = raw.pop().expect("nine gradient fields");
     let density = raw.pop().expect("nine gradient fields");
-    let gradients = Gradients2d {
+    let gradients = MhdPrimitiveGradients2d {
         density: limit_precomputed_gradient(
             state,
             &primitive.density,
@@ -2544,7 +2571,7 @@ fn local_slope_limiter(
 fn reconstruct_pair(
     state: &MhdMfmState2d,
     primitive: &MhdPrimitiveColumns2d,
-    gradients: &Gradients2d,
+    gradients: &MhdPrimitiveGradients2d,
     left: usize,
     right: usize,
     offset_left: Vector2,
@@ -3359,6 +3386,8 @@ mod tests {
         let mut hierarchy =
             begin_public_mhd_initial_hierarchy_2d(&state, &rates, &timebins, 0.0, 1.0, 0.0)
                 .unwrap();
+        let initial_primitive_cache = hierarchy.predicted_primitive_cache().clone();
+        let initial_gradient_cache = hierarchy.retained_gradient_cache().clone();
         let sync = hierarchy.drift_to_first_sync().unwrap();
         assert_eq!(sync.tick, short_ticks);
         assert_eq!(
@@ -3385,12 +3414,18 @@ mod tests {
                 if sync.active[i] { short_ticks } else { 0 }
             );
         }
+        assert_eq!(
+            hierarchy.predicted_primitive_cache().density[0].to_bits(),
+            initial_primitive_cache.density[0].to_bits()
+        );
+        assert_eq!(hierarchy.retained_gradient_cache(), &initial_gradient_cache);
         hierarchy.drift_neighbor_to_current(0).unwrap();
         assert_eq!(hierarchy.predictor_ticks()[0], short_ticks);
         assert_eq!(
             hierarchy.drift.predicted_velocities[0],
             state.velocities[0] + rates.acceleration[0] * drift_duration
         );
+        assert_eq!(hierarchy.retained_gradient_cache(), &initial_gradient_cache);
         assert!(hierarchy.drift_to_first_sync().is_err());
 
         let mut malformed_timebins = timebins.clone();
