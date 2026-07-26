@@ -604,8 +604,7 @@ DesNumNgb 4
     const INTERACTBLAST: &str =
         include_str!("../../../../validation/oracles/interactblast/legacy.params");
     const DUSTYWAVE: &str = include_str!("../../../../validation/oracles/dustywave/legacy.params");
-    const MHD_WAVE: &str =
-        include_str!("../../../../validation/oracles/mhd_wave/frontier.params");
+    const MHD_WAVE: &str = include_str!("../../../../validation/oracles/mhd_wave/frontier.params");
     const UPSTREAM_PUBLIC: &str =
         include_str!("../../../../scripts/test_problems/soundwave.params");
 
