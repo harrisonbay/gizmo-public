@@ -20,7 +20,7 @@
     },
     "one_step_parameters": {
       "path": "one-step.params",
-      "sha256": "d5742881249597e98c9010f8b3c607c95d378d88788a73a2a3eb1b8b19dda83d",
+      "sha256": "b60e032180371f553e1187ac7b461045c9c4ed674f898e9231572e4331678bd8",
       "note": "Uses the initial-step snapshot cadence and explicitly preserves the production MaxSizeTimestep=0.001 cap"
     },
     "post_kick_instrumentation": {

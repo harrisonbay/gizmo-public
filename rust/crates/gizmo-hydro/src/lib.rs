@@ -1727,8 +1727,9 @@ pub struct SynchronizedStep1d {
     pub end_time: f64,
 }
 
-// Timeline values are bounded by 2^29 and therefore exactly representable in
-// f64; the checked positive/floor operation intentionally mirrors C's cast.
+// The public C configuration uses a 2^60 tick timebase. Conversion to f64 is
+// intentional here: it mirrors C's double-precision timeline arithmetic, while
+// power-of-two synchronized steps remain exactly representable.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,

@@ -1,5 +1,5 @@
 % Instrumented C oracle profile. The snapshot cadence equals the known initial
-% 8192-tick step; MaxSizeTimestep is explicit so changing output cadence cannot
+% 2^44-tick step; MaxSizeTimestep is explicit so changing output cadence cannot
 % change the default timestep cap.
 InitCondFile                       soundwave_ics
 OutputDir                          output

@@ -19,7 +19,10 @@ class SoundwaveEvolutionOracleTests(unittest.TestCase):
         )
         self.assertEqual(len(manifest["source_commit"]), 40)
         self.assertEqual(manifest["timeline"]["steps"], 65_536)
-        self.assertEqual(manifest["timeline"]["shared_step_ticks"], 8192)
+        self.assertEqual(
+            manifest["timeline"]["shared_step_ticks"],
+            17_592_186_044_416,
+        )
 
         for input_name in (
             "config",
