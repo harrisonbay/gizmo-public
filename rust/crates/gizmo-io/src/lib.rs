@@ -281,15 +281,29 @@ pub fn write_soundwave(
 ) -> Result<(), OutputError> {
     validate_write_view(snapshot)?;
 
+    let gas_count = i32::try_from(snapshot.ids.len())
+        .map_err(|_| ValidationError::LegacyFileParticleCountOverflow(snapshot.ids.len()))?;
+    let mut num_part_this_file = [0_i32; PARTICLE_TYPES];
+    num_part_this_file[0] = gas_count;
+    let num_part_total_low = snapshot
+        .header
+        .num_part_total
+        .map(legacy_particle_count_low_word);
+    let num_part_total_high = snapshot
+        .header
+        .num_part_total
+        .map(legacy_particle_count_high_word);
+    let mass_table = [0.0_f64; PARTICLE_TYPES];
+
     let file = hdf5::File::create(path)?;
     let header = file.create_group("Header")?;
     write_scalar_attribute(&header, "Time", &snapshot.header.time)?;
     write_scalar_attribute(&header, "BoxSize", &snapshot.header.box_size)?;
-    header
-        .new_attr::<u64>()
-        .shape([PARTICLE_TYPES])
-        .create("NumPart_Total")?
-        .write_raw(&snapshot.header.num_part_total)?;
+    write_array_attribute(&header, "NumPart_ThisFile", &num_part_this_file)?;
+    write_array_attribute(&header, "NumPart_Total", &num_part_total_low)?;
+    write_array_attribute(&header, "NumPart_Total_HighWord", &num_part_total_high)?;
+    write_array_attribute(&header, "MassTable", &mass_table)?;
+    write_scalar_attribute(&header, "NumFilesPerSnapshot", &1_i32)?;
     let precision_flag = i32::from(snapshot.header.double_precision);
     write_scalar_attribute(&header, "Flag_DoublePrecision", &precision_flag)?;
 
@@ -375,6 +389,28 @@ fn write_scalar_attribute<T: hdf5::H5Type>(
         .shape(())
         .create(name)?
         .write_scalar(value)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn legacy_particle_count_low_word(count: u64) -> u32 {
+    count as u32
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn legacy_particle_count_high_word(count: u64) -> u32 {
+    (count >> u32::BITS) as u32
+}
+
+fn write_array_attribute<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    values: &[T],
+) -> Result<(), hdf5::Error> {
+    group
+        .new_attr::<T>()
+        .shape([values.len()])
+        .create(name)?
+        .write_raw(values)
 }
 
 fn write_scalars<T: hdf5::H5Type>(
@@ -548,6 +584,7 @@ pub enum ValidationError {
         actual: usize,
     },
     ParticleCountOverflow(u64),
+    LegacyFileParticleCountOverflow(usize),
     ParticleCountMismatch {
         header: usize,
         dataset: usize,
@@ -605,6 +642,10 @@ impl fmt::Display for ValidationError {
                     "gas particle count {count} does not fit in usize"
                 )
             }
+            Self::LegacyFileParticleCountOverflow(count) => write!(
+                formatter,
+                "gas particle count {count} does not fit in GIZMO's per-file header count"
+            ),
             Self::ParticleCountMismatch { header, dataset } => write!(
                 formatter,
                 "header declares {header} gas particles, datasets contain {dataset}"
@@ -900,9 +941,34 @@ mod tests {
             header
                 .attr("NumPart_Total")
                 .unwrap()
-                .read_raw::<u64>()
+                .read_raw::<u32>()
                 .unwrap(),
             vec![3, 0, 0, 0, 0, 0]
+        );
+        for (name, expected_values) in [
+            ("NumPart_ThisFile", vec![3_i32, 0, 0, 0, 0, 0]),
+            ("NumFilesPerSnapshot", vec![1_i32]),
+        ] {
+            let attribute = header.attr(name).unwrap();
+            assert!(attribute.dtype().unwrap().is::<i32>());
+            assert_eq!(attribute.read_raw::<i32>().unwrap(), expected_values);
+        }
+        for name in ["NumPart_Total", "NumPart_Total_HighWord"] {
+            assert!(header.attr(name).unwrap().dtype().unwrap().is::<u32>());
+        }
+        assert_eq!(
+            header
+                .attr("NumPart_Total_HighWord")
+                .unwrap()
+                .read_raw::<u32>()
+                .unwrap(),
+            vec![0; PARTICLE_TYPES]
+        );
+        let mass_table = header.attr("MassTable").unwrap();
+        assert!(mass_table.dtype().unwrap().is::<f64>());
+        assert_eq!(
+            mass_table.read_raw::<f64>().unwrap(),
+            vec![0.0; PARTICLE_TYPES]
         );
         let gas = file.group("PartType0").unwrap();
         assert_eq!(
