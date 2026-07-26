@@ -81,6 +81,90 @@ pub fn periodic_displacement_1d(a: f64, b: f64, box_size: f64) -> Result<f64, Hy
     Ok(displacement)
 }
 
+/// Enumerate exact unordered interactions in legacy particle-index order.
+///
+/// The sorted position index queries each particle's own compact support.
+/// Canonicalizing those directed neighborhoods applies the meshless
+/// union-support rule, `r < H_i || r < H_j`, without using a global search
+/// radius. The returned order is identical to the former nested `for i`/`for
+/// j` scan, preserving floating-point force accumulation.
+///
+/// This costs `O(N log N + sum(k_i) + P log P)`, where `k_i` is the number of
+/// particles inside `H_i` and `P` is the interacting-pair count, instead of
+/// `O(N²)` for locally bounded support.
+fn interacting_pairs_periodic_1d(
+    positions: &[f64],
+    smoothing_lengths: &[f64],
+    box_size: f64,
+) -> Result<Vec<(usize, usize, f64)>, HydroError> {
+    let mut sorted: Vec<(f64, usize)> = positions
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, position)| (position, index))
+        .collect();
+    sorted.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let mut pair_indices = Vec::new();
+    let mut candidates = Vec::new();
+    for (source, (&position, &support)) in positions.iter().zip(smoothing_lengths).enumerate() {
+        candidates.clear();
+        if support >= 0.5 * box_size {
+            candidates.extend(0..positions.len());
+        } else {
+            let lower = position - support;
+            let upper = position + support;
+            if lower < 0.0 {
+                append_sorted_position_range(&sorted, 0.0, upper, &mut candidates);
+                append_sorted_position_range(&sorted, lower + box_size, box_size, &mut candidates);
+            } else if upper >= box_size {
+                append_sorted_position_range(&sorted, lower, box_size, &mut candidates);
+                append_sorted_position_range(&sorted, 0.0, upper - box_size, &mut candidates);
+            } else {
+                append_sorted_position_range(&sorted, lower, upper, &mut candidates);
+            }
+        }
+
+        for &neighbor in &candidates {
+            if neighbor == source {
+                continue;
+            }
+            let distance = periodic_displacement_1d(position, positions[neighbor], box_size)?.abs();
+            if distance > 0.0 && distance < support {
+                pair_indices.push(if source < neighbor {
+                    (source, neighbor)
+                } else {
+                    (neighbor, source)
+                });
+            }
+        }
+    }
+    pair_indices.sort_unstable();
+    pair_indices.dedup();
+    pair_indices
+        .into_iter()
+        .map(|(i, j)| {
+            periodic_displacement_1d(positions[i], positions[j], box_size)
+                .map(|displacement| (i, j, displacement))
+        })
+        .collect()
+}
+
+fn append_sorted_position_range(
+    sorted: &[(f64, usize)],
+    lower: f64,
+    upper: f64,
+    output: &mut Vec<usize>,
+) {
+    let start = sorted.partition_point(|&(position, _)| position < lower);
+    let end = sorted.partition_point(|&(position, _)| position <= upper);
+    output.extend(sorted[start..end].iter().map(|&(_, index)| index));
+}
+
 /// Recompute the MFM density and effective neighbor number at supplied `Hsml`.
 ///
 /// This ports the density summation and one-dimensional neighbor-number
@@ -1199,72 +1283,63 @@ pub fn mfm_spatial_rates_1d(state: MfmState1d<'_>) -> Result<MfmRates1d, HydroEr
         .zip(&density_values)
         .map(|(&particle_pressure, &rho)| (state.gamma * particle_pressure / rho).sqrt())
         .collect();
-    for i in 0..particle_count {
-        for j in (i + 1)..particle_count {
-            let displacement =
-                periodic_displacement_1d(state.positions[i], state.positions[j], state.box_size)?;
-            let distance = displacement.abs();
-            if distance <= 0.0
-                || (distance >= state.smoothing_lengths[i]
-                    && distance >= state.smoothing_lengths[j])
-            {
-                continue;
-            }
-            let point_geometry = |index: usize| MeshlessPoint1d {
-                position: state.positions[index],
-                mass: state.masses[index],
+    for (i, j, displacement) in
+        interacting_pairs_periodic_1d(state.positions, state.smoothing_lengths, state.box_size)?
+    {
+        let distance = displacement.abs();
+        let point_geometry = |index: usize| MeshlessPoint1d {
+            position: state.positions[index],
+            mass: state.masses[index],
+            density: density_values[index],
+            smoothing_length: state.smoothing_lengths[index],
+            inverse_moment: inverse_moments[index],
+        };
+        let face = meshless_face_geometry_1d(point_geometry(i), point_geometry(j), state.box_size)?;
+        let reconstructed = |index: usize| ReconstructedPoint1d {
+            primitive: PrimitiveState1d {
                 density: density_values[index],
-                smoothing_length: state.smoothing_lengths[index],
-                inverse_moment: inverse_moments[index],
-            };
-            let face =
-                meshless_face_geometry_1d(point_geometry(i), point_geometry(j), state.box_size)?;
-            let reconstructed = |index: usize| ReconstructedPoint1d {
-                primitive: PrimitiveState1d {
-                    density: density_values[index],
-                    velocity: state.velocities[index],
-                    pressure: pressure[index],
-                },
-                density_gradient: density_gradients[index].limited,
-                velocity_gradient: velocity_gradients[index].limited,
-                pressure_gradient: pressure_gradients[index].limited,
+                velocity: state.velocities[index],
+                pressure: pressure[index],
+            },
+            density_gradient: density_gradients[index].limited,
+            velocity_gradient: velocity_gradients[index].limited,
+            pressure_gradient: pressure_gradients[index].limited,
+            face_closure_error: closure_errors[index],
+        };
+        let raw_flux = mfm_pair_flux_1d(reconstructed(i), reconstructed(j), face, state.gamma)?;
+        let entropic = |index: usize| {
+            Ok::<EntropicPoint1d, HydroError>(EntropicPoint1d {
+                velocity: state.velocities[index],
+                density: density_values[index],
+                pressure: pressure[index],
+                sound_speed: (state.gamma * pressure[index] / density_values[index]).sqrt(),
+                volume: state.masses[index] / density_values[index],
+                dhsml_factor: density[index].dhsml_factor,
+                kernel_radial_derivative: cubic_kernel_1d(
+                    distance,
+                    state.smoothing_lengths[index],
+                )?
+                .radial_derivative,
+                condition_number: 1.0,
                 face_closure_error: closure_errors[index],
-            };
-            let raw_flux = mfm_pair_flux_1d(reconstructed(i), reconstructed(j), face, state.gamma)?;
-            let entropic = |index: usize| {
-                Ok::<EntropicPoint1d, HydroError>(EntropicPoint1d {
-                    velocity: state.velocities[index],
-                    density: density_values[index],
-                    pressure: pressure[index],
-                    sound_speed: (state.gamma * pressure[index] / density_values[index]).sqrt(),
-                    volume: state.masses[index] / density_values[index],
-                    dhsml_factor: density[index].dhsml_factor,
-                    kernel_radial_derivative: cubic_kernel_1d(
-                        distance,
-                        state.smoothing_lengths[index],
-                    )?
-                    .radial_derivative,
-                    condition_number: 1.0,
-                    face_closure_error: closure_errors[index],
-                })
-            };
-            let (flux, selected_entropic) =
-                apply_entropic_pdv_1d(raw_flux, face, entropic(i)?, entropic(j)?)?;
-            momentum[i] += flux.momentum;
-            momentum[j] -= flux.momentum;
-            total_energy[i] += flux.energy;
-            total_energy[j] -= flux.energy;
-            pair_count += 1;
-            entropic_pair_count += usize::from(selected_entropic);
-            let signal_speed = pair_signal_speed(
-                reconstructed(i),
-                reconstructed(j),
-                displacement.signum(),
-                state.gamma,
-            )?;
-            maximum_signal_speed[i] = maximum_signal_speed[i].max(signal_speed);
-            maximum_signal_speed[j] = maximum_signal_speed[j].max(signal_speed);
-        }
+            })
+        };
+        let (flux, selected_entropic) =
+            apply_entropic_pdv_1d(raw_flux, face, entropic(i)?, entropic(j)?)?;
+        momentum[i] += flux.momentum;
+        momentum[j] -= flux.momentum;
+        total_energy[i] += flux.energy;
+        total_energy[j] -= flux.energy;
+        pair_count += 1;
+        entropic_pair_count += usize::from(selected_entropic);
+        let signal_speed = pair_signal_speed(
+            reconstructed(i),
+            reconstructed(j),
+            displacement.signum(),
+            state.gamma,
+        )?;
+        maximum_signal_speed[i] = maximum_signal_speed[i].max(signal_speed);
+        maximum_signal_speed[j] = maximum_signal_speed[j].max(signal_speed);
     }
 
     let mut acceleration = Vec::with_capacity(particle_count);
@@ -3160,6 +3235,71 @@ mod tests {
             smoothing_lengths: &[0.2],
             box_size: 1.0,
             gamma: 5.0 / 3.0,
+        }
+    }
+
+    fn brute_force_interacting_pairs(
+        positions: &[f64],
+        smoothing_lengths: &[f64],
+        box_size: f64,
+    ) -> Vec<(usize, usize, f64)> {
+        let mut pairs = Vec::new();
+        for i in 0..positions.len() {
+            for j in (i + 1)..positions.len() {
+                let displacement =
+                    periodic_displacement_1d(positions[i], positions[j], box_size).unwrap();
+                let distance = displacement.abs();
+                if distance > 0.0
+                    && (distance < smoothing_lengths[i] || distance < smoothing_lengths[j])
+                {
+                    pairs.push((i, j, displacement));
+                }
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn sparse_periodic_pairs_match_brute_force_on_irregular_states() {
+        let box_size = 1.0;
+        let mut seed = 0x5eed_f00d_cafe_babe_u64;
+        let mut random_unit = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bytes = seed.to_le_bytes();
+            f64::from(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+                / f64::from(u32::MAX)
+        };
+        let mut positions = vec![0.0, 1.0e-12, 0.999_999_999_999];
+        let mut smoothing_lengths = vec![0.031, 0.077, 0.043];
+        for _ in positions.len()..96 {
+            positions.push(random_unit());
+            smoothing_lengths.push(0.008 + 0.082 * random_unit());
+        }
+
+        let sparse =
+            interacting_pairs_periodic_1d(&positions, &smoothing_lengths, box_size).unwrap();
+        let brute = brute_force_interacting_pairs(&positions, &smoothing_lengths, box_size);
+        assert_eq!(sparse, brute);
+        assert!(sparse.windows(2).all(|pair| {
+            let (left_i, left_j, _) = pair[0];
+            let (right_i, right_j, _) = pair[1];
+            (left_i, left_j) < (right_i, right_j)
+        }));
+    }
+
+    #[test]
+    fn sparse_periodic_pairs_handle_seam_duplicates_and_global_support() {
+        let positions = [0.92, 0.08, 0.51, 0.49, 0.08, 0.75, 0.25];
+        for smoothing_lengths in [
+            [0.04, 0.17, 0.03, 0.08, 0.11, 0.02, 0.26],
+            [0.5, 0.03, 0.04, 0.02, 0.01, 0.6, 0.05],
+        ] {
+            let sparse =
+                interacting_pairs_periodic_1d(&positions, &smoothing_lengths, 1.0).unwrap();
+            let brute = brute_force_interacting_pairs(&positions, &smoothing_lengths, 1.0);
+            assert_eq!(sparse, brute);
         }
     }
 
