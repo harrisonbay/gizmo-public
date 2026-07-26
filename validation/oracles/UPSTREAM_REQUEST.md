@@ -13,8 +13,10 @@ reproduce their pass/fail results. Please publish, for every supported example:
 4. Small canonical output snapshots or reduced reference tables, with
    checksums, plus the GIZMO commit, compiler, precision, MPI rank count, and
    thread count that produced them.
-5. The `scripts/test.sh` and `scripts/lint.sh` files referenced by the public
-   Bitbucket pipeline, or their current replacements.
+5. The `scripts/pipelines/run_isodisk_testprob.sh` and
+   `scripts/pipelines/compare_isodisk_output.sh` files referenced by
+   `scripts/pipelines/bitbucket-pipelines.yml`, plus the isodisk reference
+   output they compare against. Those scripts are absent from the public tree.
 
 For `soundwave` specifically, please clarify which definition is authoritative.
 The prose says mean pressure `3/5` and sound speed `1`, while the currently
