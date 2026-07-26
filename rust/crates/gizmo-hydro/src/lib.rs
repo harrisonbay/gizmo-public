@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -381,6 +382,328 @@ pub fn solve_smoothing_lengths_1d(
         });
     }
     Ok(output)
+}
+
+/// Reproduce the public C soundwave's gravitational-tree smoothing-length seeds.
+///
+/// `setup_smoothinglengths()` does not start its density iteration from a
+/// uniform kernel size. It ascends the 42-bit gravitational oct-tree from each
+/// particle until the enclosing node contains at least
+/// `2 * desired_neighbors * particle_mass`, then scales that node's length by
+/// the particle's share of its mass. In the pinned one-dimensional profile all
+/// particles have the same transverse coordinates, so the oct-tree reduces
+/// exactly to this dyadic mass tree.
+///
+/// The domain construction and bottom-up child accumulation deliberately
+/// mirror `domain_findExtent()`, `domain_double_to_int()`, and
+/// `force_update_node_recursive()` rather than using position-space searches.
+/// This preserves the floating-point branches selected by the public C
+/// initializer.
+///
+/// # Errors
+///
+/// Returns an error for invalid or mismatched particle columns, a degenerate
+/// domain, or a non-finite seed.
+pub fn public_c_tree_smoothing_length_seeds_1d(
+    positions: &[f64],
+    masses: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+) -> Result<Vec<f64>, HydroError> {
+    const TREE_BITS: u32 = 42;
+
+    if positions.len() != masses.len() {
+        return Err(HydroError::MismatchedLength {
+            field: "masses",
+            expected: positions.len(),
+            actual: masses.len(),
+        });
+    }
+    if !box_size.is_finite() || box_size <= 0.0 {
+        return Err(HydroError::InvalidBoxSize(box_size));
+    }
+    if !desired_neighbors.is_finite() || desired_neighbors <= 0.0 {
+        return Err(HydroError::InvalidNeighborConstraint {
+            desired: desired_neighbors,
+            tolerance: 0.0,
+        });
+    }
+    for (index, (&position, &mass)) in positions.iter().zip(masses).enumerate() {
+        for (field, value, positive) in [("position", position, false), ("mass", mass, true)] {
+            if !value.is_finite()
+                || (positive && value <= 0.0)
+                || (field == "position" && (value < 0.0 || value >= box_size))
+            {
+                return Err(HydroError::InvalidParticle {
+                    index,
+                    field,
+                    value,
+                });
+            }
+        }
+    }
+    let (&minimum, &maximum) = positions
+        .iter()
+        .min_by(|left, right| left.total_cmp(right))
+        .zip(positions.iter().max_by(|left, right| left.total_cmp(right)))
+        .ok_or(HydroError::DegenerateTreeDomain {
+            minimum: f64::NAN,
+            maximum: f64::NAN,
+        })?;
+    let domain_length = 1.001 * (maximum - minimum);
+    if !domain_length.is_finite() || domain_length <= 0.0 {
+        return Err(HydroError::DegenerateTreeDomain { minimum, maximum });
+    }
+    let domain_corner = 0.5 * (minimum + maximum) - 0.5 * domain_length;
+    let keys: Vec<u64> = positions
+        .iter()
+        .map(|&position| legacy_tree_coordinate(position, domain_corner, domain_length, TREE_BITS))
+        .collect();
+
+    let mut levels = vec![BTreeMap::<u64, f64>::new(); (TREE_BITS + 1) as usize];
+    for (&key, &mass) in keys.iter().zip(masses) {
+        *levels[TREE_BITS as usize].entry(key).or_insert(0.0) += mass;
+    }
+    for depth in (0..TREE_BITS).rev() {
+        let (parents, children) = levels.split_at_mut((depth + 1) as usize);
+        let parent_level = &mut parents[depth as usize];
+        for (&child, &mass) in &children[0] {
+            *parent_level.entry(child >> 1).or_insert(0.0) += mass;
+        }
+    }
+
+    keys.iter()
+        .zip(masses)
+        .enumerate()
+        .map(|(index, (&key, &particle_mass))| {
+            let threshold = 2.0 * desired_neighbors * particle_mass;
+            let mut selected_depth = 0;
+            let mut selected_mass = levels[0][&0];
+            for depth in (0..=TREE_BITS).rev() {
+                let prefix = key >> (TREE_BITS - depth);
+                let node_mass = levels[depth as usize][&prefix];
+                selected_depth = depth;
+                selected_mass = node_mass;
+                if node_mass >= threshold {
+                    break;
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let node_length = domain_length / (1_u64 << selected_depth) as f64;
+            let seed = desired_neighbors * (particle_mass / selected_mass) * node_length;
+            if !seed.is_finite() || seed <= 0.0 {
+                return Err(HydroError::NonFiniteDensityEstimate {
+                    index,
+                    field: "tree_smoothing_length_seed",
+                    value: seed,
+                });
+            }
+            Ok(seed)
+        })
+        .collect()
+}
+
+/// Run the public C restart-0 smoothing-length iteration from its tree seeds.
+///
+/// This is the `NUMDIMS == 1` specialization of the bracket and Newton-jump
+/// schedule in `density()`, including its gradually relaxed tolerance and
+/// narrow-bracket acceptance rule. Unlike [`solve_smoothing_lengths_1d`],
+/// which computes a canonical tightly converged root, this routine preserves
+/// the accepted floating-point branch used by public-C restart-0 snapshots.
+///
+/// # Errors
+///
+/// Returns an error for invalid state or constraints, or if the legacy
+/// iteration does not converge.
+pub fn solve_public_c_initial_smoothing_lengths_1d(
+    positions: &[f64],
+    masses: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    tolerance: f64,
+) -> Result<Vec<AdaptiveDensityEstimate>, HydroError> {
+    let seeds =
+        public_c_tree_smoothing_length_seeds_1d(positions, masses, box_size, desired_neighbors)?;
+    if !tolerance.is_finite() || tolerance <= 0.0 || tolerance >= desired_neighbors {
+        return Err(HydroError::InvalidNeighborConstraint {
+            desired: desired_neighbors,
+            tolerance,
+        });
+    }
+    let neighbor_index = PeriodicNeighborIndex1d::new(positions, box_size);
+    seeds
+        .into_iter()
+        .enumerate()
+        .map(|(index, seed)| {
+            solve_public_c_initial_particle(
+                index,
+                positions,
+                masses,
+                box_size,
+                desired_neighbors,
+                tolerance,
+                seed,
+                &neighbor_index,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_public_c_initial_particle(
+    index: usize,
+    positions: &[f64],
+    masses: &[f64],
+    box_size: f64,
+    desired_neighbors: f64,
+    base_tolerance: f64,
+    seed: f64,
+    neighbor_index: &PeriodicNeighborIndex1d,
+) -> Result<AdaptiveDensityEstimate, HydroError> {
+    let mut hsml = seed;
+    let mut lower = 0.0_f64;
+    let mut upper = 0.0_f64;
+    let mut last_estimate =
+        estimate_particle(index, positions, masses, hsml, box_size, neighbor_index)?;
+
+    for iteration in 0..=128 {
+        let tolerance = if iteration > 1 {
+            let growth =
+                (0.1 * (desired_neighbors / (16.0 * base_tolerance)).ln() * f64::from(iteration))
+                    .exp();
+            (base_tolerance * growth).min(0.25 * desired_neighbors)
+        } else {
+            base_tolerance
+        };
+        if (last_estimate.effective_neighbors - desired_neighbors).abs() <= tolerance {
+            return Ok(AdaptiveDensityEstimate {
+                smoothing_length: hsml,
+                estimate: last_estimate,
+            });
+        }
+
+        if lower > 0.0 && upper > 0.0 && upper - lower < 1.0e-3 * lower {
+            return Ok(AdaptiveDensityEstimate {
+                smoothing_length: hsml,
+                estimate: last_estimate,
+            });
+        }
+        if iteration == 128 {
+            break;
+        }
+
+        if last_estimate.effective_neighbors < desired_neighbors - tolerance {
+            lower = lower.max(hsml);
+        } else if upper == 0.0 || hsml < upper {
+            upper = hsml;
+        }
+
+        hsml = public_c_initial_hsml_jump(
+            hsml,
+            last_estimate,
+            desired_neighbors,
+            iteration,
+            lower,
+            upper,
+        );
+        last_estimate =
+            estimate_particle(index, positions, masses, hsml, box_size, neighbor_index)?;
+    }
+
+    Err(HydroError::SmoothingLengthDidNotConverge {
+        index,
+        lower: (lower > 0.0).then_some(lower),
+        upper: (upper > 0.0).then_some(upper),
+        effective_neighbors: last_estimate.effective_neighbors,
+    })
+}
+
+#[allow(clippy::float_cmp)]
+fn public_c_initial_hsml_jump(
+    mut hsml: f64,
+    estimate: DensityEstimate,
+    desired_neighbors: f64,
+    iteration: u32,
+    lower: f64,
+    upper: f64,
+) -> f64 {
+    let neighbors = estimate.effective_neighbors;
+    if lower > 0.0 && upper > 0.0 {
+        let max_jump = if iteration > 1 {
+            0.2 * (upper / lower).ln()
+        } else {
+            0.0
+        };
+        if neighbors > 1.0 {
+            let mut jump = estimate.dhsml_factor * (desired_neighbors / neighbors).ln();
+            if iteration > 1 && jump.abs() < max_jump {
+                jump = max_jump.copysign(jump);
+            }
+            hsml *= jump.exp();
+        } else {
+            hsml *= 2.0;
+        }
+        if hsml < upper && hsml > lower {
+            if iteration > 1 {
+                let jump_factor = max_jump.exp();
+                if hsml > upper / jump_factor {
+                    hsml = upper / jump_factor;
+                }
+                if hsml < lower * jump_factor {
+                    hsml = lower * jump_factor;
+                }
+            }
+        } else {
+            hsml = hsml.clamp(lower, upper);
+            hsml = (hsml * lower * upper).powf(1.0 / 3.0);
+        }
+        return hsml;
+    }
+
+    let mut limited_log_jump = if neighbors > 1.0 {
+        (desired_neighbors / neighbors).ln()
+    } else {
+        1.4
+    };
+    if upper == 0.0 {
+        if neighbors < 2.0 * desired_neighbors && neighbors > 0.1 * desired_neighbors {
+            let mut slope = estimate.dhsml_factor;
+            if iteration > 2 && slope < 1.0 {
+                slope = 0.5 * (slope + 1.0);
+            }
+            let mut jump = limited_log_jump * slope;
+            if iteration >= 4 && estimate.dhsml_factor == 1.0 {
+                jump *= 10.0;
+            }
+            jump = jump.min(limited_log_jump + 0.231);
+            hsml *= jump.exp();
+        } else {
+            hsml *= limited_log_jump.exp();
+        }
+    } else {
+        limited_log_jump = limited_log_jump.max(-1.535);
+        if neighbors < 2.0 * desired_neighbors && neighbors > 0.1 * desired_neighbors {
+            let mut slope = estimate.dhsml_factor;
+            if iteration > 2 && slope < 1.0 {
+                slope = 0.5 * (slope + 1.0);
+            }
+            let mut jump = limited_log_jump * slope;
+            if iteration >= 4 && estimate.dhsml_factor == 1.0 {
+                jump *= 10.0;
+            }
+            jump = jump.max(limited_log_jump - 0.231);
+            hsml *= jump.exp();
+        } else {
+            hsml *= limited_log_jump.exp();
+        }
+    }
+    hsml
+}
+
+fn legacy_tree_coordinate(position: f64, domain_corner: f64, domain_length: f64, bits: u32) -> u64 {
+    const MANTISSA_MASK: u64 = (1_u64 << 52) - 1;
+    let normalized = (position - domain_corner) / domain_length + 1.0;
+    (normalized.to_bits() & MANTISSA_MASK) >> (52 - bits)
 }
 
 /// Build the inverse one-dimensional MLS moment for each particle.
@@ -3055,6 +3378,10 @@ pub enum HydroError {
         desired: f64,
         tolerance: f64,
     },
+    DegenerateTreeDomain {
+        minimum: f64,
+        maximum: f64,
+    },
     InvalidGradientTolerance(f64),
     SmoothingLengthDidNotConverge {
         index: usize,
@@ -3159,6 +3486,10 @@ impl fmt::Display for HydroError {
             Self::InvalidNeighborConstraint { desired, tolerance } => write!(
                 formatter,
                 "invalid neighbor constraint desired={desired}, tolerance={tolerance}"
+            ),
+            Self::DegenerateTreeDomain { minimum, maximum } => write!(
+                formatter,
+                "cannot build a tree for degenerate position extent {minimum}..{maximum}"
             ),
             Self::InvalidGradientTolerance(tolerance) => {
                 write!(formatter, "invalid gradient shoot tolerance {tolerance}")
@@ -3317,6 +3648,44 @@ mod tests {
             }
         }
         pairs
+    }
+
+    #[test]
+    fn public_c_tree_seeds_are_particle_order_invariant() {
+        let positions = [0.07, 0.19, 0.31, 0.44, 0.58, 0.69, 0.83, 0.94];
+        let masses = [0.8, 1.1, 0.9, 1.2, 0.7, 1.3, 1.05, 0.95];
+        let expected =
+            public_c_tree_smoothing_length_seeds_1d(&positions, &masses, 1.0, 2.0).unwrap();
+
+        let permutation = [5, 1, 7, 3, 0, 6, 2, 4];
+        let permuted_positions: Vec<f64> =
+            permutation.iter().map(|&index| positions[index]).collect();
+        let permuted_masses: Vec<f64> = permutation.iter().map(|&index| masses[index]).collect();
+        let permuted = public_c_tree_smoothing_length_seeds_1d(
+            &permuted_positions,
+            &permuted_masses,
+            1.0,
+            2.0,
+        )
+        .unwrap();
+
+        for (permuted_index, &original_index) in permutation.iter().enumerate() {
+            assert_eq!(
+                permuted[permuted_index].to_bits(),
+                expected[original_index].to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn public_c_tree_seed_rejects_degenerate_extent() {
+        assert!(matches!(
+            public_c_tree_smoothing_length_seeds_1d(&[0.5, 0.5], &[1.0, 1.0], 1.0, 4.0),
+            Err(HydroError::DegenerateTreeDomain {
+                minimum: 0.5,
+                maximum: 0.5
+            })
+        ));
     }
 
     #[test]

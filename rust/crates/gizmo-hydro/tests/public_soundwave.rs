@@ -5,7 +5,8 @@ use gizmo_hydro::{
     cubic_kernel_1d, density_at_hsml_1d, face_closure_errors_1d, finish_mfm_kdk_1d,
     global_courant_timestep_1d, gradients_at_hsml_1d, inverse_moments_1d,
     meshless_face_geometry_1d, mfm_pair_flux_1d, mfm_spatial_rates_1d,
-    select_public_soundwave_timestep_1d, solve_smoothing_lengths_1d,
+    public_c_tree_smoothing_length_seeds_1d, select_public_soundwave_timestep_1d,
+    solve_public_c_initial_smoothing_lengths_1d, solve_smoothing_lengths_1d,
 };
 use gizmo_io::read_soundwave;
 use std::path::Path;
@@ -42,6 +43,48 @@ fn rust_density_matches_pinned_public_soundwave_state() {
         .iter()
         .map(|coordinate| coordinate[0])
         .collect();
+    let tree_seeds = public_c_tree_smoothing_length_seeds_1d(
+        &positions,
+        &snapshot.gas.masses,
+        snapshot.header.box_size,
+        SOUNDWAVE_DESIRED_NEIGHBORS,
+    )
+    .expect("public-C tree seeds must be reproducible from the raw IC");
+    let tree_seed_hash = tree_seeds
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |mut hash, seed| {
+            for byte in seed.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+            hash
+        });
+    assert_eq!(
+        tree_seed_hash, 0x8344_c5d4_0450_d6a2,
+        "Rust tree seeds diverged from the instrumented public-C initializer"
+    );
+    let public_c_initialized = solve_public_c_initial_smoothing_lengths_1d(
+        &positions,
+        &snapshot.gas.masses,
+        snapshot.header.box_size,
+        SOUNDWAVE_DESIRED_NEIGHBORS,
+        SOUNDWAVE_NEIGHBOR_TOLERANCE,
+    )
+    .expect("public-C restart-0 smoothing-length iteration must converge");
+    let initialized_hsml: Vec<f64> = public_c_initialized
+        .iter()
+        .map(|particle| particle.smoothing_length)
+        .collect();
+    let corrected_c_t0_path = std::env::var_os("GIZMO_SOUNDWAVE_C_T0")
+        .expect("corrected-C initialized table is required");
+    let corrected_c_t0 = read_evolution_table(Path::new(&corrected_c_t0_path));
+    let initialized_hsml_error =
+        max_relative_error(&initialized_hsml, &corrected_c_t0.smoothing_lengths);
+    eprintln!("public-C restart-0 Hsml parity: max relative error={initialized_hsml_error:.12e}");
+    assert!(
+        initialized_hsml_error < 1.0e-12,
+        "Rust restart-0 Hsml branches diverged from corrected public C"
+    );
     let estimates = density_at_hsml_1d(
         &positions,
         &snapshot.gas.masses,

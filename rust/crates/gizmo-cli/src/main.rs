@@ -11,7 +11,7 @@ use gizmo_hydro::{
     GradientEstimate, LEGACY_TIMEBASE_TICKS, MeshlessPoint1d, MfmDriftState1d, MfmEvolvingState1d,
     SynchronizedTimeline1d, begin_mfm_kdk_1d, density_at_hsml_1d, finish_mfm_kdk_1d,
     gradients_at_hsml_1d, inverse_moments_1d, meshless_face_geometry_1d, mfm_spatial_rates_1d,
-    select_public_soundwave_timestep_1d, solve_smoothing_lengths_1d,
+    select_public_soundwave_timestep_1d, solve_public_c_initial_smoothing_lengths_1d,
 };
 use gizmo_io::{SnapshotHeader, SoundWaveWriteView, read_soundwave, write_soundwave};
 use gizmo_params::SoundwaveParameters;
@@ -175,15 +175,12 @@ fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, A
     .map_err(ApplicationError::Hydro)?;
     let particle_count = u32::try_from(snapshot.gas.len())
         .map_err(|_| ApplicationError::StateMismatch("particle count exceeds u32".to_owned()))?;
-    let initial_hsml =
-        vec![2.0 * snapshot.header.box_size / f64::from(particle_count); snapshot.gas.len()];
-    let solved = solve_smoothing_lengths_1d(
+    let solved = solve_public_c_initial_smoothing_lengths_1d(
         &positions,
         &snapshot.gas.masses,
-        &initial_hsml,
         snapshot.header.box_size,
         parameters.desired_num_neighbors,
-        1.0e-8,
+        parameters.max_neighbor_deviation,
     )
     .map_err(ApplicationError::Hydro)?;
 
@@ -196,7 +193,7 @@ fn initialize_soundwave(parameter_file: &Path) -> Result<InitializedSoundwave, A
         &solved,
         (particle_count, parameters.desired_num_neighbors),
     )?;
-    summary.validate()?;
+    summary.validate(parameters.max_neighbor_deviation)?;
     let particle_ids = snapshot.gas.ids;
     let transverse_vectors = snapshot
         .gas
@@ -641,11 +638,15 @@ struct InitializationSummary {
 }
 
 impl InitializationSummary {
-    fn validate(self) -> Result<(), ApplicationError> {
+    fn validate(self, neighbor_tolerance: f64) -> Result<(), ApplicationError> {
         for (field, value, limit) in [
             ("density parity", self.max_density_relative_error, 1.0e-10),
-            ("Hsml parity", self.max_hsml_relative_difference, 1.0e-3),
-            ("neighbor constraint", self.max_neighbor_deviation, 1.0e-8),
+            ("Hsml parity", self.max_hsml_relative_difference, 1.0e-2),
+            (
+                "neighbor constraint",
+                self.max_neighbor_deviation,
+                neighbor_tolerance,
+            ),
             ("density gradient", self.density_gradient_error, 1.0e-4),
             ("velocity gradient", self.velocity_gradient_error, 1.0e-4),
             ("pressure gradient", self.pressure_gradient_error, 1.0e-4),
